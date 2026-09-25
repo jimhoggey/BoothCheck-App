@@ -27,22 +27,22 @@
 
   * { box-sizing: border-box; }
   html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  body { margin: 0; background: #fff; color: var(--ink); font: 9.3pt/1.42 var(--body); }
+  body { margin: 0; background: #fff; color: var(--ink); font: 9.1pt/1.4 var(--body); }
 
   h1, h2, h3 { font-family: var(--display); margin: 0; text-wrap: balance; }
   h1 { font-size: 25pt; line-height: 1.05; letter-spacing: -0.01em; }
   h2 { font-size: 13.5pt; letter-spacing: 0.01em; margin-bottom: 2.2mm; }
   h2 .who { font-family: var(--body); font-weight: 500; font-size: 8.5pt; color: var(--muted); margin-left: 2mm; letter-spacing: 0; }
   p { margin: 0; }
-  code, .file { font-family: var(--mono); font-size: 8.6pt; }
+  code, .file { font-family: var(--mono); font-size: 8.4pt; }
   .file { background: var(--code); padding: 0.2mm 1.2mm; border-radius: 1mm; white-space: nowrap; }
   b { font-weight: 600; }
 
   /* header */
   .eyebrow { font: 600 7.6pt/1 var(--body); letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); margin-bottom: 2mm; }
-  .lede { color: var(--muted); max-width: 150mm; margin-top: 2mm; }
-  .current { display: flex; flex-wrap: wrap; gap: 2mm 8mm; margin-top: 4mm; padding: 2.4mm 3.5mm;
-             background: var(--blue-soft); border-radius: 1.5mm; font-size: 8.8pt; }
+  .lede { color: var(--muted); max-width: 160mm; margin-top: 2mm; }
+  .current { display: flex; flex-wrap: wrap; gap: 2mm 7mm; margin-top: 4mm; padding: 2.4mm 3.5mm;
+             background: var(--blue-soft); border-radius: 1.5mm; font-size: 8.6pt; }
   .current span { color: var(--muted); margin-right: 1.5mm; }
 
   section { margin-top: 5mm; }
@@ -54,7 +54,7 @@
   .stop p { max-width: 140mm; }
 
   /* numbered sequences */
-  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 1.8mm; }
+  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 1.7mm; }
   ol.steps > li { counter-increment: s; display: grid; grid-template-columns: 7mm 1fr; gap: 3mm; break-inside: avoid; }
   ol.steps > li::before { content: counter(s); font: 700 11pt/1.25 var(--display); color: var(--amber);
                           text-align: right; font-variant-numeric: tabular-nums; }
@@ -63,10 +63,10 @@
 
   /* troubleshooting */
   .faults { border-top: 0.3mm solid var(--rule); }
-  .fault { display: grid; grid-template-columns: 58mm 1fr; gap: 4mm; padding: 2mm 0;
+  .fault { display: grid; grid-template-columns: 56mm 1fr; gap: 4mm; padding: 1.8mm 0;
            border-bottom: 0.3mm solid var(--rule); break-inside: avoid; }
   .fault .sym { font-weight: 600; }
-  .fault .cause { color: var(--muted); margin-bottom: 1.2mm; }
+  .fault .cause { color: var(--muted); margin-bottom: 1mm; }
   .fix { display: grid; grid-template-columns: 20mm 1fr; gap: 0.8mm 2.5mm; align-items: baseline; }
   .tag { font: 600 6.8pt/1.6 var(--body); letter-spacing: 0.08em; text-transform: uppercase;
          padding: 0 1.4mm; border-radius: 0.8mm; justify-self: start; white-space: nowrap; }
@@ -74,9 +74,11 @@
   .tag.setup { background: var(--blue-soft); color: var(--blue); }
 
   /* commands */
-  pre { font-family: var(--mono); font-size: 8.6pt; line-height: 1.4; background: var(--code); margin: 1.4mm 0 0;
-        padding: 1.8mm 3mm; border-radius: 1mm; white-space: pre-wrap; word-break: break-all; }
+  pre { font-family: var(--mono); font-size: 8.3pt; line-height: 1.4; background: var(--code); margin: 1.2mm 0 0;
+        padding: 1.6mm 3mm; border-radius: 1mm; white-space: pre-wrap; word-break: break-all; }
   .note { color: var(--muted); margin-top: 1.2mm; }
+  .fallback { margin-top: 3mm; padding: 2.4mm 3.5mm; border: 0.3mm solid var(--rule); border-radius: 1.5mm; break-inside: avoid; }
+  .fallback .label { font: 600 7.4pt/1 var(--body); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
 
   .setup-page h2 { break-after: avoid; }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6mm; }
@@ -87,12 +89,13 @@
 <body>
 
 <header>
-  <div class="eyebrow">Lightkey · Stream Deck · MacBook</div>
+  <div class="eyebrow">Lightkey · Stream Deck · Booth Check</div>
   <h1>Lighting Booth Runbook</h1>
-  <p class="lede">How to get the booth Mac ready before a service, what to do when something goes wrong, and the one-time setup that stops most of it happening at all.</p>
+  <p class="lede">Booth Check, the icon at the top right of the menu bar, starts the show and watches the Mac. This page is what’s left for a person.</p>
   <div class="current">
-    <div><span>Lightkey show</span><span class="file">BackupChurch_modular_v33.lightkeyproj</span></div>
-    <div><span>Stream Deck profile</span><b>Lightkey v33 Service Panel</b></div>
+    <div><span>Show</span><span class="file">BackupChurch_modular_v33.lightkeyproj</span></div>
+    <div><span>Stream Deck</span><b>Lightkey v33 Service Panel</b></div>
+    <div><span>Booth Check</span><b>1.5+</b></div>
   </div>
 </header>
 
@@ -105,10 +108,11 @@
 <section>
   <h2>Before every service</h2>
   <ol class="steps">
-    <li><p><span class="what">Plug the charger in and open the lid.</span> <span class="why">The Mac only stays awake on power, and a closed lid puts it to sleep.</span></p></li>
-    <li><p><span class="what">Open Lightkey and check the window title says <span class="file">BackupChurch_modular_v33</span>.</span> <span class="why">If it shows an older name, choose File → Open Recent and pick v33. The folder holds many old versions.</span></p></li>
-    <li><p><span class="what">Hold Option and click Lightkey’s green window button</span> to make it fill the screen. <span class="why">Don’t use true full screen: it moves Lightkey into its own space and macOS then lets the Stream Deck app fall asleep.</span></p></li>
-    <li><p><span class="what">Open the Stream Deck app, choose “Lightkey v33 Service Panel”, and leave its window open behind Lightkey.</span> <span class="why">An app with no window showing is the first thing macOS decides isn’t busy.</span></p></li>
+    <li><p><span class="what">Plug the charger in.</span> <span class="why">The lid can stay closed: the Mac runs from the external screen, keyboard and mouse, but only while it’s on the charger. If the Mac is shut down, unplug the charger and plug it back in to start it.</span></p></li>
+    <li><p><span class="what">Look at Booth Check in the menu bar.</span> <span class="why">A tick means ready; a triangle or cross with a number means something needs fixing, so click it. When the Mac starts, Booth Check opens the show and Stream Deck itself, and opens its window if anything is wrong.</span></p></li>
+    <li><p><span class="what">If Lightkey or the Stream Deck app isn’t open, click the Booth Check icon → Get the show started.</span> <span class="why">It opens the show, waits for Lightkey to be ready, then opens the Stream Deck app, in that order.</span></p></li>
+    <li><p><span class="what">Hold Option and click Lightkey’s green window button</span> to make it fill the screen. <span class="why">Don’t use true full screen: it moves Lightkey into its own space, and macOS can then let the Stream Deck app fall asleep.</span></p></li>
+    <li><p><span class="what">In the Stream Deck app, check “Lightkey v33 Service Panel” is the profile in use.</span> <span class="why">Booth Check can’t see which profile is selected.</span></p></li>
     <li><p><span class="what">Press House 10% on the deck, then press it again.</span> <span class="why">The house lights should come up and the key light, then both go off. If that works, the whole chain works.</span></p></li>
   </ol>
 </section>
@@ -118,12 +122,22 @@
   <div class="faults">
 
     <div class="fault">
+      <p class="sym">The Booth Check icon shows a triangle or a cross.</p>
+      <div>
+        <p class="cause">Something it checks needs attention. The number is how many things.</p>
+        <div class="fix">
+          <span class="tag now">Now</span><p>Click the icon. Each item says what to do; <b>Open Booth Check</b> shows the full list, with a button for each fix.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="fault">
       <p class="sym">Deck keys do nothing — then they all fire at once when you click the Stream Deck app.</p>
       <div>
         <p class="cause">macOS has put the Stream Deck app to sleep. Your presses are queued inside it, not lost.</p>
         <div class="fix">
           <span class="tag now">Now</span><p><b>Stop pressing</b> — every queued press fires when it wakes. Click the Stream Deck app once.</p>
-          <span class="tag setup">For good</span><p>Setup 1 and 2, and never use true full screen.</p>
+          <span class="tag setup">For good</span><p>Setup 3 (App Nap), and never true full screen.</p>
         </div>
       </div>
     </div>
@@ -141,9 +155,10 @@
     <div class="fault">
       <p class="sym">The deck does nothing at all, even with the app open.</p>
       <div>
-        <p class="cause">The wrong profile is selected, or the keys aren’t sending to Lightkey.</p>
+        <p class="cause">Wrong profile, or Stream Deck started before Lightkey was ready.</p>
         <div class="fix">
-          <span class="tag now">Now</span><p>In the Stream Deck app, pick “Lightkey v33 Service Panel”. Still dead: open any key’s settings and check Midi Out says <b>Lightkey Input</b>.</p>
+          <span class="tag now">Now</span><p>Pick “Lightkey v33 Service Panel”. Still dead: quit and reopen the Stream Deck app.</p>
+          <span class="tag setup">For good</span><p>Setup 3 and 5, so Booth Check opens them in order.</p>
         </div>
       </div>
     </div>
@@ -151,7 +166,7 @@
     <div class="fault">
       <p class="sym">Cues change in Lightkey but nothing lights up.</p>
       <div>
-        <p class="cause">The USB DMX interface isn’t reaching the lights.</p>
+        <p class="cause">The USB DMX interface isn’t reaching the lights. Booth Check’s two DMX items help tell.</p>
         <div class="fix">
           <span class="tag now">Now</span><p>Reseat the DMX USB cable at both ends, then quit and reopen Lightkey.</p>
         </div>
@@ -164,29 +179,18 @@
         <p class="cause">An older show file is open.</p>
         <div class="fix">
           <span class="tag now">Now</span><p>File → Open Recent → <span class="file">BackupChurch_modular_v33</span>.</p>
-          <span class="tag setup">For good</span><p>Setup 7 opens the right file automatically.</p>
+          <span class="tag setup">For good</span><p>Booth Check → <b>Change…</b> to the right show.</p>
         </div>
       </div>
     </div>
 
     <div class="fault">
-      <p class="sym">“Allow accessory to connect?” appears.</p>
+      <p class="sym">“Allow accessory to connect?” appears, or a password after sitting idle.</p>
       <div>
-        <p class="cause">macOS asks before trusting a USB device.</p>
+        <p class="cause">Two macOS settings Booth Check can’t read.</p>
         <div class="fix">
-          <span class="tag now">Now</span><p>Click Allow.</p>
+          <span class="tag now">Now</span><p>Click Allow, or type the password.</p>
           <span class="tag setup">For good</span><p>Setup 4.</p>
-        </div>
-      </div>
-    </div>
-
-    <div class="fault">
-      <p class="sym">The Mac wants a password after sitting idle.</p>
-      <div>
-        <p class="cause">The lock screen kicked in.</p>
-        <div class="fix">
-          <span class="tag now">Now</span><p>Type the password.</p>
-          <span class="tag setup">For good</span><p>Setup 5.</p>
         </div>
       </div>
     </div>
@@ -194,10 +198,10 @@
     <div class="fault">
       <p class="sym">The screen went black or the Mac went to sleep.</p>
       <div>
-        <p class="cause">It’s running on battery, or the lid was closed.</p>
+        <p class="cause">It’s running on battery, or its screen settings turned the display off.</p>
         <div class="fix">
-          <span class="tag now">Now</span><p>Plug the charger in, open the lid, touch the trackpad.</p>
-          <span class="tag setup">For good</span><p>Setup 3.</p>
+          <span class="tag now">Now</span><p>Plug the charger in, then press a key on the external keyboard.</p>
+          <span class="tag setup">For good</span><p>Booth Check’s “Never sleeps on the charger” item (setup 3).</p>
         </div>
       </div>
     </div>
@@ -206,51 +210,35 @@
 </section>
 
 <section class="setup-page">
-  <h2>One-time setup <span class="who">Done once by whoever looks after the Mac. Needs the admin password.</span></h2>
+  <h2>One-time setup <span class="who">Done once by whoever looks after the Mac.</span></h2>
   <ol class="steps">
-    <li>
-      <div>
-        <p class="what">Stop macOS putting apps to sleep (App Nap).</p>
-        <p class="why">This is what freezes the Stream Deck. It is switched off for every app, because the Stream Deck’s MIDI plugin runs as a separate program. Open Terminal and run:</p>
-        <pre>defaults write -g NSAppSleepDisabled -bool true</pre>
-        <p class="note">Restart the Mac, then check it took — this should print 1:</p>
-        <pre>defaults read -g NSAppSleepDisabled</pre>
-      </div>
-    </li>
-    <li>
-      <div>
-        <p class="what">Make sure Low Power Mode is off.</p>
-        <p class="why">It throttles background apps hard. This should print 0; if it prints 1, set System Settings → Battery → Low Power Mode to Never.</p>
-        <pre>pmset -g | grep lowpowermode</pre>
-      </div>
-    </li>
-    <li>
-      <div>
-        <p class="what">Never sleep while on the charger.</p>
-        <pre>sudo pmset -c sleep 0 displaysleep 0 disksleep 0</pre>
-        <p class="note">The <code>-c</code> means on the charger only. If someone unplugs it, it still sleeps on battery instead of running flat.</p>
-      </div>
-    </li>
-    <li><p><span class="what">Stop the USB prompt.</span> <span class="why">System Settings → Privacy &amp; Security → Allow accessories to connect → <b>Always</b>.</span></p></li>
-    <li><p><span class="what">No password after sitting idle.</span> <span class="why">System Settings → Lock Screen: “Start Screen Saver when inactive” → Never, and “Require password after screen saver begins or display is turned off” → Never.</span></p></li>
-    <li><p><span class="what">No surprise updates.</span> <span class="why">System Settings → General → Software Update → the ⓘ next to Automatic Updates: turn off “Install macOS updates” and “Install Security Responses and system files”. An update can reset the USB permission and the MIDI setup, so install them yourself in the monthly restart (below).</span></p></li>
-    <li><p><span class="what">Everything opens by itself.</span> <span class="why">System Settings → General → Login Items → Open at Login: add <b>Elgato Stream Deck</b> and the show file <span class="file">BackupChurch_modular_v33.lightkeyproj</span> itself, which starts Lightkey with that exact show. Swap the file when the version changes. If it won’t take the file, drag the file to the Dock so it’s one click away.</span></p></li>
-    <li><p><span class="what">Keep notifications off the screen.</span> <span class="why">Control Centre → Focus → Do Not Disturb, left on permanently on this Mac or scheduled over service times.</span></p></li>
+    <li><p><span class="what">Install Booth Check.</span> <span class="why">Download <b>Booth.Check.zip</b> from github.com/jimhoggey/BoothCheck-App/releases and drag Booth Check into Applications. First time only: right-click → Open → Open. After that it updates itself; click <b>Update</b> when offered, outside a service.</span></p></li>
+    <li><p><span class="what">Choose the show and allow access.</span> <span class="why"><b>Choose show…</b> → the show file. Allow control of System Events when asked. On “The right show is open”, click <b>Allow access…</b>, turn Booth Check on under Accessibility, then reopen it.</span></p></li>
+    <li><p><span class="what">Work down Booth Check’s list until everything is a tick.</span> <span class="why">Each item says what to do. Anything that changes the Mac shows the exact command first and runs only when you press Run; anything needing the admin password opens System Settings instead, except starting from the charger, which shows its one <code>sudo</code> command first.</span></p></li>
+    <li><p><span class="what">The settings Booth Check can’t see.</span> <span class="why">Privacy &amp; Security → Allow accessories to connect → <b>Always</b>. Lock Screen → screen saver and “Require password…” → Never. Control Centre → Focus → Do Not Disturb, on.</span></p></li>
+    <li><p><span class="what">Turn off the Stream Deck app’s own “launch at login”.</span> <span class="why">Booth Check opens it once Lightkey is ready; starting on its own, it can beat Lightkey and the keys stay dead.</span></p></li>
+    <li><p><span class="what">Look after the battery.</span> <span class="why">An always-plugged-in Intel MacBook can swell its battery: turn on battery health management (System Settings → Battery → ⓘ next to Battery Health). If the case bulges or the trackpad lifts, get the battery replaced.</span></p></li>
   </ol>
+  <div class="fallback">
+    <p class="label">Without Booth Check</p>
+    <p class="note">Switch App Nap off (then restart), and stop the Mac sleeping on the charger:</p>
+    <pre>defaults write -g NSAppSleepDisabled -bool true
+sudo pmset -c sleep 0 displaysleep 0 disksleep 0</pre>
+  </div>
 </section>
 
 <section class="pair">
   <div>
     <h2>Leave it on</h2>
-    <p>Leave the Mac on, plugged in, lid open and logged in, all week — no need to shut it down after a service. Restart it about <b>once a month</b>, a few days before a service, never the morning of, and install updates then. If something breaks, you have days to fix it.</p>
+    <p>Leave it on, plugged in and logged in, all week. With the lid closed, shut down from the Apple menu and start it by replugging the charger; a vertical stand keeps it cooler. Restart about <b>once a month</b>, a few days before a service, and install macOS updates then.</p>
   </div>
   <div>
-    <h2>Why restarts still ask for a password</h2>
-    <p>With FileVault on, unlocking the disk <i>is</i> the login, so every restart needs the password once. Turning FileVault off allows automatic login, but then anyone who takes the laptop can read everything on it. Keeping it on and restarting rarely gets the same result.</p>
+    <h2>Why restarts ask for a password</h2>
+    <p>With FileVault on, unlocking the disk <i>is</i> the login, so each restart needs the password once before Booth Check can start the show. Turning FileVault off allows automatic login, but anyone who takes the laptop could read it. Restarting rarely gets the same result.</p>
   </div>
 </section>
 
-<footer>Lightkey with an Elgato Stream Deck (Trevliga Spel MIDI plugin) on a MacBook running macOS 26. Written for the v33 show file and profile, 25 September 2026. When the show version changes, update the two file names at the top and in setup step 7.</footer>
+<footer>Written for Booth Check 1.5 and the v33 show, 25 September 2026. When the show version changes, update the names at the top and choose the new show in Booth Check.</footer>
 
 </body>
 </html>
