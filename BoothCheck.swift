@@ -881,14 +881,22 @@ extension Booth {
             step("Installed \(r.version). The old copy is in the Trash")
             try? fm.removeItem(at: work)
 
-            // 6. Reopen the new copy once this one has quit.
+            // 6. Reopen the new copy once this one has quit. The helper waits for this process to be
+            //    gone so two copies never run side by side. AppKit won't quit while a sheet is open,
+            //    so close it first, and fall back to exit() if quitting is still refused.
             DispatchQueue.main.async {
                 self.updateSteps.append("Reopening\u{2026}")
+                let pid = String(ProcessInfo.processInfo.processIdentifier)
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/bin/sh")
-                p.arguments = ["-c", "sleep 1; /usr/bin/open \"$1\"", "sh", current.path]
+                p.arguments = ["-c", "while /bin/kill -0 \"$2\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$1\"",
+                               "sh", current.path, pid]
                 try? p.run()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.showUpdate = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { exit(0) }
+                }
             }
         }
     }
@@ -984,14 +992,13 @@ struct CodeBlock: View {
     let text: String
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        HStack(alignment: .top, spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(text)
                     .font(.system(size: 11.5, design: .monospaced))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: true, vertical: true)
                     .padding(10)
-                    .padding(.trailing, 44)
             }
             Button("Copy") {
                 NSPasteboard.general.clearContents()
