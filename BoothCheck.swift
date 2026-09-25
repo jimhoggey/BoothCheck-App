@@ -184,6 +184,28 @@ func usbDevices(_ output: String) -> [USBDevice] {
     return list
 }
 
+func isDMXInterface(_ d: USBDevice) -> Bool {
+    d.vendorID == IDs.ftdiVendor || d.name.localizedCaseInsensitiveContains("DMX")
+}
+
+/// USB driver connections that one process has open, from `ioreg -l -c IOUserClient` output. Each
+/// connection records who opened it ("pid 123, Lightkey"); a USB one opened by Lightkey means
+/// Lightkey is driving a USB device, and the DMX interface is the only one it drives.
+func usbConnections(_ output: String, pid: pid_t) -> [String] {
+    var currentClass = ""
+    var found: [String] = []
+    for raw in output.split(separator: "\n") {
+        let line = String(raw)
+        if let r = line.range(of: "<class ") {
+            currentClass = String(line[r.upperBound...].prefix { $0 != "," && $0 != ">" })
+        } else if line.contains("\"IOUserClientCreator\""), line.contains("\"pid \(pid),"),
+                  currentClass.localizedCaseInsensitiveContains("USB") {
+            found.append("\(currentClass) \u{2014} \(line.components(separatedBy: "= ").last ?? "")")
+        }
+    }
+    return found
+}
+
 /// Keeps a CoreMIDI client alive so the endpoint list stays current while the app runs.
 final class MIDIWatch {
     static let shared = MIDIWatch()
@@ -271,6 +293,7 @@ func makeLoginShowScript(_ path: String) -> String {
             delete login item (contents of n)
         end repeat
         make login item at end with properties {path:\(appleScriptQuote(path)), hidden:false}
+        set AppleScript's text item delimiters to ", "
         return "Login items now: " & (name of every login item as text)
     end tell
     """
@@ -280,6 +303,18 @@ func addLoginItemScript(_ path: String) -> String {
     """
     tell application "System Events"
         make login item at end with properties {path:\(appleScriptQuote(path)), hidden:false}
+        set AppleScript's text item delimiters to ", "
+        return "Login items now: " & (name of every login item as text)
+    end tell
+    """
+}
+
+/// Stops one item opening at login. The app or file itself is untouched.
+func removeLoginItemScript(_ path: String) -> String {
+    """
+    tell application "System Events"
+        delete (every login item whose path is \(appleScriptQuote(path)))
+        set AppleScript's text item delimiters to ", "
         return "Login items now: " & (name of every login item as text)
     end tell
     """
@@ -312,7 +347,8 @@ enum Status {
 
 enum Action {
     case fixAppNap, chooseShow, openShow, launchStreamDeck
-    case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin
+    case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
+    case removeLoginItem(LoginItem)
     case open(URL, String)
 
     var label: String {
@@ -323,7 +359,8 @@ enum Action {
         case .launchStreamDeck: return "Open Stream Deck"
         case .allowAccessibility, .allowAutomation: return "Allow access\u{2026}"
         case .makeLoginShow: return "Make it the login show\u{2026}"
-        case .addStreamDeckToLogin: return "Add to login\u{2026}"
+        case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
+        case .removeLoginItem: return "Remove\u{2026}"
         case .open(_, let label): return label
         }
     }
@@ -360,6 +397,8 @@ struct Snapshot {
     var appNapOff = false
     var usb: [USBDevice] = []
     var autoInstall: String?
+    var lightkeyUSB: [String] = []          // USB driver connections Lightkey has open
+    var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
 }
 
 final class Booth: ObservableObject {
@@ -381,6 +420,11 @@ final class Booth: ObservableObject {
     @Published var updateError: String?
     @Published var updateLog: [LogEntry] = []
 
+    @Published var starting = false
+    @Published var startNotes: [String] = []
+    @Published var longestGap: TimeInterval = 0
+    private var lastTick: Date?
+
     private var busy = false
     private var appNapSetThisSession = false
 
@@ -389,6 +433,7 @@ final class Booth: ObservableObject {
     func refresh() {
         guard !busy else { return }
         busy = true
+        let lightkeyPID = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
         DispatchQueue.global(qos: .userInitiated).async {
             let pass = Pass()
             var s = Snapshot()
@@ -400,6 +445,32 @@ final class Booth: ObservableObject {
             let upd = pass.sh("Automatic macOS updates", "/usr/bin/defaults",
                               ["read", "/Library/Preferences/com.apple.SoftwareUpdate", "AutomaticallyInstallMacOSUpdates"])
             s.autoInstall = upd.code == 0 ? upd.out.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+
+            // Experimental: is Lightkey actually using the DMX interface? Only worth asking when
+            // both are there. Logged filtered to Lightkey's own entries; the raw output is huge.
+            if let pid = lightkeyPID, s.usb.contains(where: isDMXInterface) {
+                let ioArgs = ["-l", "-w0", "-c", "IOUserClient"]
+                let io = shell("/usr/sbin/ioreg", ioArgs)
+                s.lightkeyUSB = usbConnections(io.out, pid: pid)
+                pass.entries.append(LogEntry(
+                    title: "Lightkey's USB connections (experimental)", language: "Terminal",
+                    code: commandLine("/usr/sbin/ioreg", ioArgs),
+                    output: (s.lightkeyUSB.isEmpty ? "None opened by Lightkey (pid \(pid))." : s.lightkeyUSB.joined(separator: "\n"))
+                        + "\n(Only connections opened by Lightkey are shown.)",
+                    status: io.code))
+                let lsofArgs = ["-p", String(pid), "-Fn"]
+                let ls = shell("/usr/sbin/lsof", lsofArgs)
+                s.lightkeySerial = ls.out.split(separator: "\n").compactMap { line in
+                    line.hasPrefix("n/dev/") && (line.contains("usbserial") || line.contains("usbmodem"))
+                        ? String(line.dropFirst()) : nil
+                }
+                pass.entries.append(LogEntry(
+                    title: "Lightkey's open serial ports (experimental)", language: "Terminal",
+                    code: commandLine("/usr/sbin/lsof", lsofArgs),
+                    output: (s.lightkeySerial.isEmpty ? "No USB serial ports open." : s.lightkeySerial.joined(separator: "\n"))
+                        + "\n(Only USB serial ports are shown.)",
+                    status: ls.code))
+            }
             DispatchQueue.main.async {
                 self.finish(s, pass)
                 self.busy = false
@@ -417,7 +488,7 @@ final class Booth: ObservableObject {
                  "Lightkey: \(lightkey == nil ? "not running" : "running")\nStream Deck: \(deckApp == nil ? "not running" : "running")")
 
         // Lighting ---------------------------------------------------------------------------
-        let dmx = s.usb.first { $0.vendorID == IDs.ftdiVendor || $0.name.localizedCaseInsensitiveContains("DMX") }
+        let dmx = s.usb.first(where: isDMXInterface)
         if let d = dmx {
             let serial = d.serial.isEmpty ? "" : ", serial \(d.serial)"
             out.append(Check(id: "dmx", group: "Lighting", title: "DMX interface plugged in", status: .ok,
@@ -434,6 +505,25 @@ final class Booth: ObservableObject {
                     detail: "Lightkey isn't open.", action: showPath != nil ? .openShow : nil))
 
         out.append(showCheck(lightkey, pass))
+
+        let dmxTitle = "Lightkey is sending DMX (experimental)"
+        if dmx == nil {
+            out.append(Check(id: "dmxLive", group: "Lighting", title: dmxTitle, status: .unknown,
+                             detail: "Waiting for the DMX interface."))
+        } else if lightkey == nil {
+            out.append(Check(id: "dmxLive", group: "Lighting", title: dmxTitle, status: .unknown,
+                             detail: "Waiting for Lightkey to open."))
+        } else if !s.lightkeyUSB.isEmpty {
+            out.append(Check(id: "dmxLive", group: "Lighting", title: dmxTitle, status: .ok,
+                             detail: "Lightkey has the DMX interface open."))
+        } else if let port = s.lightkeySerial.first {
+            out.append(Check(id: "dmxLive", group: "Lighting", title: dmxTitle, status: .ok,
+                             detail: "Lightkey has the DMX interface\u{2019}s port open (\(port))."))
+        } else {
+            out.append(Check(id: "dmxLive", group: "Lighting", title: dmxTitle, status: .warn,
+                             detail: "Lightkey is open, but it doesn\u{2019}t seem to be using the DMX interface.",
+                             fix: "In Lightkey, check the interface is chosen for the universe. If it is, unplug and replug the interface, then quit and reopen Lightkey. This check is new: if the lights respond, trust the lights."))
+        }
 
         let midi = MIDIWatch.shared.destinationNames()
         pass.api("Lightkey's MIDI input", "CoreMIDI: list the MIDI destinations", midi.isEmpty ? "(none)" : midi.joined(separator: "\n"))
@@ -497,6 +587,23 @@ final class Booth: ObservableObject {
                     detail: "Low Power Mode slows background apps, including the Stream Deck app.",
                     fix: "Set Low Power Mode to Never.", action: .open(Settings.battery, "Open Battery settings")))
 
+        // Booth Check itself: it opts out of App Nap, and proves it by timing its own 15-second checks.
+        let optedOut = napActivity != nil || (Bundle.main.infoDictionary?["NSAppSleepDisabled"] as? Bool) == true
+        let gap = Int(longestGap.rounded())
+        if !optedOut {
+            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .fail,
+                             detail: "Booth Check could be slowed down while it\u{2019}s in the background.",
+                             fix: "Quit and reopen Booth Check."))
+        } else if longestGap > 60 {
+            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .warn,
+                             detail: "Booth Check was held up for \(gap) seconds between checks.",
+                             fix: "If this keeps happening, check App Nap and Low Power Mode above."))
+        } else {
+            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .ok,
+                             detail: "Booth Check has opted out of App Nap and checks every 15 seconds, even in the background"
+                                + (lastTick == nil || gap == 0 ? "." : " (longest gap so far: \(gap) s).")))
+        }
+
         if s.appNapOff && appNapSetThisSession {
             out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
                              detail: "Switched off just now.", fix: "Restart the Mac for it to take effect."))
@@ -527,6 +634,21 @@ final class Booth: ObservableObject {
                 : Check(id: "deckLogin", group: "Start at login", title: "Stream Deck opens at login", status: .warn,
                         detail: "After a restart someone has to open the Stream Deck app by hand.",
                         action: .addStreamDeckToLogin))
+            let selfPath = Bundle.main.bundleURL.standardizedFileURL.path
+            let selfAtLogin = items.contains {
+                URL(fileURLWithPath: $0.path).standardizedFileURL.path == selfPath || $0.name == "Booth Check"
+            }
+            if selfAtLogin {
+                out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .ok,
+                                 detail: "Booth Check opens by itself and checks everything straight away."))
+            } else if let problem = installProblem {
+                out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .warn,
+                                 detail: "Booth Check doesn\u{2019}t open at login.", fix: problem))
+            } else {
+                out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .warn,
+                                 detail: "After a restart nobody sees these checks until someone opens Booth Check.",
+                                 action: .addSelfToLogin))
+            }
         case .notAllowed:
             pass.entries.append(LogEntry(title: "What opens at login", language: "AppleScript", code: readLoginItemsScript,
                                          output: "Not allowed to talk to System Events yet.", status: -1743))
@@ -669,6 +791,20 @@ final class Booth: ObservableObject {
                 explanation: "Adds the Stream Deck app to the login items so it starts by itself after a restart.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
             return
+        case .removeLoginItem(let item):
+            let script = removeLoginItemScript(item.path)
+            pending = PendingChange(
+                key: "removeLogin", title: "Stop \(item.name) opening at login",
+                explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
+                language: "AppleScript", code: script, run: { runAppleScript(script) })
+            return
+        case .addSelfToLogin:
+            let script = addLoginItemScript(Bundle.main.bundleURL.path)
+            pending = PendingChange(
+                key: "selfLogin", title: "Open Booth Check at login",
+                explanation: "Adds Booth Check to the login items, so it opens by itself after a restart and checks everything straight away.",
+                language: "AppleScript", code: script, run: { runAppleScript(script) })
+            return
         case .chooseShow:
             chooseShow()
         case .openShow:
@@ -718,6 +854,89 @@ final class Booth: ObservableObject {
         showPath = url.path
         UserDefaults.standard.set(url.path, forKey: IDs.showKey)
         refresh()
+    }
+}
+
+// MARK: - Timing and getting the show started
+
+extension Booth {
+    /// Called by the 15-second timer. Measures the gap since the last tick, so Booth Check can tell
+    /// whether it was held up in the background, then checks again.
+    func tick() {
+        let now = Date()
+        if let lastTick { longestGap = max(longestGap, now.timeIntervalSince(lastTick)) }
+        lastTick = now
+        if pending == nil { refresh() }
+    }
+
+    /// The Mac was asleep, so the gap since the last tick says nothing about Booth Check.
+    func macDidWake() { lastTick = nil }
+
+    /// The override for when login didn't do its job: open the show, wait for Lightkey's MIDI input,
+    /// then make sure the Stream Deck app is open. Opens things only; changes no settings.
+    func startShow() {
+        guard !starting else { return }
+        starting = true
+        startNotes = []
+        let lightkeyWasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).isEmpty
+        var waitForLightkey = lightkeyWasRunning
+
+        if let showPath, let showName {
+            NSWorkspace.shared.open(URL(fileURLWithPath: showPath))
+            startNote(lightkeyWasRunning ? "Brought \(showName) to the front in Lightkey." : "Opening \(showName) in Lightkey\u{2026}",
+                      "NSWorkspace: open \(showPath)")
+            waitForLightkey = true
+        } else if !lightkeyWasRunning, let lk = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) {
+            NSWorkspace.shared.openApplication(at: lk, configuration: .init())
+            startNote("Opening Lightkey. No show is chosen in Booth Check, so open it in Lightkey.", "NSWorkspace: open \(lk.path)")
+            waitForLightkey = true
+        } else if lightkeyWasRunning {
+            startNote("Lightkey is already open. No show is chosen in Booth Check.", "NSWorkspace: list the running apps")
+        } else {
+            startNote("Lightkey isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.lightkey)")
+        }
+
+        if waitForLightkey {
+            waitForMIDI(until: Date().addingTimeInterval(30), lightkeyWasRunning: lightkeyWasRunning)
+        } else {
+            finishStart(lightkeyWasRunning: lightkeyWasRunning)
+        }
+    }
+
+    private func startNote(_ text: String, _ code: String) {
+        startNotes.append(text)
+        changes.insert(LogEntry(title: "Get the show started", language: "macOS API", code: code, output: text, status: 0), at: 0)
+    }
+
+    /// The Stream Deck plugin looks for "Lightkey Input" when it starts, so Lightkey goes first.
+    private func waitForMIDI(until deadline: Date, lightkeyWasRunning: Bool) {
+        if MIDIWatch.shared.destinationNames().contains(where: { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }) {
+            startNote("Lightkey\u{2019}s MIDI input is ready.", "CoreMIDI: look for \u{201C}\(IDs.lightkeyMIDIInput)\u{201D}")
+            finishStart(lightkeyWasRunning: lightkeyWasRunning)
+        } else if Date() > deadline {
+            startNote("Lightkey\u{2019}s MIDI input didn\u{2019}t appear within 30 seconds. Opening the Stream Deck app anyway.",
+                      "CoreMIDI: look for \u{201C}\(IDs.lightkeyMIDIInput)\u{201D}")
+            finishStart(lightkeyWasRunning: lightkeyWasRunning)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.waitForMIDI(until: deadline, lightkeyWasRunning: lightkeyWasRunning)
+            }
+        }
+    }
+
+    private func finishStart(lightkeyWasRunning: Bool) {
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck).isEmpty {
+            startNote(lightkeyWasRunning ? "The Stream Deck app is already open."
+                                         : "The Stream Deck app was already open. If the keys don\u{2019}t respond, quit and reopen it so it finds Lightkey.",
+                      "NSWorkspace: list the running apps")
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
+            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            startNote("Opening the Stream Deck app.", "NSWorkspace: open \(url.path)")
+        } else {
+            startNote("The Stream Deck app isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.streamDeck)")
+        }
+        starting = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refresh() }
     }
 }
 
@@ -1086,7 +1305,7 @@ struct LogSheet: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    heading("Changes you approved", "Everything Booth Check has changed on this Mac since it opened.")
+                    heading("What you asked Booth Check to do", "Changes you approved, apps it opened for you, and updates, since it opened.")
                     if booth.changes.isEmpty {
                         Text("Nothing changed yet.").font(.system(size: 12)).foregroundStyle(.secondary)
                     }
@@ -1190,6 +1409,7 @@ struct ContentView: View {
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
+                    if !booth.startNotes.isEmpty { startPanel }
                     showRow
                     ForEach(groupOrder, id: \.self) { group in
                         let rows = booth.checks.filter { $0.group == group }
@@ -1208,7 +1428,7 @@ struct ContentView: View {
                 .padding(16)
             }
         }
-        .frame(minWidth: 540, idealWidth: 580, minHeight: 560, idealHeight: 820)
+        .frame(minWidth: 700, idealWidth: 720, minHeight: 560, idealHeight: 820)
         .sheet(item: $booth.pending) { ChangeSheet(change: $0, booth: booth) }
         .sheet(isPresented: $showLog) { LogSheet(booth: booth) }
         .sheet(isPresented: $booth.showUpdate) {
@@ -1219,7 +1439,10 @@ struct ContentView: View {
             booth.checkForUpdates(userInitiated: false)
         }
         .onReceive(updateTimer) { _ in booth.checkForUpdates(userInitiated: false) }
-        .onReceive(timer) { _ in if booth.pending == nil { booth.refresh() } }
+        .onReceive(timer) { _ in booth.tick() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            booth.macDidWake()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if booth.pending == nil { booth.refresh() }
         }
@@ -1245,14 +1468,46 @@ struct ContentView: View {
             Spacer()
             if booth.updateAvailable, let release = booth.latest {
                 Button("Update to \(release.version)") { booth.showUpdate = true }
-                    .buttonStyle(.borderedProminent)
             }
+            Button { booth.startShow() } label: {
+                if booth.starting {
+                    HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Starting\u{2026}") }
+                } else {
+                    Label("Get the show started", systemImage: "play.fill")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .disabled(booth.starting)
+            .help("Opens the show in Lightkey, waits for it, then opens the Stream Deck app")
             Button { showLog = true } label: { Label("Log", systemImage: "list.bullet.rectangle") }
                 .keyboardShortcut("l")
             Button("Check again") { booth.refresh() }.keyboardShortcut("r")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    private var startPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("GET THE SHOW STARTED").font(.system(size: 11, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+                Spacer()
+                if !booth.starting {
+                    Button("Dismiss") { booth.startNotes = [] }.controlSize(.small)
+                }
+            }
+            ForEach(Array(booth.startNotes.enumerated()), id: \.offset) { _, line in
+                Label(line, systemImage: "arrow.right.circle.fill")
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if booth.starting {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Waiting for Lightkey\u{2026}").font(.system(size: 12)) }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.1)))
     }
 
     private var footer: some View {
@@ -1300,6 +1555,9 @@ struct ContentView: View {
                         }
                         Spacer()
                         if item.isShow { badge(for: item) }
+                        Button("Remove\u{2026}") { booth.perform(.removeLoginItem(item)) }
+                            .controlSize(.small)
+                            .help("Stop \(item.name) opening at login. Shows the script first.")
                     }
                     .padding(.vertical, 3)
                 }
@@ -1338,8 +1596,16 @@ struct ContentView: View {
     }
 }
 
+/// Held for the app's whole life. Opts Booth Check out of App Nap so its checks keep running while
+/// Lightkey is in front; it still lets the Mac itself sleep, which is the charger settings' job.
+var napActivity: NSObjectProtocol?
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) { _ = MIDIWatch.shared }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = MIDIWatch.shared
+        napActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                            reason: "Booth Check watches the booth in the background")
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 

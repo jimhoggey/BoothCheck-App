@@ -5,21 +5,39 @@ anything that isn't. It checks every 15 seconds while it's open.
 
 | Group | Checks |
 |---|---|
-| Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey's MIDI input ready for the Stream Deck |
+| Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
-| Power & sleep | on the charger · never sleeps on the charger · Low Power Mode off · App Nap off |
-| Start at login | the right show opens at login, and no older one · Stream Deck app opens at login · the full list of what opens at login |
+| Power & sleep | on the charger · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
+| Start at login | the right show opens at login, and no older one · Stream Deck app opens at login · Booth Check opens at login · the full list of what opens at login, each with a Remove button |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking · no password after idle (macOS doesn't let apps read these two) |
+
+**Lightkey sending DMX** is experimental. An app can't see the DMX signal, but it can see whether
+Lightkey has the interface open: macOS records which app opened each USB driver connection
+(`ioreg`), and `lsof` lists the serial ports Lightkey holds. Either one counts. If the lights respond
+and this row disagrees, trust the lights.
+
+**Booth Check stays awake** because it opts out of App Nap (`NSAppSleepDisabled` plus a
+background activity). It proves it by timing its own 15-second checks, and warns if a gap ever
+passes a minute while the Mac was awake.
+
+## Get the show started
+
+The green button in the header is the override for when login didn't do its job. It opens the chosen
+show in Lightkey (or brings it to the front), waits up to 30 seconds for Lightkey's MIDI input to
+appear, then opens the Stream Deck app if it isn't open. Lightkey goes first because the Stream Deck
+plugin looks for "Lightkey Input" when it starts. It only opens apps; it changes no settings. What
+it did is shown under the header and kept in the Log.
 
 ## Nothing runs behind your back
 
 - **Checks only read.** Every command a check runs is listed in the **Log** (⌘L) with its output.
   It's the same short list each time, repeated every 15 seconds.
 - **Changes wait for you.** A button that changes something (turn App Nap off, make the chosen
-  show the only one that opens at login, add the Stream Deck app to login) first shows the exact
-  Terminal command or AppleScript, and runs it only when you press **Run**. The output appears
-  straight away, and the change is kept in the Log. App Nap also shows the command that undoes it.
+  show the only one that opens at login, add the Stream Deck app or Booth Check to login, remove
+  something from login) first shows the exact Terminal command or AppleScript, and runs it only
+  when you press **Run**. The output appears straight away, and the change is kept in the Log. App
+  Nap also shows the command that undoes it.
 - **No admin password.** Anything that would need it, such as switching sleep off, opens the right
   page of System Settings instead and says which setting to change.
 
