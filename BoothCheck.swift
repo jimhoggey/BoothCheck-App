@@ -14,6 +14,7 @@
 import AppKit
 import ApplicationServices
 import CoreMIDI
+import CryptoKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -37,6 +38,49 @@ enum Settings {
     static let loginItems = url("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
     static let accessibility = url("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
     static let automation = url("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+}
+
+// MARK: - Updates from GitHub
+
+enum Repo {
+    static let latestAPI = URL(string: "https://api.github.com/repos/jimhoggey/BoothCheck-App/releases/latest")!
+    static let releases = URL(string: "https://github.com/jimhoggey/BoothCheck-App/releases")!
+}
+
+/// The newest GitHub release and the zip attached to it.
+struct Release {
+    let version: String         // tag without the leading "v"
+    let tag: String
+    let notes: String
+    let page: URL
+    let zipURL: URL
+    let zipName: String
+    let size: Int
+    let sha256: String?         // GitHub's own checksum of the zip
+}
+
+func parseRelease(_ data: Data) -> Release? {
+    guard let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let tag = d["tag_name"] as? String,
+          let assets = d["assets"] as? [[String: Any]],
+          let zip = assets.first(where: { ($0["name"] as? String)?.lowercased().hasSuffix(".zip") == true }),
+          let download = (zip["browser_download_url"] as? String).flatMap(URL.init(string:)) else { return nil }
+    let digest = (zip["digest"] as? String).flatMap { $0.hasPrefix("sha256:") ? String($0.dropFirst(7)) : nil }
+    return Release(version: tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV")), tag: tag,
+                   notes: (d["body"] as? String) ?? "",
+                   page: (d["html_url"] as? String).flatMap(URL.init(string:)) ?? Repo.releases,
+                   zipURL: download, zipName: (zip["name"] as? String) ?? "update.zip",
+                   size: (zip["size"] as? Int) ?? 0, sha256: digest)
+}
+
+/// "1.10" is newer than "1.9"; missing parts count as 0.
+func isNewer(_ a: String, than b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p > q }
+    }
+    return false
 }
 
 // MARK: - Log
@@ -328,6 +372,14 @@ final class Booth: ObservableObject {
     @Published var pending: PendingChange?
     @Published var lastPass: [LogEntry] = []
     @Published var changes: [LogEntry] = []
+
+    @Published var latest: Release?
+    @Published var updateStatus = ""
+    @Published var showUpdate = false
+    @Published var updating = false
+    @Published var updateSteps: [String] = []
+    @Published var updateError: String?
+    @Published var updateLog: [LogEntry] = []
 
     private var busy = false
     private var appNapSetThisSession = false
@@ -669,7 +721,264 @@ final class Booth: ObservableObject {
     }
 }
 
+// MARK: - Updating
+
+extension Booth {
+    var currentVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+    var updateAvailable: Bool { latest.map { isNewer($0.version, than: currentVersion) } ?? false }
+
+    /// Why this copy can't replace itself where it is, if it can't.
+    var installProblem: String? {
+        let app = Bundle.main.bundleURL
+        if app.path.contains("/AppTranslocation/") {
+            return "macOS is running this copy from a temporary location. Drag Booth Check into Applications, open it from there, then update."
+        }
+        let folder = app.deletingLastPathComponent().path
+        if !FileManager.default.isWritableFile(atPath: folder) {
+            return "Booth Check can't write to \(folder). Move it into Applications first."
+        }
+        return nil
+    }
+
+    /// Asks GitHub for the newest release. Only reads; installing is a separate, approved step.
+    func checkForUpdates(userInitiated: Bool) {
+        var request = URLRequest(url: Repo.latestAPI, timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("BoothCheck/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        updateStatus = "Checking for updates\u{2026}"
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            let http = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let release = data.flatMap(parseRelease)
+            DispatchQueue.main.async {
+                let summary: String
+                if let error {
+                    summary = error.localizedDescription
+                } else if let release {
+                    summary = "Newest release: \(release.tag)\nDownload: \(release.zipName), \(release.size) bytes\nSHA-256: \(release.sha256 ?? "not given")"
+                } else {
+                    summary = "HTTP \(http): no release with a zip attached."
+                }
+                self.updateLog.insert(LogEntry(title: "Check for updates", language: "Network",
+                                               code: "GET \(Repo.latestAPI.absoluteString)",
+                                               output: summary, status: release == nil ? 1 : 0), at: 0)
+                if self.updateLog.count > 20 { self.updateLog.removeLast(self.updateLog.count - 20) }
+                guard let release else {
+                    self.updateStatus = "Couldn\u{2019}t reach GitHub to check for updates."
+                    return
+                }
+                self.latest = release
+                if self.updateAvailable {
+                    self.updateStatus = "Version \(release.version) is available."
+                    if userInitiated { self.showUpdate = true }
+                } else {
+                    self.updateStatus = "Up to date."
+                }
+            }
+        }.resume()
+    }
+
+    /// Downloads, checks and installs a release, then reopens. Stops before touching anything if a
+    /// check fails, and puts the old copy back if the swap itself fails.
+    func installUpdate(_ r: Release) {
+        updating = true
+        updateError = nil
+        updateSteps = []
+        let current = Bundle.main.bundleURL
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            let work = fm.temporaryDirectory.appendingPathComponent("BoothCheckUpdate-\(UUID().uuidString)")
+
+            func step(_ s: String) { DispatchQueue.main.async { self.updateSteps.append(s) } }
+            func log(_ title: String, _ language: String, _ code: String, _ output: String, _ status: Int32) {
+                let e = LogEntry(title: title, language: language, code: code, output: output, status: status)
+                DispatchQueue.main.async { self.changes.insert(e, at: 0) }
+            }
+            func fail(_ s: String) {
+                try? fm.removeItem(at: work)
+                DispatchQueue.main.async {
+                    self.updateError = s
+                    self.updating = false
+                }
+            }
+
+            do { try fm.createDirectory(at: work, withIntermediateDirectories: true) } catch {
+                return fail("Couldn\u{2019}t make a temporary folder: \(error.localizedDescription)")
+            }
+
+            // 1. Download
+            let zip = work.appendingPathComponent(r.zipName)
+            let done = DispatchSemaphore(value: 0)
+            var body: Data?
+            var problem: String?
+            URLSession.shared.dataTask(with: URLRequest(url: r.zipURL, timeoutInterval: 120)) { data, response, error in
+                if let error { problem = error.localizedDescription }
+                else if let http = response as? HTTPURLResponse, http.statusCode != 200 { problem = "HTTP \(http.statusCode)" }
+                else { body = data }
+                done.signal()
+            }.resume()
+            done.wait()
+            guard let data = body, (try? data.write(to: zip)) != nil else {
+                log("Update: download", "Network", "GET \(r.zipURL.absoluteString)", problem ?? "No data", 1)
+                return fail("The download failed: \(problem ?? "no data").")
+            }
+            log("Update: download", "Network", "GET \(r.zipURL.absoluteString)", "\(data.count) bytes saved to \(zip.path)", 0)
+            step("Downloaded \(r.zipName) (\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)))")
+
+            // 2. Checksum
+            guard let expected = r.sha256 else {
+                return fail("GitHub didn\u{2019}t give a checksum for this download, so it wasn\u{2019}t installed.")
+            }
+            let got = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            log("Update: check the download", "macOS API", "CryptoKit: SHA-256 of \(r.zipName)",
+                "GitHub says \(expected)\nDownload is \(got)", got == expected ? 0 : 1)
+            guard got == expected else {
+                return fail("The download doesn\u{2019}t match GitHub\u{2019}s checksum, so it wasn\u{2019}t installed.")
+            }
+            step("Checksum matches GitHub\u{2019}s")
+
+            // 3. Unzip
+            let unzipped = work.appendingPathComponent("unzipped")
+            let unzipArgs = ["-x", "-k", zip.path, unzipped.path]
+            let u = shell("/usr/bin/ditto", unzipArgs)
+            log("Update: unzip", "Terminal", commandLine("/usr/bin/ditto", unzipArgs), u.out.isEmpty ? "(no output)" : u.out, u.code)
+            guard u.code == 0,
+                  let newApp = (try? fm.contentsOfDirectory(at: unzipped, includingPropertiesForKeys: nil))?
+                    .first(where: { $0.pathExtension == "app" }) else {
+                return fail("Couldn\u{2019}t unzip the update.")
+            }
+            step("Unzipped")
+
+            // 4. Is it really Booth Check at that version, with an intact signature?
+            let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist"))
+            let newID = info?["CFBundleIdentifier"] as? String
+            let newVersion = info?["CFBundleShortVersionString"] as? String
+            guard newID == bundleID, newVersion == r.version else {
+                return fail("The download isn\u{2019}t Booth Check \(r.version) (it says \(newID ?? "?") \(newVersion ?? "?")), so it wasn\u{2019}t installed.")
+            }
+            let sigArgs = ["--verify", "--deep", "--strict", newApp.path]
+            let sig = shell("/usr/bin/codesign", sigArgs)
+            log("Update: check the app", "Terminal", commandLine("/usr/bin/codesign", sigArgs),
+                sig.out.isEmpty ? "Signature is intact." : sig.out, sig.code)
+            guard sig.code == 0 else {
+                return fail("The new app\u{2019}s signature is broken, so it wasn\u{2019}t installed.")
+            }
+            step("It\u{2019}s Booth Check \(r.version), signature intact")
+
+            // 5. Swap: old copy to the Trash (recoverable), new copy into its place.
+            var trashed: NSURL?
+            do { try fm.trashItem(at: current, resultingItemURL: &trashed) } catch {
+                return fail("Couldn\u{2019}t move the old copy to the Trash: \(error.localizedDescription)")
+            }
+            do { try fm.moveItem(at: newApp, to: current) } catch {
+                if let t = trashed as URL? { try? fm.moveItem(at: t, to: current) }
+                return fail("Couldn\u{2019}t put the new version in place, so the old one was put back: \(error.localizedDescription)")
+            }
+            log("Update: replace", "macOS API",
+                "FileManager: move \(current.path) to the Trash, then move the new app to \(current.path)",
+                "The old copy is in the Trash: \((trashed as URL?)?.path ?? "?")", 0)
+            step("Installed \(r.version). The old copy is in the Trash")
+            try? fm.removeItem(at: work)
+
+            // 6. Reopen the new copy once this one has quit.
+            DispatchQueue.main.async {
+                self.updateSteps.append("Reopening\u{2026}")
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                p.arguments = ["-c", "sleep 1; /usr/bin/open \"$1\"", "sh", current.path]
+                try? p.run()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
+            }
+        }
+    }
+}
+
 // MARK: - Views
+
+struct UpdateSheet: View {
+    @ObservedObject var booth: Booth
+    let release: Release
+
+    private var notes: AttributedString {
+        (try? AttributedString(markdown: release.notes,
+                               options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(release.notes)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Update to Booth Check \(release.version)").font(.system(size: 17, weight: .bold))
+                    Text("You have \(booth.currentVersion).").font(.system(size: 12)).foregroundStyle(.secondary)
+                    if !release.notes.isEmpty {
+                        Text("What\u{2019}s new").font(.system(size: 12, weight: .semibold))
+                        ScrollView {
+                            Text(notes).font(.system(size: 12)).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                        }
+                        .frame(maxHeight: 110)
+                        .background(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
+                    }
+                    Text("What happens when you press Update").font(.system(size: 12, weight: .semibold))
+                    stepRow(1, "Download \(release.zipName) (\(ByteCountFormatter.string(fromByteCount: Int64(release.size), countStyle: .file))) from GitHub:",
+                            release.zipURL.absoluteString)
+                    stepRow(2, "Check it matches the SHA-256 checksum GitHub gives for it:",
+                            release.sha256 ?? "GitHub gave no checksum, so the update will stop here.")
+                    stepRow(3, "Unzip it into a temporary folder:",
+                            "/usr/bin/ditto -x -k <download> <temporary folder>")
+                    stepRow(4, "Check it\u{2019}s Booth Check \(release.version) and its signature is intact:",
+                            "/usr/bin/codesign --verify --deep --strict <new app>")
+                    stepRow(5, "Move this copy to the Trash and put the new one in its place:",
+                            Bundle.main.bundleURL.path)
+                    stepRow(6, "Reopen Booth Check. macOS asks for the System Events and Accessibility permissions again, because it\u{2019}s a new build.", nil)
+                    Text("If any check fails, nothing is changed.").font(.system(size: 11)).foregroundStyle(.secondary)
+
+                    if !booth.updateSteps.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(booth.updateSteps, id: \.self) { s in
+                                Label(s, systemImage: "checkmark.circle.fill").font(.system(size: 12)).foregroundStyle(.green)
+                            }
+                        }
+                    }
+                    if let err = booth.updateError {
+                        Label(err, systemImage: "xmark.circle.fill").font(.system(size: 12)).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let problem = booth.installProblem {
+                        Label(problem, systemImage: "exclamationmark.triangle.fill").font(.system(size: 12))
+                            .foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(20)
+            }
+            Divider()
+            HStack {
+                Button("Release page") { NSWorkspace.shared.open(release.page) }
+                Spacer()
+                Button("Cancel") { booth.showUpdate = false }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(booth.updating)
+                Button(booth.updating ? "Updating\u{2026}" : "Update") { booth.installUpdate(release) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(booth.updating || booth.installProblem != nil || release.sha256 == nil)
+            }
+            .padding(16)
+        }
+        .frame(width: 560, height: 600)
+    }
+
+    private func stepRow(_ n: Int, _ text: String, _ code: String?) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("\(n)").font(.system(size: 12, weight: .bold)).foregroundStyle(.secondary).frame(width: 14, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(text).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+                if let code { CodeBlock(text: code) }
+            }
+        }
+    }
+}
 
 struct CodeBlock: View {
     let text: String
@@ -776,6 +1085,12 @@ struct LogSheet: View {
                     }
                     ForEach(booth.changes) { entryView($0, showOutput: true) }
                     Divider().padding(.vertical, 4)
+                    heading("Update checks", "Booth Check asks GitHub for the newest release when it opens, every six hours, and when you ask. This only reads.")
+                    if booth.updateLog.isEmpty {
+                        Text("No update check yet.").font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
+                    ForEach(booth.updateLog) { entryView($0, showOutput: true) }
+                    Divider().padding(.vertical, 4)
                     heading("Last check", "What was read to fill in the checks, at "
                             + (booth.lastChecked?.formatted(date: .omitted, time: .standard) ?? "\u{2014}")
                             + ". These only read; they change nothing.")
@@ -847,9 +1162,10 @@ struct CheckRow: View {
 }
 
 struct ContentView: View {
-    @StateObject private var booth = Booth()
+    @ObservedObject var booth: Booth
     @State private var showLog = false
     private let timer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    private let updateTimer = Timer.publish(every: 6 * 60 * 60, on: .main, in: .common).autoconnect()
 
     private var problems: Int { booth.checks.filter { $0.status == .fail || $0.status == .warn }.count }
     private var unknowns: Int { booth.checks.filter { $0.status == .unknown }.count }
@@ -880,6 +1196,7 @@ struct ContentView: View {
                         }
                         if group == "Start at login" { loginList }
                     }
+                    footer
                 }
                 .padding(16)
             }
@@ -887,7 +1204,14 @@ struct ContentView: View {
         .frame(minWidth: 540, idealWidth: 580, minHeight: 560, idealHeight: 820)
         .sheet(item: $booth.pending) { ChangeSheet(change: $0, booth: booth) }
         .sheet(isPresented: $showLog) { LogSheet(booth: booth) }
-        .onAppear { booth.refresh() }
+        .sheet(isPresented: $booth.showUpdate) {
+            if let release = booth.latest { UpdateSheet(booth: booth, release: release) }
+        }
+        .onAppear {
+            booth.refresh()
+            booth.checkForUpdates(userInitiated: false)
+        }
+        .onReceive(updateTimer) { _ in booth.checkForUpdates(userInitiated: false) }
         .onReceive(timer) { _ in if booth.pending == nil { booth.refresh() } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if booth.pending == nil { booth.refresh() }
@@ -912,12 +1236,30 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if booth.updateAvailable, let release = booth.latest {
+                Button("Update to \(release.version)") { booth.showUpdate = true }
+                    .buttonStyle(.borderedProminent)
+            }
             Button { showLog = true } label: { Label("Log", systemImage: "list.bullet.rectangle") }
                 .keyboardShortcut("l")
             Button("Check again") { booth.refresh() }.keyboardShortcut("r")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Text("Booth Check \(booth.currentVersion)").font(.system(size: 11, weight: .medium))
+            Text(booth.updateStatus).font(.system(size: 11)).foregroundStyle(.secondary)
+            Spacer()
+            if booth.updateAvailable {
+                Button("See update\u{2026}") { booth.showUpdate = true }.controlSize(.small)
+            } else {
+                Button("Check for updates") { booth.checkForUpdates(userInitiated: true) }.controlSize(.small)
+            }
+        }
+        .padding(.top, 4)
     }
 
     private var showRow: some View {
@@ -997,9 +1339,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct BoothCheckApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var booth = Booth()
 
     var body: some Scene {
-        WindowGroup("Booth Check") { ContentView() }
+        WindowGroup("Booth Check") { ContentView(booth: booth) }
             .windowResizability(.contentMinSize)
+            .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates\u{2026}") { booth.checkForUpdates(userInitiated: true) }
+                }
+            }
     }
 }

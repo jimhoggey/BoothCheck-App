@@ -42,6 +42,25 @@ It needs nothing installed. It's one universal app for Apple silicon and Intel, 
 
 To have it greet whoever sits down, add Booth Check itself to Login Items.
 
+## Updates
+
+Booth Check asks GitHub for the newest release when it opens, every six hours while it's open, and
+when you click **Check for updates** (bottom of the window, or the Booth Check menu). When there's a
+newer version an **Update to x.y** button appears. It shows what's new and every step before
+anything happens:
+
+1. Download the release zip from GitHub.
+2. Check it against the SHA-256 checksum GitHub publishes for it.
+3. Unzip it (`ditto`).
+4. Check it's Booth Check at the version offered, with an intact signature (`codesign --verify`).
+5. Move the current copy to the Trash and put the new one in its place.
+6. Reopen. macOS asks for the two permissions again, because it's a new build.
+
+If any check fails, nothing changes, and every step is kept in the Log. The app has to be somewhere
+it can write, such as Applications, not run straight from Downloads.
+
+1.0 has no updater, so a Mac on 1.0 needs 1.1 installed by hand once.
+
 ## Changing the show version
 
 Click **Change…** at the top and pick the new file. "The right show opens at login" goes red; click
@@ -57,3 +76,16 @@ Needs the Xcode Command Line Tools on the Mac doing the build, and nowhere else.
 SDK the installed Swift compiler accepts, builds arm64 and x86_64, joins them, draws the icon, signs
 the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS asks for the two
 permissions again.
+
+## Releasing an update
+
+1. Bump `CFBundleShortVersionString` (and `CFBundleVersion`) in `Info.plist`, and commit.
+2. Run:
+
+```bash
+./release.sh "What changed, in a line or two"
+```
+
+It builds, checks the built app carries that version, pushes, and publishes release `v<version>`
+with the zip attached. Every copy of Booth Check offers it within six hours, or straight away from
+Check for updates.
