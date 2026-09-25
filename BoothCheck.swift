@@ -27,6 +27,7 @@ enum IDs {
     static let ftdiVendor = 0x0403            // the chip inside Enttec Open DMX USB and most USB-DMX cables
     static let lightkeyMIDIInput = "Lightkey Input"
     static let showKey = "showPath"
+    static let autoStartKey = "startShowAtLogin"
 }
 
 enum Settings {
@@ -309,6 +310,17 @@ func addLoginItemScript(_ path: String) -> String {
     """
 }
 
+let removeShowLoginItemsScript = """
+tell application "System Events"
+    set oldNames to name of every login item whose path ends with ".lightkeyproj"
+    repeat with n in oldNames
+        delete login item (contents of n)
+    end repeat
+    set AppleScript's text item delimiters to ", "
+    return "Login items now: " & (name of every login item as text)
+end tell
+"""
+
 /// Stops one item opening at login. The app or file itself is untouched.
 func removeLoginItemScript(_ path: String) -> String {
     """
@@ -349,6 +361,7 @@ enum Action {
     case fixAppNap, chooseShow, openShow, launchStreamDeck
     case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
     case removeLoginItem(LoginItem)
+    case removeShowLoginItems
     case open(URL, String)
 
     var label: String {
@@ -360,7 +373,7 @@ enum Action {
         case .allowAccessibility, .allowAutomation: return "Allow access\u{2026}"
         case .makeLoginShow: return "Make it the login show\u{2026}"
         case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
-        case .removeLoginItem: return "Remove\u{2026}"
+        case .removeLoginItem, .removeShowLoginItems: return "Remove\u{2026}"
         case .open(_, let label): return label
         }
     }
@@ -402,6 +415,8 @@ struct Snapshot {
 }
 
 final class Booth: ObservableObject {
+    static let shared = Booth()
+
     @Published var checks: [Check] = []
     @Published var loginItems: [LoginItem] = []
     @Published var loginRead: LoginRead = .items([])
@@ -424,6 +439,16 @@ final class Booth: ObservableObject {
     @Published var startNotes: [String] = []
     @Published var longestGap: TimeInterval = 0
     private var lastTick: Date?
+    private var startCompletion: (() -> Void)?
+    private var timers: [Timer] = []
+
+    /// At login, open the show, wait for Lightkey, then open Stream Deck. On unless switched off.
+    @Published var autoStart: Bool = (UserDefaults.standard.object(forKey: IDs.autoStartKey) as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(autoStart, forKey: IDs.autoStartKey)
+            refresh()
+        }
+    }
 
     private var busy = false
     private var appNapSetThisSession = false
@@ -624,30 +649,62 @@ final class Booth: ObservableObject {
                                          output: items.isEmpty ? "(nothing)" : items.map { "\($0.name) \u{2014} \($0.path)" }.joined(separator: "\n"),
                                          status: 0))
             loginItems = items
-            out.append(loginShowCheck(items))
-            let deckAtLogin = items.contains {
-                $0.name.localizedCaseInsensitiveContains("Stream Deck") || $0.path.localizedCaseInsensitiveContains("Stream Deck")
-            }
-            out.append(deckAtLogin
-                ? Check(id: "deckLogin", group: "Start at login", title: "Stream Deck opens at login", status: .ok,
-                        detail: "The Stream Deck app starts by itself.")
-                : Check(id: "deckLogin", group: "Start at login", title: "Stream Deck opens at login", status: .warn,
-                        detail: "After a restart someone has to open the Stream Deck app by hand.",
-                        action: .addStreamDeckToLogin))
             let selfPath = Bundle.main.bundleURL.standardizedFileURL.path
             let selfAtLogin = items.contains {
                 URL(fileURLWithPath: $0.path).standardizedFileURL.path == selfPath || $0.name == "Booth Check"
             }
+            let deckItem = items.first {
+                $0.name.localizedCaseInsensitiveContains("Stream Deck") || $0.path.localizedCaseInsensitiveContains("Stream Deck")
+            }
             if selfAtLogin {
                 out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .ok,
-                                 detail: "Booth Check opens by itself and checks everything straight away."))
+                                 detail: autoStart ? "Booth Check opens by itself, starts the show and checks everything."
+                                                   : "Booth Check opens by itself and checks everything straight away."))
             } else if let problem = installProblem {
                 out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .warn,
                                  detail: "Booth Check doesn\u{2019}t open at login.", fix: problem))
             } else {
-                out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login", status: .warn,
-                                 detail: "After a restart nobody sees these checks until someone opens Booth Check.",
+                out.append(Check(id: "selfLogin", group: "Start at login", title: "Booth Check opens at login",
+                                 status: autoStart ? .fail : .warn,
+                                 detail: autoStart ? "Nothing starts the show after a restart until someone opens Booth Check."
+                                                   : "After a restart nobody sees these checks until someone opens Booth Check.",
                                  action: .addSelfToLogin))
+            }
+
+            if autoStart {
+                // Booth Check starts everything in order, so shows and Stream Deck shouldn't also open on their own.
+                if let showName {
+                    out.append(Check(id: "autoShow", group: "Start at login", title: "Booth Check starts the show", status: .ok,
+                                     detail: "At login it opens \(showName), waits for Lightkey, then opens the Stream Deck app."))
+                } else {
+                    out.append(Check(id: "autoShow", group: "Start at login", title: "Booth Check starts the show", status: .warn,
+                                     detail: "Choose the show this Mac should run.", action: .chooseShow))
+                }
+                let shows = items.filter(\.isShow)
+                out.append(shows.isEmpty
+                    ? Check(id: "loginShows", group: "Start at login", title: "No show opens on its own at login", status: .ok,
+                            detail: "Only Booth Check opens the show.")
+                    : Check(id: "loginShows", group: "Start at login", title: "No show opens on its own at login", status: .warn,
+                            detail: "\(shows.map(\.name).joined(separator: ", ")) also open\(shows.count == 1 ? "s" : "") at login, which can race Booth Check or open an older version.",
+                            fix: "Booth Check opens the show itself, so take it off the login items.",
+                            action: .removeShowLoginItems))
+                if let deckItem {
+                    out.append(Check(id: "deckLogin", group: "Start at login", title: "Stream Deck waits for Lightkey", status: .warn,
+                                     detail: "The Stream Deck app also opens at login on its own, so it can start before Lightkey\u{2019}s MIDI input exists and the keys stay dead.",
+                                     fix: "Booth Check opens it after Lightkey, so take it off the login items.",
+                                     action: .removeLoginItem(deckItem)))
+                } else {
+                    out.append(Check(id: "deckLogin", group: "Start at login", title: "Stream Deck waits for Lightkey", status: .ok,
+                                     detail: "Booth Check opens the Stream Deck app once Lightkey is ready."))
+                }
+            } else {
+                out.append(loginShowCheck(items))
+                out.append(deckItem != nil
+                    ? Check(id: "deckLogin", group: "Start at login", title: "Stream Deck opens at login", status: .ok,
+                            detail: "The Stream Deck app starts by itself.")
+                    : Check(id: "deckLogin", group: "Start at login", title: "Stream Deck opens at login", status: .warn,
+                            detail: "After a restart someone has to open the Stream Deck app by hand.",
+                            action: .addStreamDeckToLogin))
             }
         case .notAllowed:
             pass.entries.append(LogEntry(title: "What opens at login", language: "AppleScript", code: readLoginItemsScript,
@@ -798,6 +855,13 @@ final class Booth: ObservableObject {
                 explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
             return
+        case .removeShowLoginItems:
+            let script = removeShowLoginItemsScript
+            pending = PendingChange(
+                key: "removeShows", title: "Stop shows opening at login on their own",
+                explanation: "Removes every Lightkey show from the login items. Booth Check opens the chosen show itself at login, in the right order. The show files aren\u{2019}t touched.",
+                language: "AppleScript", code: script, run: { runAppleScript(script) })
+            return
         case .addSelfToLogin:
             let script = addLoginItemScript(Bundle.main.bundleURL.path)
             pending = PendingChange(
@@ -857,6 +921,60 @@ final class Booth: ObservableObject {
     }
 }
 
+// MARK: - Running in the background
+
+extension Booth {
+    var problemCount: Int { checks.filter { $0.status == .fail || $0.status == .warn }.count }
+    var unknownCount: Int { checks.filter { $0.status == .unknown }.count }
+    private var anyFailing: Bool { checks.contains { $0.status == .fail } }
+
+    /// Icon, colour and headline shared by the window and the menu bar.
+    var summary: (symbol: String, color: Color, title: String) {
+        if checks.isEmpty { return ("hourglass", .secondary, "Checking\u{2026}") }
+        if problemCount == 0 && unknownCount == 0 { return ("checkmark.seal.fill", .green, "Ready for the service") }
+        if problemCount == 0 {
+            return ("questionmark.circle.fill", .secondary,
+                    "\(unknownCount) check\(unknownCount == 1 ? "" : "s") couldn\u{2019}t run")
+        }
+        return (anyFailing ? "xmark.octagon.fill" : "exclamationmark.triangle.fill", anyFailing ? .red : .orange,
+                "\(problemCount) thing\(problemCount == 1 ? "" : "s") to fix")
+    }
+
+    /// The menu bar shows shape rather than colour, since macOS draws menu bar icons in one colour.
+    var menuSymbol: String {
+        if checks.isEmpty { return "hourglass" }
+        if problemCount == 0 { return unknownCount == 0 ? "checkmark.circle" : "questionmark.circle" }
+        return anyFailing ? "xmark.octagon" : "exclamationmark.triangle"
+    }
+
+    /// Starts the checks, the update checks and the wake watcher. They run whether or not the window
+    /// is open, so the menu bar icon is always current.
+    func start() {
+        guard timers.isEmpty else { return }
+        refresh()
+        checkForUpdates(userInitiated: false)
+        let checks = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.tick() }
+        let updates = Timer(timeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(userInitiated: false)
+        }
+        for t in [checks, updates] { RunLoop.main.add(t, forMode: .common) }
+        timers = [checks, updates]
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
+                                                          queue: .main) { [weak self] _ in self?.macDidWake() }
+    }
+
+    func showWindow() { MainWindow.shared.show() }
+
+    /// After login has had its chance: if anything needs attention, open the window once so whoever
+    /// sits down sees it. Otherwise stay quietly in the menu bar.
+    func reviewStartup() {
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            if self.problemCount > 0 { self.showWindow() }
+        }
+    }
+}
+
 // MARK: - Timing and getting the show started
 
 extension Booth {
@@ -874,10 +992,11 @@ extension Booth {
 
     /// The override for when login didn't do its job: open the show, wait for Lightkey's MIDI input,
     /// then make sure the Stream Deck app is open. Opens things only; changes no settings.
-    func startShow() {
+    func startShow(then completion: (() -> Void)? = nil) {
         guard !starting else { return }
         starting = true
         startNotes = []
+        startCompletion = completion
         let lightkeyWasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).isEmpty
         var waitForLightkey = lightkeyWasRunning
 
@@ -936,7 +1055,12 @@ extension Booth {
             startNote("The Stream Deck app isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.streamDeck)")
         }
         starting = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refresh() }
+        let completion = startCompletion
+        startCompletion = nil
+        // Give Stream Deck a moment to appear before checking again or reviewing the startup.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if let completion { completion() } else { self.refresh() }
+        }
     }
 }
 
@@ -1390,12 +1514,6 @@ struct CheckRow: View {
 struct ContentView: View {
     @ObservedObject var booth: Booth
     @State private var showLog = false
-    private let timer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
-    private let updateTimer = Timer.publish(every: 6 * 60 * 60, on: .main, in: .common).autoconnect()
-
-    private var problems: Int { booth.checks.filter { $0.status == .fail || $0.status == .warn }.count }
-    private var unknowns: Int { booth.checks.filter { $0.status == .unknown }.count }
-    private var failing: Bool { booth.checks.contains { $0.status == .fail } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1411,6 +1529,7 @@ struct ContentView: View {
                     }
                     if !booth.startNotes.isEmpty { startPanel }
                     showRow
+                    autoStartRow
                     ForEach(groupOrder, id: \.self) { group in
                         let rows = booth.checks.filter { $0.group == group }
                         if !rows.isEmpty {
@@ -1434,28 +1553,13 @@ struct ContentView: View {
         .sheet(isPresented: $booth.showUpdate) {
             if let release = booth.latest { UpdateSheet(booth: booth, release: release) }
         }
-        .onAppear {
-            booth.refresh()
-            booth.checkForUpdates(userInitiated: false)
-        }
-        .onReceive(updateTimer) { _ in booth.checkForUpdates(userInitiated: false) }
-        .onReceive(timer) { _ in booth.tick() }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
-            booth.macDidWake()
-        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if booth.pending == nil { booth.refresh() }
         }
     }
 
     private var header: some View {
-        let (symbol, color, title): (String, Color, String) = {
-            if booth.checks.isEmpty { return ("hourglass", .secondary, "Checking\u{2026}") }
-            if problems == 0 && unknowns == 0 { return ("checkmark.seal.fill", .green, "Ready for the service") }
-            if problems == 0 { return ("questionmark.circle.fill", .secondary, "\(unknowns) check\(unknowns == 1 ? "" : "s") couldn\u{2019}t run") }
-            return (failing ? "xmark.octagon.fill" : "exclamationmark.triangle.fill", failing ? .red : .orange,
-                    "\(problems) thing\(problems == 1 ? "" : "s") to fix")
-        }()
+        let (symbol, color, title) = booth.summary
         return HStack(spacing: 12) {
             Image(systemName: symbol).font(.system(size: 30)).foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
@@ -1540,6 +1644,20 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
+    private var autoStartRow: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Toggle("", isOn: $booth.autoStart).toggleStyle(.switch).labelsHidden().controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Start the show when the Mac starts").font(.system(size: 13, weight: .medium))
+                Text("At login, Booth Check opens the show, waits for Lightkey, then opens the Stream Deck app, in that order. It needs Booth Check itself to open at login.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+
     @ViewBuilder private var loginList: some View {
         if case .items(let items) = booth.loginRead {
             section("Everything that opens at login") {
@@ -1596,31 +1714,174 @@ struct ContentView: View {
     }
 }
 
+/// The full window, made on demand and kept for reuse. Built in AppKit rather than as a SwiftUI
+/// scene so it never opens by itself at login.
+final class MainWindow {
+    static let shared = MainWindow()
+    private var window: NSWindow?
+
+    func show() {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 820),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             backing: .buffered, defer: false)
+            w.title = "Booth Check"
+            w.isReleasedWhenClosed = false
+            w.contentViewController = NSHostingController(rootView: ContentView(booth: Booth.shared))
+            w.setContentSize(NSSize(width: 720, height: 820))
+            w.setFrameAutosaveName("BoothCheckMain")
+            if !w.setFrameUsingName("BoothCheckMain") { w.center() }
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+/// The menu bar icon: its shape shows the state, and a count appears when something needs attention.
+struct StatusLabel: View {
+    @ObservedObject var booth: Booth
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Image(systemName: booth.menuSymbol)
+            if booth.problemCount > 0 { Text("\(booth.problemCount)") }
+        }
+    }
+}
+
+/// What drops down from the menu bar: only what needs attention, and the two things you'd reach for.
+struct MenuPanel: View {
+    @ObservedObject var booth: Booth
+
+    var body: some View {
+        let s = booth.summary
+        let issues = booth.checks.filter { $0.status == .fail || $0.status == .warn }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: s.symbol).font(.system(size: 22)).foregroundStyle(s.color)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(s.title).font(.system(size: 14, weight: .bold))
+                    Text(booth.lastChecked.map { "Checked at \($0.formatted(date: .omitted, time: .shortened))" } ?? "Checking\u{2026}")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+            if !issues.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(issues.prefix(8)) { check in
+                        Button { booth.showWindow() } label: {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: check.status.symbol).foregroundStyle(check.status.color)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(check.title).font(.system(size: 12, weight: .semibold))
+                                    Text(check.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open Booth Check to fix this")
+                    }
+                    if issues.count > 8 {
+                        Text("and \(issues.count - 8) more\u{2026}").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+            } else if !booth.checks.isEmpty {
+                Text("Everything Booth Check looks at is fine.").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            if !booth.startNotes.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(booth.startNotes.suffix(4).enumerated()), id: \.offset) { _, line in
+                        Label(line, systemImage: "arrow.right.circle.fill").font(.system(size: 11))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if booth.updateAvailable, let release = booth.latest {
+                Button("Booth Check \(release.version) is available\u{2026}") {
+                    booth.showWindow()
+                    booth.showUpdate = true
+                }
+                .controlSize(.small)
+            }
+            Divider()
+            Button { booth.startShow() } label: {
+                Label(booth.starting ? "Starting\u{2026}" : "Get the show started", systemImage: "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .controlSize(.large)
+            .disabled(booth.starting)
+            HStack {
+                Button("Open Booth Check") { booth.showWindow() }
+                Button("Check again") { booth.refresh() }
+                Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+            }
+            .controlSize(.small)
+        }
+        .padding(14)
+        .frame(width: 360)
+    }
+}
+
 /// Held for the app's whole life. Opts Booth Check out of App Nap so its checks keep running while
 /// Lightkey is in front; it still lets the Mac itself sleep, which is the charger settings' job.
 var napActivity: NSObjectProtocol?
+
+/// True when macOS opened Booth Check as a login item, rather than someone opening it by hand.
+/// `--login` forces it, for testing.
+func launchedAsLoginItem() -> Bool {
+    if CommandLine.arguments.contains("--login") { return true }
+    if let event = NSAppleEventManager.shared().currentAppleEvent,
+       event.eventID == AEEventID(kAEOpenApplication),
+       event.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue == OSType(keyAELaunchedAsLogInItem) {
+        return true
+    }
+    return ProcessInfo.processInfo.systemUptime < 180      // just after a restart
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = MIDIWatch.shared
         napActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
                                                             reason: "Booth Check watches the booth in the background")
+        let booth = Booth.shared
+        let atLogin = launchedAsLoginItem()
+        booth.start()
+        if !atLogin {
+            booth.showWindow()                       // someone opened it on purpose
+        } else if booth.autoStart, booth.showPath != nil {
+            booth.startShow { booth.reviewStartup() }
+        } else {
+            // Give the other login items time to open before judging.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { booth.reviewStartup() }
+        }
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Opening Booth Check again while it's running (Finder, Spotlight, Dock) shows the window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        Booth.shared.showWindow()
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 
 @main
 struct BoothCheckApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var booth = Booth()
+    @StateObject private var booth = Booth.shared
 
     var body: some Scene {
-        WindowGroup("Booth Check") { ContentView(booth: booth) }
-            .windowResizability(.contentMinSize)
-            .commands {
-                CommandGroup(after: .appInfo) {
-                    Button("Check for Updates\u{2026}") { booth.checkForUpdates(userInitiated: true) }
-                }
-            }
+        MenuBarExtra {
+            MenuPanel(booth: booth)
+        } label: {
+            StatusLabel(booth: booth)
+        }
+        .menuBarExtraStyle(.window)
     }
 }

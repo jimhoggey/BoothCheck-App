@@ -1,43 +1,66 @@
 # Booth Check
 
-One window that says whether the lighting booth Mac is ready for a service, and what to do about
-anything that isn't. It checks every 15 seconds while it's open.
+A menu bar app that keeps the lighting booth Mac ready for a service. At login it starts the show in
+the right order and checks everything; if it's all green it stays out of the way, and if not it opens
+its window once so whoever sits down sees what to fix.
+
+## How it behaves
+
+- **Lives in the menu bar.** No Dock icon, not in Cmd-Tab, never takes focus from Lightkey. The icon's
+  shape shows the state: a tick when everything's fine, a triangle or cross with a count when
+  something needs attention. Click it to see just the problems, **Get the show started**, and
+  **Open Booth Check** for the full window.
+- **At login** it opens the chosen show in Lightkey, waits for Lightkey's MIDI input, then opens the
+  Stream Deck app, in that order, then checks everything. If anything needs attention it opens its
+  window once. After that it never pops up during a service; only the icon changes.
+- **Opened by hand**, it shows the window straight away.
+- **Checks every 15 seconds** in the background, window open or not.
+
+Starting the show at login can be switched off in the window ("Start the show when the Mac starts").
+Then it only checks, and expects the show and Stream Deck to be login items themselves.
+
+## What it checks
 
 | Group | Checks |
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
 | Power & sleep | on the charger · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
-| Start at login | the right show opens at login, and no older one · Stream Deck app opens at login · Booth Check opens at login · the full list of what opens at login, each with a Remove button |
+| Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey · the full list of what opens at login, each with a Remove button |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking · no password after idle (macOS doesn't let apps read these two) |
+
+**Why only Booth Check should open at login.** Login items all start at once, in no set order. If
+the Stream Deck app wins the race, its MIDI plugin can start before Lightkey's MIDI input exists and
+the keys stay dead until Stream Deck is restarted. Booth Check opens them one after the other, so the
+login checks ask for shows and Stream Deck to come off the login items. If the Stream Deck app has
+its own "launch at login" option switched on in its preferences, Booth Check can't see that; switch
+it off there too.
 
 **Lightkey sending DMX** is experimental. An app can't see the DMX signal, but it can see whether
 Lightkey has the interface open: macOS records which app opened each USB driver connection
 (`ioreg`), and `lsof` lists the serial ports Lightkey holds. Either one counts. If the lights respond
 and this row disagrees, trust the lights.
 
-**Booth Check stays awake** because it opts out of App Nap (`NSAppSleepDisabled` plus a
-background activity). It proves it by timing its own 15-second checks, and warns if a gap ever
-passes a minute while the Mac was awake.
+**Booth Check stays awake** because it opts out of App Nap (`NSAppSleepDisabled` plus a background
+activity). It proves it by timing its own 15-second checks, and warns if a gap ever passes a minute
+while the Mac was awake.
 
 ## Get the show started
 
-The green button in the header is the override for when login didn't do its job. It opens the chosen
-show in Lightkey (or brings it to the front), waits up to 30 seconds for Lightkey's MIDI input to
-appear, then opens the Stream Deck app if it isn't open. Lightkey goes first because the Stream Deck
-plugin looks for "Lightkey Input" when it starts. It only opens apps; it changes no settings. What
-it did is shown under the header and kept in the Log.
+The green button, in the window header and the menu bar dropdown, does by hand what login does: opens
+the chosen show in Lightkey (or brings it to the front), waits up to 30 seconds for Lightkey's MIDI
+input, then opens the Stream Deck app if it isn't open. It only opens apps; it changes no settings.
+What it did is shown and kept in the Log.
 
 ## Nothing runs behind your back
 
 - **Checks only read.** Every command a check runs is listed in the **Log** (⌘L) with its output.
   It's the same short list each time, repeated every 15 seconds.
-- **Changes wait for you.** A button that changes something (turn App Nap off, make the chosen
-  show the only one that opens at login, add the Stream Deck app or Booth Check to login, remove
-  something from login) first shows the exact Terminal command or AppleScript, and runs it only
-  when you press **Run**. The output appears straight away, and the change is kept in the Log. App
-  Nap also shows the command that undoes it.
+- **Changes wait for you.** A button that changes something (turn App Nap off, add Booth Check to
+  login, remove something from login) first shows the exact Terminal command or AppleScript, and runs
+  it only when you press **Run**. The output appears straight away, and the change is kept in the
+  Log. App Nap also shows the command that undoes it.
 - **No admin password.** Anything that would need it, such as switching sleep off, opens the right
   page of System Settings instead and says which setting to change.
 
@@ -47,24 +70,27 @@ Other buttons only open things: the show, the Stream Deck app, or a page of Syst
 
 It needs nothing installed. It's one universal app for Apple silicon and Intel, macOS 13 or later.
 
-1. Download `Booth.Check.zip` from this repo's latest release (or copy `build/Booth Check.zip`),
-   double-click it, and drag **Booth Check** into Applications.
+1. Download `Booth.Check.zip` from this repo's latest release, double-click it, and drag
+   **Booth Check** into Applications.
 2. **First launch only:** right-click Booth Check → Open → Open. It isn't signed with a paid Apple
    developer account, so a plain double-click the first time gets "can't be opened". If there's no
    Open button, go to System Settings → Privacy & Security, scroll down, and click **Open Anyway**.
 3. Click **Choose show…** and pick the show file this Mac should run.
 4. Allow the two permissions when it asks:
-   - **System Events** (asked straight away) — to read and change what opens at login.
-   - **Accessibility** (click *Allow access…* on "The right show is open") — to read which show
+   - **System Events** (asked straight away): to read and change what opens at login.
+   - **Accessibility** (click *Allow access…* on "The right show is open"): to read which show
      Lightkey has open. Turn Booth Check on in the list, then quit and reopen Booth Check.
+5. Under **Start at login**, click **Add to login…** on "Booth Check opens at login", and remove any
+   show or Stream Deck entries it points out.
 
-To have it greet whoever sits down, add Booth Check itself to Login Items.
+To quit it, click the menu bar icon → Quit. To bring the window back, click the icon → Open Booth
+Check, or open Booth Check again from Applications.
 
 ## Updates
 
-Booth Check asks GitHub for the newest release when it opens, every six hours while it's open, and
-when you click **Check for updates** (bottom of the window, or the Booth Check menu). When there's a
-newer version an **Update to x.y** button appears. It shows what's new and every step before
+Booth Check asks GitHub for the newest release when it starts, every six hours, and when you click
+**Check for updates** at the bottom of the window. When there's a newer version, an **Update to x.y**
+button appears in the window and the menu bar dropdown. It shows what's new and every step before
 anything happens:
 
 1. Download the release zip from GitHub.
@@ -77,12 +103,12 @@ anything happens:
 If any check fails, nothing changes, and every step is kept in the Log. The app has to be somewhere
 it can write, such as Applications, not run straight from Downloads.
 
-1.0 has no updater, so a Mac on 1.0 needs 1.1 installed by hand once.
+1.0 has no updater, so a Mac on 1.0 needs a newer version installed by hand once.
 
 ## Changing the show version
 
-Click **Change…** at the top and pick the new file. "The right show opens at login" goes red; click
-**Make it the login show** and the old version is removed from login and the new one added.
+Click **Change…** at the top of the window and pick the new file. Booth Check opens that one from the
+next login, and "The right show is open" checks against it straight away.
 
 ## Rebuilding
 
@@ -94,6 +120,12 @@ Needs the Xcode Command Line Tools on the Mac doing the build, and nowhere else.
 SDK the installed Swift compiler accepts, builds arm64 and x86_64, joins them, draws the icon, signs
 the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS asks for the two
 permissions again.
+
+To try the login behaviour without restarting, open it with `--login`:
+
+```bash
+open "build/Booth Check.app" --args --login
+```
 
 ## Releasing an update
 
