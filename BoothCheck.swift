@@ -362,6 +362,7 @@ enum Action {
     case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
     case removeLoginItem(LoginItem)
     case removeShowLoginItems
+    case enableAutoBoot(String?)
     case open(URL, String)
 
     var label: String {
@@ -374,6 +375,7 @@ enum Action {
         case .makeLoginShow: return "Make it the login show\u{2026}"
         case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
         case .removeLoginItem, .removeShowLoginItems: return "Remove\u{2026}"
+        case .enableAutoBoot: return "Turn on\u{2026}"
         case .open(_, let label): return label
         }
     }
@@ -387,7 +389,22 @@ struct Check: Identifiable {
     let detail: String
     var fix: String? = nil
     var action: Action? = nil
+    var info: String? = nil         // "what is this?", shown from the row's ⓘ button
 }
+
+let autoBootInfo = """
+When this MacBook is shut down, plugging in the charger turns it on, without opening the lid or \
+pressing the power button. That matters in clamshell mode, where the lid stays closed under a \
+monitor: shut down from the Apple menu, and to start again, unplug the charger and plug it back in.
+
+It only acts on a Mac that is shut down. It doesn\u{2019}t wake a sleeping Mac, and it doesn\u{2019}t stop \
+you shutting down. Opening the lid starts the Mac too.
+
+It\u{2019}s a firmware setting stored in NVRAM, not in System Settings. Reading it needs no password; \
+changing it needs an administrator password. Intel MacBooks from 2016 on call it AutoBoot and have \
+it on from the factory. Apple silicon MacBooks call it BootPreference, which can also turn off \
+starting when the lid opens.
+"""
 
 /// A change waiting for the user to read the code and press Run.
 struct PendingChange: Identifiable {
@@ -412,6 +429,33 @@ struct Snapshot {
     var autoInstall: String?
     var lightkeyUSB: [String] = []          // USB driver connections Lightkey has open
     var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
+    var hasBattery = false                  // a laptop, so starting from the charger applies
+    var bootValue: String?                  // the firmware setting; nil = not set = factory setting
+    var bootReadFailed = false
+}
+
+// MARK: - Starting up from the charger (laptops)
+
+// Intel MacBooks (2016 on) use AutoBoot: %00 off, anything else or unset on.
+// Apple silicon uses BootPreference: unset = lid and charger both start it, %01 = charger only,
+// %02 = lid only, %00 = neither (Apple support article 120622).
+#if arch(arm64)
+let bootVariable = "BootPreference"
+func startsOnCharger(_ value: String?) -> Bool { value == nil || value == "%01" }
+func enableBootArgs(_ value: String?) -> [String] { value == "%00" ? ["BootPreference=%01"] : ["-d", "BootPreference"] }
+#else
+let bootVariable = "AutoBoot"
+func startsOnCharger(_ value: String?) -> Bool { value != "%00" }
+func enableBootArgs(_ value: String?) -> [String] { ["AutoBoot=%03"] }
+#endif
+
+/// The value from `nvram <name>` output ("AutoBoot\t%03").
+func nvramValue(_ output: String) -> String? {
+    output.split(separator: "\t").last.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
+func undoBootArgs(_ value: String?) -> [String] {
+    value.map { ["\(bootVariable)=\($0)"] } ?? ["-d", bootVariable]
 }
 
 final class Booth: ObservableObject {
@@ -462,7 +506,17 @@ final class Booth: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let pass = Pass()
             var s = Snapshot()
-            s.onAC = pass.sh("Power source", "/usr/bin/pmset", ["-g", "batt"]).out.contains("'AC Power'")
+            let batt = pass.sh("Power source", "/usr/bin/pmset", ["-g", "batt"]).out
+            s.onAC = batt.contains("'AC Power'")
+            s.hasBattery = batt.contains("InternalBattery")
+            if s.hasBattery {
+                let boot = pass.sh("Starts from the charger", "/usr/sbin/nvram", [bootVariable])
+                if boot.code == 0 {
+                    s.bootValue = nvramValue(boot.out)
+                } else if !boot.out.contains("not found") {
+                    s.bootReadFailed = true
+                }
+            }
             s.ac = pmsetSection(pass.sh("Sleep settings", "/usr/bin/pmset", ["-g", "custom"]).out, "AC Power")
             s.appNapOff = pass.sh("App Nap setting", "/usr/bin/defaults", ["read", "-g", "NSAppSleepDisabled"])
                 .out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
@@ -583,6 +637,24 @@ final class Booth: ObservableObject {
             ? Check(id: "ac", group: "Power & sleep", title: "On the charger", status: .ok, detail: "Running on AC power.")
             : Check(id: "ac", group: "Power & sleep", title: "On the charger", status: .fail,
                     detail: "Running on battery.", fix: "Plug the charger in. The Mac only stays awake on power."))
+
+        if s.hasBattery {
+            let title = "Starts up when the charger is plugged in"
+            if s.bootReadFailed {
+                out.append(Check(id: "autoboot", group: "Power & sleep", title: title, status: .unknown,
+                                 detail: "Couldn\u{2019}t read the start-up setting.", info: autoBootInfo))
+            } else if startsOnCharger(s.bootValue) {
+                out.append(Check(id: "autoboot", group: "Power & sleep", title: title, status: .ok,
+                                 detail: "If the Mac is shut down with the lid closed, unplugging and replugging the charger starts it"
+                                    + (s.bootValue == nil ? " (the factory setting)." : "."),
+                                 info: autoBootInfo))
+            } else {
+                out.append(Check(id: "autoboot", group: "Power & sleep", title: title, status: .warn,
+                                 detail: "Plugging in the charger won\u{2019}t start this Mac, so in clamshell mode someone has to open the lid and press the power button.",
+                                 fix: "Optional, but it means the Mac can be started without opening it.",
+                                 action: .enableAutoBoot(s.bootValue), info: autoBootInfo))
+            }
+        }
 
         // Changing sleep needs the admin password, so these send you to System Settings instead.
         if s.ac.isEmpty {
@@ -854,6 +926,23 @@ final class Booth: ObservableObject {
                 key: "removeLogin", title: "Stop \(item.name) opening at login",
                 explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
+            return
+        case .enableAutoBoot(let current):
+            // A firmware setting with no System Settings page, so this is the one change that asks
+            // for the admin password. The sheet shows exactly which command it's for.
+            let args = enableBootArgs(current)
+            let shown = "sudo " + commandLine("/usr/sbin/nvram", args)
+            let script = "do shell script \(appleScriptQuote(commandLine("/usr/sbin/nvram", args))) with administrator privileges"
+            pending = PendingChange(
+                key: "autoboot", title: "Start up when the charger is plugged in",
+                explanation: "Changes a firmware setting so that, when the Mac is shut down, plugging in the charger starts it, even with the lid closed. It has no page in System Settings, so macOS asks for an administrator password for this one command. Booth Check never sees the password. You can also copy the command and run it in Terminal yourself.",
+                language: "Terminal command (as administrator)", code: shown,
+                undo: "sudo " + commandLine("/usr/sbin/nvram", undoBootArgs(current)),
+                run: {
+                    let r = runAppleScript(script)
+                    return r.code == -128 ? ("Cancelled at the password prompt. Nothing changed.", 1)
+                                          : (r.code == 0 ? "Done. The Mac now starts when the charger is plugged in." : r.out, r.code)
+                })
             return
         case .removeShowLoginItems:
             let script = removeShowLoginItemsScript
@@ -1483,6 +1572,7 @@ struct LogSheet: View {
 struct CheckRow: View {
     let check: Check
     let perform: (Action) -> Void
+    @State private var showInfo = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -1492,7 +1582,25 @@ struct CheckRow: View {
                 .frame(width: 20)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 2) {
-                Text(check.title).font(.system(size: 13, weight: .semibold))
+                HStack(spacing: 5) {
+                    Text(check.title).font(.system(size: 13, weight: .semibold))
+                    if let info = check.info {
+                        Button { showInfo.toggle() } label: {
+                            Image(systemName: "info.circle").font(.system(size: 12)).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("What this does")
+                        .popover(isPresented: $showInfo, arrowEdge: .bottom) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(check.title).font(.system(size: 13, weight: .bold))
+                                Text(info).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(14)
+                            .frame(width: 380)
+                        }
+                    }
+                }
                 Text(check.detail)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)

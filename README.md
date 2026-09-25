@@ -25,7 +25,7 @@ Then it only checks, and expects the show and Stream Deck to be login items them
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
-| Power & sleep | on the charger · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
+| Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey · the full list of what opens at login, each with a Remove button |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking · no password after idle (macOS doesn't let apps read these two) |
@@ -36,6 +36,16 @@ the keys stay dead until Stream Deck is restarted. Booth Check opens them one af
 login checks ask for shows and Stream Deck to come off the login items. If the Stream Deck app has
 its own "launch at login" option switched on in its preferences, Booth Check can't see that; switch
 it off there too.
+
+**Starts up when the charger is plugged in** (AutoBoot) matters in clamshell mode, where the lid
+stays closed under a monitor. With it on, a shut-down MacBook starts when you unplug and replug the
+charger, so nobody has to open the lid to press the power button. It only acts on a Mac that's shut
+down; it doesn't wake a sleeping one or stop you shutting down. It's a firmware setting in NVRAM:
+`AutoBoot` on Intel MacBooks from 2016 on (on from the factory), `BootPreference` on Apple silicon.
+Booth Check reads it without a password. Turning it on is the one change that asks for the admin
+password, because it has no System Settings page; the approval sheet shows the exact `sudo nvram`
+command and its undo first, and you can copy it into Terminal instead. The ⓘ next to the check
+explains it in the app.
 
 **Lightkey sending DMX** is experimental. An app can't see the DMX signal, but it can see whether
 Lightkey has the interface open: macOS records which app opened each USB driver connection
