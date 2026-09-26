@@ -136,8 +136,7 @@
     <li><p><span class="what">Open Audio MIDI Setup</span> <span class="why">(Applications → Utilities, or Spotlight), then <b>Window → Show MIDI Studio</b>, then the globe button, <b>MIDI Network Setup</b>.</span></p></li>
     <li><p><span class="what">Under My Sessions, click +, rename it “ProPresenter Link”, and tick Enabled.</span> <span class="why">Leave the port at 5004.</span></p></li>
     <li><p><span class="what">Set “Who may connect to me” to Anyone.</span> <span class="why">The PC makes the connection, so the Mac only has to accept it.</span></p></li>
-    <li><p><span class="what">Give the MacBook a fixed address on the network.</span> <span class="why">A DHCP reservation on the router is simplest. The PC normally finds the Mac by name (Bonjour), but a fixed IP means you can add it by hand if that ever fails.</span></p></li>
-    <li><p><span class="what">If macOS asks whether to accept incoming network connections, click Allow.</span> <span class="why">That appears only when the Mac’s firewall is on.</span></p></li>
+    <li><p><span class="what">Give the MacBook a fixed address on the network.</span> <span class="why">A DHCP reservation on the router is simplest. The PC normally finds the Mac by name (Bonjour); a fixed IP lets you add it by hand if that fails. If macOS asks to accept incoming connections, click Allow.</span></p></li>
   </ol>
 </div>
 
@@ -148,7 +147,7 @@
     <li><p><span class="what">Open rtpMIDI, click + under My Sessions, name it “ProPresenter Link”, and tick Enabled.</span> <span class="why">That session name is what ProPresenter lists as a MIDI port.</span></p></li>
     <li><p><span class="what">Under Directory, pick the MacBook and click Connect.</span> <span class="why">It moves into Participants. Not listed? Click + under Directory and enter the Mac’s IP address and port 5004.</span></p></li>
     <li><p><span class="what">When Windows Firewall asks, allow rtpMIDI on private networks.</span> <span class="why">It uses UDP ports 5004 and 5005.</span></p></li>
-    <li><p><span class="what">Use wired Ethernet for both machines if you can.</span> <span class="why">Wi-Fi works, but can delay or drop a note, and a dropped note is a cue that doesn’t fire.</span></p></li>
+    <li><p><span class="what">Use wired Ethernet for both machines if you can.</span> <span class="why">On Wi-Fi a note can arrive late or not at all.</span></p></li>
   </ol>
 </div>
 
@@ -161,11 +160,12 @@
     <li><p><span class="what">For moments inside a video, use the presentation’s Timeline.</span> <span class="why">Open it with the Timeline button at the top right of the presentation. Put the video on it, then drop the MIDI actions (or macros holding them) at the moments you want. Rewind and press Play: the video and the cues run together. The Timeline can also follow SMPTE timecode for frame accuracy.</span></p></li>
     <li><p><span class="what">Use macros for looks you reuse.</span> <span class="why">A macro called “Lights: Walk-in” holding the MIDI action can go on any slide or timeline, so the note number is set in one place.</span></p></li>
   </ol>
-  <p class="tip"><b>Why channel 16:</b> the v33 show already uses MIDI channels 1 to 4 for the Stream Deck, 230 notes in all. Keeping ProPresenter on channel 16 means a ProPresenter note can never fire a Stream Deck cue by accident. Some apps count channels 0–15, so Lightkey may show it as 15 or 16; either is the same channel.</p>
+  <p class="tip"><b>Already built for ProPresenter:</b> the Summit Opener cues OP-01 to OP-60 listen on <b>channel 1, note 39 + the cue number</b> (OP-01 = note 40, OP-60 = note 99) from any MIDI port. Send those from ProPresenter and they fire with no work in Lightkey, but they’re set to Toggle, so see step 4b. <b>For any new cue, use channel 16:</b> channels 1 to 4 are taken (230 notes, most of them the Stream Deck’s), so a stray note there could fire a deck cue. Some apps count channels 0–15, so Lightkey may show 16 as 15; it’s the same channel.</p>
 </div>
 
 <div class="part">
   <div class="part-head"><span class="n">4</span><h2>Catch the notes in Lightkey</h2><span class="where mac">MacBook</span></div>
+  <p class="note" style="color: var(--muted); margin-bottom: 1.8mm;">Steps a and c only for cues without a note yet; step b for every cue ProPresenter fires, OP cues included.</p>
   <ol class="steps">
     <li><p><span class="what">Right-click the cue → External Control → Add Trigger, then fire the ProPresenter action once.</span> <span class="why">Lightkey learns the note and channel from what it receives.</span></p></li>
     <li><p><span class="what">Change the trigger’s behaviour from Toggle to Activate.</span> <span class="why">With Toggle, the same note arriving twice, as it will when you rehearse the video, switches the cue off again. Activate only ever switches it on.</span></p></li>
@@ -222,12 +222,11 @@
       <tr><td class="num">1</td><td class="ex">Walk-in look</td><td class="ex">Macro “Lights: Walk-in”, on the countdown video’s first frame</td></tr>
       <tr><td class="num"></td><td></td><td></td></tr>
       <tr><td class="num"></td><td></td><td></td></tr>
-      <tr><td class="num"></td><td></td><td></td></tr>
     </tbody>
   </table>
 </section>
 
-<footer>Written 26 September 2026 for ProPresenter 7 on Windows and Lightkey with the v33 show. Menu names come from the vendors’ own guides; check them against the versions installed. Sources: tobias-erichsen.de (rtpMIDI and its tutorial); renewedvision.com (“ProPresenter + Lightkey”, “Automate with Timeline”); support.renewedvision.com (“Devices: MIDI” setup, “Sending MIDI cues”); lightkeyapp.com/en/help.</footer>
+<footer>Written 26 September 2026 for ProPresenter 7 on Windows and Lightkey with the v33 show. Menu names come from the vendors’ guides (tobias-erichsen.de, renewedvision.com, lightkeyapp.com); check them against the versions installed.</footer>
 
 </body>
 </html>
