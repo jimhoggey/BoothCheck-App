@@ -10,9 +10,20 @@ its window once so whoever sits down sees what to fix.
   shape shows the state: a tick when everything's fine, a triangle or cross with a count when
   something needs attention. Click it to see just the problems, **Get the show started**, and
   **Open Booth Check** for the full window.
-- **At login** it opens the chosen show in Lightkey, waits for Lightkey's MIDI input, then opens the
-  Stream Deck app, in that order, then checks everything. If anything needs attention it opens its
-  window once. After that it never pops up during a service; only the icon changes.
+- **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
+  the top right that floats over everything, full-screen Lightkey included, without taking focus:
+
+  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it
+  2. Open any other apps, such as ProPresenter
+  3. Open the show in Lightkey (while it opens: "If macOS asks to allow an accessory, click Allow")
+  4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
+  5. Confirm Lightkey has the DMX interface open (experimental)
+  6. Open Stream Deck in the background, so Lightkey stays in front
+  7. Check everything
+
+  Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
+  the service" and hides itself; if not it stays, with **Open Booth Check**. After that it never pops
+  up during a service; only the icon changes.
 - **Opened by hand**, it shows the window straight away.
 - **Checks every 15 seconds** in the background, window open or not.
 
@@ -54,7 +65,7 @@ the sheet.
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
-| Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey · the full list of what opens at login, each with a Remove button |
+| Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking · no password after idle (macOS doesn't let apps read these two) |
 
@@ -86,10 +97,9 @@ while the Mac was awake.
 
 ## Get the show started
 
-The green button, in the window header and the menu bar dropdown, does by hand what login does: opens
-the chosen show in Lightkey (or brings it to the front), waits up to 30 seconds for Lightkey's MIDI
-input, then opens the Stream Deck app if it isn't open. It only opens apps; it changes no settings.
-What it did is shown and kept in the Log.
+The green button, in the window header and the menu bar dropdown, runs the same numbered start-up
+by hand, in the same floating panel: anything already open is left alone (the show is just brought to
+the front). It only opens apps; it changes no settings. Each step is kept in the Log.
 
 ## Nothing runs behind your back
 

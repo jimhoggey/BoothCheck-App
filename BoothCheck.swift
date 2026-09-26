@@ -481,6 +481,16 @@ it on from the factory. Apple silicon MacBooks call it BootPreference, which can
 starting when the lid opens.
 """
 
+enum StepState { case waiting, running, done, warn, failed }
+
+/// One step of the start-up order: "Wait for the DMX interface", "Open Stream Deck in the background"…
+struct BootStep: Identifiable, Equatable {
+    let id: String
+    var title: String
+    var state: StepState = .waiting
+    var detail: String? = nil
+}
+
 /// A change waiting for the user to read the code and press Run.
 struct PendingChange: Identifiable {
     let id = UUID()
@@ -555,10 +565,10 @@ final class Booth: ObservableObject {
     @Published var updateLog: [LogEntry] = []
 
     @Published var starting = false
-    @Published var startNotes: [String] = []
+    @Published var bootSteps: [BootStep] = []
+    @Published var bootFinished = false
     @Published var longestGap: TimeInterval = 0
     private var lastTick: Date?
-    private var startCompletion: (() -> Void)?
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -1283,15 +1293,6 @@ extension Booth {
     func logSetting(_ title: String, _ output: String) {
         changes.insert(LogEntry(title: title, language: "Booth Check setting", code: title, output: output, status: nil), at: 0)
     }
-
-    /// After login has had its chance: if anything needs attention, open the window once so whoever
-    /// sits down sees it. Otherwise stay quietly in the menu bar.
-    func reviewStartup() {
-        refresh()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            if self.problemCount > 0 { self.showWindow() }
-        }
-    }
 }
 
 // MARK: - Timing and getting the show started
@@ -1309,96 +1310,185 @@ extension Booth {
     /// The Mac was asleep, so the gap since the last tick says nothing about Booth Check.
     func macDidWake() { lastTick = nil }
 
-    /// The override for when login didn't do its job: open the show, wait for Lightkey's MIDI input,
-    /// then make sure the Stream Deck app is open. Opens things only; changes no settings.
-    func startShow(then completion: (() -> Void)? = nil) {
+    /// The start-up order, as numbered steps. The same list is shown in This Mac before anyone
+    /// restarts, and ticks off live in the start-up panel while it runs.
+    func plannedSteps(checkOnly: Bool = false) -> [BootStep] {
+        var steps: [BootStep] = []
+        if !checkOnly {
+            // Lightkey attaches to the DMX interface when it opens, so the interface comes first.
+            if setup.lightkey && setup.dmx { steps.append(BootStep(id: "dmxWait", title: "Wait for the DMX interface")) }
+            for app in setup.apps where app.on { steps.append(BootStep(id: "app:\(app.bundleID)", title: "Open \(app.name)")) }
+            if setup.lightkey {
+                let show = showName.map { ($0 as NSString).deletingPathExtension }
+                steps.append(BootStep(id: "lightkey", title: show.map { "Open \($0) in Lightkey" } ?? "Open Lightkey"))
+            }
+            // The Stream Deck plugin looks for Lightkey's MIDI input when it starts.
+            if setup.lightkey && setup.streamDeck { steps.append(BootStep(id: "midi", title: "Wait for Lightkey to be ready for the Stream Deck")) }
+            if setup.lightkey && setup.dmx { steps.append(BootStep(id: "dmxLink", title: "Lightkey connects to the DMX interface")) }
+            if setup.streamDeck { steps.append(BootStep(id: "deck", title: "Open Stream Deck in the background")) }
+        }
+        steps.append(BootStep(id: "check", title: "Check everything"))
+        return steps
+    }
+
+    /// Runs the start-up steps in order, shown live in a small panel that floats over everything,
+    /// full-screen Lightkey included. Opens apps only; changes no settings. `checkOnly` is the
+    /// login path on a Mac that doesn't start the show: just check, and show the result.
+    func startShow(checkOnly: Bool = false) {
         guard !starting else { return }
         starting = true
-        startNotes = []
-        startCompletion = completion
+        bootFinished = false
+        bootSteps = plannedSteps(checkOnly: checkOnly)
+        BootPanel.shared.show(steps: bootSteps.count)
+        runStep(0)
+    }
 
-        // Apps that don't depend on anything go first, such as ProPresenter.
-        for app in setup.apps where app.on {
-            if !NSRunningApplication.runningApplications(withBundleIdentifier: app.bundleID).isEmpty {
-                startNote("\(app.name) is already open.", "NSWorkspace: list the running apps")
-            } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleID) {
-                NSWorkspace.shared.openApplication(at: url, configuration: .init())
-                startNote("Opening \(app.name).", "NSWorkspace: open \(url.path)")
+    private func setStep(_ i: Int, _ state: StepState, _ detail: String? = nil) {
+        guard i < bootSteps.count else { return }
+        bootSteps[i].state = state
+        if let detail { bootSteps[i].detail = detail }
+        if state != .running {
+            changes.insert(LogEntry(title: "Start-up \(i + 1): \(bootSteps[i].title)", language: "Start-up",
+                                    code: bootSteps[i].title, output: bootSteps[i].detail ?? "Done.",
+                                    status: state == .done ? 0 : 1), at: 0)
+        }
+    }
+
+    /// Re-tests `test` every `interval` seconds until it passes or `timeout` runs out. Shell-based
+    /// tests run off the main thread.
+    private func poll(every interval: TimeInterval = 1, for timeout: TimeInterval, background: Bool = false,
+                      _ test: @escaping () -> Bool, done: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(timeout)
+        func attempt() {
+            let evaluate = {
+                let ok = test()
+                DispatchQueue.main.async {
+                    if ok { done(true) }
+                    else if Date() > deadline { done(false) }
+                    else { DispatchQueue.main.asyncAfter(deadline: .now() + interval) { attempt() } }
+                }
+            }
+            if background { DispatchQueue.global(qos: .userInitiated).async(execute: evaluate) } else { evaluate() }
+        }
+        attempt()
+    }
+
+    private func isRunning(_ bundleID: String) -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+    }
+
+    private func runStep(_ i: Int) {
+        guard i < bootSteps.count else { return finishBoot() }
+        let next = { self.runStep(i + 1) }
+        setStep(i, .running)
+        let id = bootSteps[i].id
+
+        switch id {
+        case "dmxWait":
+            poll(for: 30, background: true, {
+                usbDevices(shell("/usr/sbin/ioreg", ["-p", "IOUSB", "-l", "-w0"]).out).contains(where: isDMXInterface)
+            }) { ok in
+                self.setStep(i, ok ? .done : .warn,
+                             ok ? "Found on USB." : "Not found after 30 seconds. Opening Lightkey anyway; check the DMX USB cable.")
+                next()
+            }
+
+        case _ where id.hasPrefix("app:"):
+            let bundleID = String(id.dropFirst(4))
+            if isRunning(bundleID) {
+                setStep(i, .done, "Already open.")
+            } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                // On a Lightkey Mac, Lightkey should end up in front, so other apps open behind it.
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = !setup.lightkey
+                NSWorkspace.shared.openApplication(at: url, configuration: config)
+                setStep(i, .done, "Opened.")
             } else {
-                startNote("\(app.name) isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(app.bundleID)")
+                setStep(i, .failed, "Not installed on this Mac.")
+            }
+            next()
+
+        case "lightkey":
+            let wasRunning = isRunning(IDs.lightkey)
+            if let showPath {
+                NSWorkspace.shared.open(URL(fileURLWithPath: showPath))
+            } else if !wasRunning, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) {
+                NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            } else if !wasRunning {
+                setStep(i, .failed, "Lightkey isn\u{2019}t installed on this Mac.")
+                return next()
+            }
+            setStep(i, .running, "If macOS asks to allow an accessory, click Allow.")
+            poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
+                if !ok {
+                    self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
+                } else if self.showPath == nil {
+                    self.setStep(i, .warn, "No show is chosen in Booth Check, so open it in Lightkey.")
+                } else {
+                    self.setStep(i, .done, wasRunning ? "Already open; brought to the front." : "Opened.")
+                }
+                next()
+            }
+
+        case "midi":
+            poll(every: 0.5, for: 45, {
+                MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }
+            }) { ok in
+                self.setStep(i, ok ? .done : .warn,
+                             ok ? "Lightkey\u{2019}s MIDI input is ready." : "Not ready after 45 seconds. Opening Stream Deck anyway.")
+                next()
+            }
+
+        case "dmxLink":
+            guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier else {
+                setStep(i, .warn, "Lightkey isn\u{2019}t open.")
+                return next()
+            }
+            poll(every: 2, for: 20, background: true, {
+                !usbConnections(shell("/usr/sbin/ioreg", ["-l", "-w0", "-c", "IOUserClient"]).out, pid: pid).isEmpty
+                    || shell("/usr/sbin/lsof", ["-p", String(pid), "-Fn"]).out.split(separator: "\n").contains {
+                        $0.hasPrefix("n/dev/") && ($0.contains("usbserial") || $0.contains("usbmodem"))
+                    }
+            }) { ok in
+                self.setStep(i, ok ? .done : .warn,
+                             ok ? "Lightkey has the interface open."
+                                : "Couldn\u{2019}t confirm (this check is experimental). If the lights respond, all is well.")
+                next()
+            }
+
+        case "deck":
+            if isRunning(IDs.streamDeck) {
+                setStep(i, .done, "Already open.")
+            } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
+                // In the background, so Lightkey stays in front and full screen isn't interrupted.
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: config)
+                setStep(i, .done, "Opened behind Lightkey.")
+            } else {
+                setStep(i, .failed, "Not installed on this Mac.")
+            }
+            next()
+
+        default:        // "check"
+            refresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                let n = self.problemCount
+                self.setStep(i, n == 0 ? .done : .warn,
+                             n == 0 ? "Everything is green." : "\(n) thing\(n == 1 ? "" : "s") to fix. Open Booth Check to see what.")
+                next()
             }
         }
-        guard setup.lightkey else {
-            finishStart(lightkeyWasRunning: true)
-            return
-        }
-
-        let lightkeyWasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).isEmpty
-        var waitForLightkey = lightkeyWasRunning
-
-        if let showPath, let showName {
-            NSWorkspace.shared.open(URL(fileURLWithPath: showPath))
-            startNote(lightkeyWasRunning ? "Brought \(showName) to the front in Lightkey." : "Opening \(showName) in Lightkey\u{2026}",
-                      "NSWorkspace: open \(showPath)")
-            waitForLightkey = true
-        } else if !lightkeyWasRunning, let lk = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) {
-            NSWorkspace.shared.openApplication(at: lk, configuration: .init())
-            startNote("Opening Lightkey. No show is chosen in Booth Check, so open it in Lightkey.", "NSWorkspace: open \(lk.path)")
-            waitForLightkey = true
-        } else if lightkeyWasRunning {
-            startNote("Lightkey is already open. No show is chosen in Booth Check.", "NSWorkspace: list the running apps")
-        } else {
-            startNote("Lightkey isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.lightkey)")
-        }
-
-        // Waiting for Lightkey's MIDI input only matters when a Stream Deck is going to look for it.
-        if waitForLightkey && setup.streamDeck {
-            waitForMIDI(until: Date().addingTimeInterval(30), lightkeyWasRunning: lightkeyWasRunning)
-        } else {
-            finishStart(lightkeyWasRunning: lightkeyWasRunning)
-        }
     }
 
-    private func startNote(_ text: String, _ code: String) {
-        startNotes.append(text)
-        changes.insert(LogEntry(title: "Get the show started", language: "macOS API", code: code, output: text, status: 0), at: 0)
-    }
-
-    /// The Stream Deck plugin looks for "Lightkey Input" when it starts, so Lightkey goes first.
-    private func waitForMIDI(until deadline: Date, lightkeyWasRunning: Bool) {
-        if MIDIWatch.shared.destinationNames().contains(where: { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }) {
-            startNote("Lightkey\u{2019}s MIDI input is ready.", "CoreMIDI: look for \u{201C}\(IDs.lightkeyMIDIInput)\u{201D}")
-            finishStart(lightkeyWasRunning: lightkeyWasRunning)
-        } else if Date() > deadline {
-            startNote("Lightkey\u{2019}s MIDI input didn\u{2019}t appear within 30 seconds. Opening the Stream Deck app anyway.",
-                      "CoreMIDI: look for \u{201C}\(IDs.lightkeyMIDIInput)\u{201D}")
-            finishStart(lightkeyWasRunning: lightkeyWasRunning)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.waitForMIDI(until: deadline, lightkeyWasRunning: lightkeyWasRunning)
-            }
-        }
-    }
-
-    private func finishStart(lightkeyWasRunning: Bool) {
-        if !setup.streamDeck {
-            // This Mac has no Stream Deck, so there's nothing more to open.
-        } else if !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck).isEmpty {
-            startNote(lightkeyWasRunning ? "The Stream Deck app is already open."
-                                         : "The Stream Deck app was already open. If the keys don\u{2019}t respond, quit and reopen it so it finds Lightkey.",
-                      "NSWorkspace: list the running apps")
-        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
-            NSWorkspace.shared.openApplication(at: url, configuration: .init())
-            startNote("Opening the Stream Deck app.", "NSWorkspace: open \(url.path)")
-        } else {
-            startNote("The Stream Deck app isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.streamDeck)")
-        }
+    /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed.
+    private func finishBoot() {
         starting = false
-        let completion = startCompletion
-        startCompletion = nil
-        // Give Stream Deck a moment to appear before checking again or reviewing the startup.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            if let completion { completion() } else { self.refresh() }
+        bootFinished = true
+        if bootSteps.allSatisfy({ $0.state == .done }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                if self.bootFinished && !self.starting { BootPanel.shared.hide() }
+            }
         }
     }
 }
@@ -1717,11 +1807,30 @@ struct SetupSheet: View {
                                    isOn: $booth.setup.alwaysOn)
                         Divider().padding(.leading, indent)
                         SettingRow(symbol: "play.fill", tint: .green, title: "Start the show when the Mac starts",
-                                   detail: booth.canStartShow
-                                    ? booth.startOrder + " Booth Check does this instead of macOS login items, so they open in the right order."
-                                    : booth.startOrder,
+                                   detail: !booth.canStartShow ? "Switch on an app above first."
+                                    : booth.autoStart ? "Booth Check opens at login and does this, in order, instead of macOS:"
+                                    : "Off: macOS login items open whatever they\u{2019}re set to, in no set order.",
                                    isOn: $booth.autoStart)
                             .disabled(!booth.canStartShow)
+                        if booth.autoStart && booth.canStartShow {
+                            BootStepsList(steps: booth.plannedSteps(), live: false)
+                                .padding(.leading, indent)
+                                .padding(.bottom, 10)
+                        }
+                        let others = booth.loginItems.filter { !$0.name.localizedCaseInsensitiveContains("Booth Check") }
+                        if !others.isEmpty {
+                            Divider().padding(.leading, indent)
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("Also opened by macOS at login: " + others.map(\.name).joined(separator: ", "))
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer()
+                                Button("Login Items\u{2026}") { NSWorkspace.shared.open(Settings.loginItems) }
+                                    .buttonStyle(.link).font(.system(size: 11))
+                            }
+                            .padding(.leading, indent)
+                            .padding(.vertical, 10)
+                        }
                     }
 
                     if !booth.mutedChecks.isEmpty {
@@ -2073,7 +2182,7 @@ struct ContentView: View {
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
-                    if !booth.startNotes.isEmpty { startPanel }
+                    if !booth.bootSteps.isEmpty { startPanel }
                     if booth.setup.lightkey { showRow }
                     ForEach(groupOrder, id: \.self) { group in
                         let rows = booth.checks.filter { $0.group == group }
@@ -2085,7 +2194,6 @@ struct ContentView: View {
                                 }
                             }
                         }
-                        if group == "Start at login" && booth.setup.alwaysOn { loginList }
                     }
                     if !booth.mutedChecks.isEmpty { mutedList }
                     footer
@@ -2169,22 +2277,15 @@ struct ContentView: View {
     }
 
     private var startPanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("GET THE SHOW STARTED").font(.system(size: 11, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+                Text(booth.starting ? "Starting the show" : "Start-up").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if !booth.starting {
-                    Button("Dismiss") { booth.startNotes = [] }.controlSize(.small)
+                    Button("Dismiss") { booth.bootSteps = [] }.controlSize(.small)
                 }
             }
-            ForEach(Array(booth.startNotes.enumerated()), id: \.offset) { _, line in
-                Label(line, systemImage: "arrow.right.circle.fill")
-                    .font(.system(size: 12))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if booth.starting {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Waiting for Lightkey\u{2026}").font(.system(size: 12)) }
-            }
+            BootStepsList(steps: booth.bootSteps)
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.1)))
@@ -2220,48 +2321,6 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
-    @ViewBuilder private var loginList: some View {
-        if case .items(let items) = booth.loginRead {
-            section("Everything that opens at login") {
-                if items.isEmpty {
-                    Text("Nothing opens at login.").font(.system(size: 12)).foregroundStyle(.secondary).padding(.vertical, 4)
-                }
-                ForEach(items) { item in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(item.name).font(.system(size: 12, weight: .medium))
-                            Text(item.path).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
-                                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                        }
-                        Spacer()
-                        if item.isShow { badge(for: item) }
-                        Button("Remove\u{2026}") { booth.perform(.removeLoginItem(item)) }
-                            .controlSize(.small)
-                            .help("Stop \(item.name) opening at login. Shows the script first.")
-                    }
-                    .padding(.vertical, 3)
-                }
-                HStack {
-                    Spacer()
-                    Button("Open Login Items\u{2026}") { NSWorkspace.shared.open(Settings.loginItems) }.controlSize(.small)
-                }
-                .padding(.top, 4)
-            }
-        }
-    }
-
-    private func badge(for item: LoginItem) -> some View {
-        let isOurs = booth.showPath.map {
-            URL(fileURLWithPath: $0).standardizedFileURL.path == URL(fileURLWithPath: item.path).standardizedFileURL.path
-        } ?? false
-        return Text(isOurs ? "This show" : "Other show")
-            .font(.system(size: 10, weight: .semibold))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .foregroundStyle(isOurs ? Color.green : Color.red)
-            .background(Capsule().fill((isOurs ? Color.green : Color.red).opacity(0.14)))
-    }
-
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title.uppercased())
@@ -2274,6 +2333,114 @@ struct ContentView: View {
                 .background(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.22)))
         }
     }
+}
+
+/// The start-up steps, numbered because they run in this order. `live` adds each step's state and
+/// what happened; without it the list is just the plan.
+struct BootStepsList: View {
+    let steps: [BootStep]
+    var live = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(steps.enumerated()), id: \.element.id) { n, step in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("\(n + 1)")
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12, alignment: .trailing)
+                    if live { icon(step.state).frame(width: 16, height: 16) }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(step.title)
+                            .font(.system(size: 12, weight: live && step.state == .running ? .semibold : .regular))
+                            .foregroundStyle(live && step.state == .waiting ? .secondary : .primary)
+                        if live, let detail = step.detail {
+                            Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func icon(_ state: StepState) -> some View {
+        switch state {
+        case .waiting: Image(systemName: "circle").font(.system(size: 12)).foregroundStyle(.tertiary)
+        case .running: ProgressView().controlSize(.mini)
+        case .done: Image(systemName: "checkmark.circle.fill").font(.system(size: 13)).foregroundStyle(.green)
+        case .warn: Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 12)).foregroundStyle(.orange)
+        case .failed: Image(systemName: "xmark.circle.fill").font(.system(size: 13)).foregroundStyle(.red)
+        }
+    }
+}
+
+/// What the floating start-up panel shows.
+struct BootView: View {
+    @ObservedObject var booth: Booth
+
+    var body: some View {
+        let allGood = booth.bootSteps.allSatisfy { $0.state == .done }
+        let n = booth.problemCount
+        let (symbol, color, title): (String, Color, String) =
+            !booth.bootFinished ? ("play.circle.fill", .green, "Starting the show")
+            : allGood ? ("checkmark.seal.fill", .green, "Ready for the service")
+            : n > 0 ? ("exclamationmark.triangle.fill", .orange, "\(n) thing\(n == 1 ? "" : "s") to fix")
+            : ("exclamationmark.triangle.fill", .orange, "Started, with warnings")
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol).font(.system(size: 20)).foregroundStyle(color)
+                Text(title).font(.system(size: 15, weight: .bold))
+                Spacer(minLength: 0)
+            }
+            BootStepsList(steps: booth.bootSteps)
+            Spacer(minLength: 0)
+            HStack {
+                Button("Open Booth Check") { booth.showWindow() }
+                Spacer()
+                Button("Hide") { BootPanel.shared.hide() }
+            }
+            .controlSize(.small)
+        }
+        .padding(16)
+    }
+}
+
+/// A small panel in the top-right corner that floats over every app, full-screen Lightkey included,
+/// without taking focus. It's the only way to show the start-up while Lightkey fills the screen:
+/// Booth Check's own window would pull you out of Lightkey's full-screen space.
+final class BootPanel {
+    static let shared = BootPanel()
+    private var panel: NSPanel?
+
+    func show(steps: Int) {
+        let size = NSSize(width: 360, height: 104 + CGFloat(steps) * 44)
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                            styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView],
+                            backing: .buffered, defer: false)
+            p.titleVisibility = .hidden
+            p.titlebarAppearsTransparent = true
+            p.isFloatingPanel = true
+            p.level = .floating
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.hidesOnDeactivate = false
+            p.isMovableByWindowBackground = true
+            p.isReleasedWhenClosed = false
+            let host = NSHostingController(rootView: BootView(booth: Booth.shared))
+            host.sizingOptions = []            // the panel's size is set here, from the number of steps
+            p.contentViewController = host
+            panel = p
+        }
+        guard let panel else { return }
+        panel.setContentSize(size)
+        if let screen = NSScreen.main?.visibleFrame {
+            panel.setFrameTopLeftPoint(NSPoint(x: screen.maxX - panel.frame.width - 16, y: screen.maxY - 16))
+        }
+        panel.orderFrontRegardless()
+    }
+
+    func hide() { panel?.orderOut(nil) }
 }
 
 /// The full window, made on demand and kept for reuse. Built in AppKit rather than as a SwiftUI
@@ -2356,13 +2523,8 @@ struct MenuPanel: View {
             } else if !booth.checks.isEmpty {
                 Text("Everything Booth Check looks at is fine.").font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            if !booth.startNotes.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(Array(booth.startNotes.suffix(4).enumerated()), id: \.offset) { _, line in
-                        Label(line, systemImage: "arrow.right.circle.fill").font(.system(size: 11))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+            if booth.starting {
+                BootStepsList(steps: booth.bootSteps)
             }
             if booth.updateAvailable, let release = booth.latest {
                 Button("Booth Check \(release.version) is available\u{2026}") {
@@ -2424,11 +2586,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         booth.start()
         if !atLogin {
             booth.showWindow()                       // someone opened it on purpose
-        } else if booth.autoStart, booth.canStartShow, !booth.setup.lightkey || booth.showPath != nil {
-            booth.startShow { booth.reviewStartup() }
+        } else if booth.autoStart, booth.canStartShow {
+            booth.startShow()
         } else {
             // Give the other login items time to open before judging.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { booth.reviewStartup() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { booth.startShow(checkOnly: true) }
         }
     }
 
