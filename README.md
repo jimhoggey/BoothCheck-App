@@ -26,11 +26,11 @@ runs, each with a switch. Switching an app on switches on every check that belon
 
 | On this Mac | What Booth Check does |
 |---|---|
-| **Lightkey** | checks it's open with the right show, and opens it when the show starts. The show file and **A DMX interface is plugged in here** live inside this row; the DMX option adds the interface-connected and Lightkey-is-using-it checks |
+| **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks |
 | **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
-| **Start the show when the Mac starts** | opens the apps above at login, in order; the switch's description says exactly what it will open |
+| **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
 
 So a ProPresenter Mac is: ProPresenter on, Lightkey and Stream Deck off, stays on, start at login.
 Booth Check keeps it awake, opens ProPresenter at startup, and checks it's running.

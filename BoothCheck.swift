@@ -1717,7 +1717,10 @@ struct SetupSheet: View {
                                    isOn: $booth.setup.alwaysOn)
                         Divider().padding(.leading, indent)
                         SettingRow(symbol: "play.fill", tint: .green, title: "Start the show when the Mac starts",
-                                   detail: booth.startOrder, isOn: $booth.autoStart)
+                                   detail: booth.canStartShow
+                                    ? booth.startOrder + " Booth Check does this instead of macOS login items, so they open in the right order."
+                                    : booth.startOrder,
+                                   isOn: $booth.autoStart)
                             .disabled(!booth.canStartShow)
                     }
 
@@ -1748,17 +1751,10 @@ struct SetupSheet: View {
         .frame(width: 540, height: 640)
     }
 
-    /// The show and the DMX interface belong to Lightkey, so they sit inside its row.
+    /// The DMX interface belongs to Lightkey, so it sits inside its row. The show itself is chosen
+    /// on the main window, the one place people look for it.
     private var lightkeyOptions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text("Show").font(.system(size: 11)).foregroundStyle(.secondary)
-                Text(booth.showName ?? "None chosen")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .lineLimit(1).truncationMode(.middle)
-                Spacer()
-                Button(booth.showPath == nil ? "Choose\u{2026}" : "Change\u{2026}") { booth.chooseShow() }.controlSize(.small)
-            }
             Toggle(isOn: $booth.setup.dmx) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("A DMX interface is plugged in here").font(.system(size: 12))
