@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>ProPresenter to Lightkey</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+  @page { size: A4; margin: 12mm 15mm 12mm; }
+
+  :root {
+    --ink: #16181d;
+    --muted: #596070;
+    --rule: #d9dee6;
+    --amber: #a86400;
+    --amber-soft: #fff2d9;
+    --blue: #2c5883;
+    --blue-soft: #e8eff7;
+    --win: #1d5fa8;
+    --win-soft: #eaf2fb;
+    --mac: #3d4450;
+    --mac-soft: #f2f3f5;
+    --red: #b02c24;
+    --red-soft: #fcebe9;
+    --code: #eef1f5;
+    --display: "IBM Plex Sans Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+    --body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    --mono: "IBM Plex Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { margin: 0; background: #fff; color: var(--ink); font: 9.1pt/1.4 var(--body); }
+
+  h1, h2, h3 { font-family: var(--display); margin: 0; text-wrap: balance; }
+  h1 { font-size: 25pt; line-height: 1.05; letter-spacing: -0.01em; }
+  h2 { font-size: 13.5pt; letter-spacing: 0.01em; margin-bottom: 2.2mm; }
+  h2 .who { font-family: var(--body); font-weight: 500; font-size: 8.5pt; color: var(--muted); margin-left: 2mm; letter-spacing: 0; }
+  p { margin: 0; }
+  code, .file { font-family: var(--mono); font-size: 8.3pt; background: var(--code); padding: 0.2mm 1.1mm; border-radius: 1mm; white-space: nowrap; }
+  b { font-weight: 600; }
+
+  .eyebrow { font: 600 7.6pt/1 var(--body); letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); margin-bottom: 2mm; }
+  .lede { color: var(--muted); max-width: 165mm; margin-top: 2mm; }
+
+  section { margin-top: 5mm; }
+
+  /* signal chain */
+  .chain { display: grid; grid-template-columns: 1fr 9mm 1fr 9mm 1fr; align-items: stretch; margin-top: 5mm; }
+  .node { border-radius: 2mm; padding: 2.6mm 3.2mm; border: 0.4mm solid var(--rule); }
+  .node.win { background: var(--win-soft); border-color: #b6cde9; }
+  .node.net { background: #fff; border-style: dashed; }
+  .node.mac { background: var(--mac-soft); border-color: #c9ccd3; }
+  .node .kind { font: 600 7pt/1 var(--body); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .node.win .kind { color: var(--win); }
+  .node h3 { font-size: 12pt; margin: 1.2mm 0 0.8mm; }
+  .node p { color: var(--muted); font-size: 8.4pt; }
+  .arrow { display: flex; align-items: center; justify-content: center; color: var(--amber); font: 700 14pt/1 var(--display); }
+
+  .answer { margin-top: 4mm; padding: 2.6mm 3.5mm; background: var(--amber-soft); border-radius: 1.5mm; }
+  .answer b { color: var(--amber); }
+
+  /* steps grouped by machine */
+  .part { margin-top: 5mm; }
+  .part-head { break-after: avoid; display: flex; align-items: baseline; gap: 3mm; margin-bottom: 2.2mm; padding-bottom: 1.4mm; border-bottom: 0.3mm solid var(--rule); }
+  .part-head .n { font: 700 18pt/1 var(--display); color: var(--amber); }
+  .part-head h2 { margin: 0; }
+  .where { font: 600 7pt/1.6 var(--body); letter-spacing: 0.08em; text-transform: uppercase; padding: 0 1.6mm; border-radius: 0.8mm; margin-left: auto; white-space: nowrap; }
+  .where.win { background: var(--win-soft); color: var(--win); }
+  .where.mac { background: var(--mac-soft); color: var(--mac); }
+
+  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 1.6mm; }
+  ol.steps > li { counter-increment: s; display: grid; grid-template-columns: 6mm 1fr; gap: 2.6mm; break-inside: avoid; }
+  ol.steps > li::before { content: counter(s, lower-alpha); font: 600 9.5pt/1.4 var(--display); color: var(--muted); text-align: right; }
+  ol.steps .what { font-weight: 600; }
+  ol.steps .why { color: var(--muted); }
+
+  .tip { margin-top: 2.4mm; padding: 2mm 3mm; border-left: 0.8mm solid var(--amber); background: #fffaf0; font-size: 8.6pt; }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 6mm; }
+
+  /* troubleshooting */
+  .faults { border-top: 0.3mm solid var(--rule); }
+  .fault { display: grid; grid-template-columns: 52mm 1fr; gap: 4mm; padding: 1.8mm 0; border-bottom: 0.3mm solid var(--rule); break-inside: avoid; }
+  .fault .sym { font-weight: 600; }
+  .fault .fix { color: var(--ink); }
+  .fault .fix span { color: var(--muted); }
+
+  /* cue plan */
+  table { width: 100%; border-collapse: collapse; font-size: 8.6pt; }
+  th { text-align: left; font: 600 7.2pt/1.4 var(--body); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+       border-bottom: 0.4mm solid var(--ink); padding: 1mm 2mm 1mm 0; }
+  td { border-bottom: 0.3mm solid var(--rule); padding: 1.6mm 2mm 1.6mm 0; height: 7mm; vertical-align: top; }
+  td.ex { color: var(--muted); font-style: italic; }
+  td.num { font-family: var(--mono); width: 18mm; }
+
+  .sources { margin-top: 5mm; font-size: 7.8pt; color: var(--muted); columns: 2; column-gap: 6mm; }
+  .sources p { break-inside: avoid; margin-bottom: 0.6mm; }
+  footer { margin-top: 3mm; padding-top: 2mm; border-top: 0.3mm solid var(--rule); color: var(--muted); font-size: 7.8pt; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="eyebrow">ProPresenter · rtpMIDI · Lightkey</div>
+  <h1>ProPresenter to Lightkey</h1>
+  <p class="lede">How a slide or a moment in a video on the ProPresenter PC fires a lighting cue in Lightkey on the MacBook. It’s set up once; after that the lights follow ProPresenter by themselves.</p>
+</header>
+
+<div class="chain">
+  <div class="node win">
+    <div class="kind">Windows PC</div>
+    <h3>ProPresenter</h3>
+    <p>A slide, or a point on a video’s timeline, sends a MIDI note.</p>
+  </div>
+  <div class="arrow">→</div>
+  <div class="node net">
+    <div class="kind">Network</div>
+    <h3>rtpMIDI ↔ Network MIDI</h3>
+    <p>rtpMIDI on the PC and the Mac’s built-in Network MIDI speak the same language (RTP-MIDI).</p>
+  </div>
+  <div class="arrow">→</div>
+  <div class="node mac">
+    <div class="kind">MacBook</div>
+    <h3>Lightkey</h3>
+    <p>Each note is a trigger on a cue, which sends the look to the lights over DMX.</p>
+  </div>
+</div>
+
+<p class="answer"><b>What to install:</b> only rtpMIDI (free), on the Windows PC. The Mac needs nothing: its Network MIDI is the same thing, built into Audio MIDI Setup. Name the session <b>ProPresenter Link</b> on both machines so it’s easy to recognise everywhere it appears.</p>
+
+<div class="part">
+  <div class="part-head"><span class="n">1</span><h2>Open the door on the MacBook</h2><span class="where mac">MacBook</span></div>
+  <ol class="steps">
+    <li><p><span class="what">Open Audio MIDI Setup</span> <span class="why">(Applications → Utilities, or Spotlight), then <b>Window → Show MIDI Studio</b>, then the globe button, <b>MIDI Network Setup</b>.</span></p></li>
+    <li><p><span class="what">Under My Sessions, click +, rename it “ProPresenter Link”, and tick Enabled.</span> <span class="why">Leave the port at 5004.</span></p></li>
+    <li><p><span class="what">Set “Who may connect to me” to Anyone.</span> <span class="why">The PC makes the connection, so the Mac only has to accept it.</span></p></li>
+    <li><p><span class="what">Give the MacBook a fixed address on the network.</span> <span class="why">A DHCP reservation on the router is simplest. The PC normally finds the Mac by name (Bonjour), but a fixed IP means you can add it by hand if that ever fails.</span></p></li>
+    <li><p><span class="what">If macOS asks whether to accept incoming network connections, click Allow.</span> <span class="why">That appears only when the Mac’s firewall is on.</span></p></li>
+  </ol>
+</div>
+
+<div class="part">
+  <div class="part-head"><span class="n">2</span><h2>Connect from the PC with rtpMIDI</h2><span class="where win">Windows PC</span></div>
+  <ol class="steps">
+    <li><p><span class="what">Install rtpMIDI from tobias-erichsen.de.</span> <span class="why">It needs Apple’s Bonjour service; if it’s missing, the installer says so and links to Apple’s download. rtpMIDI runs as a Windows service, so it starts with Windows on its own.</span></p></li>
+    <li><p><span class="what">Open rtpMIDI, click + under My Sessions, name it “ProPresenter Link”, and tick Enabled.</span> <span class="why">That session name is what ProPresenter lists as a MIDI port.</span></p></li>
+    <li><p><span class="what">Under Directory, pick the MacBook and click Connect.</span> <span class="why">It moves into Participants. Not listed? Click + under Directory and enter the Mac’s IP address and port 5004.</span></p></li>
+    <li><p><span class="what">When Windows Firewall asks, allow rtpMIDI on private networks.</span> <span class="why">It uses UDP ports 5004 and 5005.</span></p></li>
+    <li><p><span class="what">Use wired Ethernet for both machines if you can.</span> <span class="why">Wi-Fi works, but can delay or drop a note, and a dropped note is a cue that doesn’t fire.</span></p></li>
+  </ol>
+</div>
+
+<div class="part">
+  <div class="part-head"><span class="n">3</span><h2>Send notes from ProPresenter</h2><span class="where win">Windows PC</span></div>
+  <ol class="steps">
+    <li><p><span class="what">Set up rtpMIDI first, then restart ProPresenter.</span> <span class="why">ProPresenter only sees MIDI ports that existed when it opened.</span></p></li>
+    <li><p><span class="what">Settings → Devices → + → MIDI. Name it “Lightkey”, turn on Auto Reconnect, and choose “ProPresenter Link” as the Destination.</span> <span class="why">Destinations are where ProPresenter sends; Sources would be for controlling ProPresenter, which isn’t needed here. Click Connect.</span></p></li>
+    <li><p><span class="what">On a slide: right-click → Add Action → Communication → MIDI → MIDI Note On.</span> <span class="why">Choose channel 16, a note number, and a velocity above 0. The note fires when the slide is triggered.</span></p></li>
+    <li><p><span class="what">For moments inside a video, use the presentation’s Timeline.</span> <span class="why">Open it with the Timeline button at the top right of the presentation. Put the video on it, then drop the MIDI actions (or macros holding them) at the moments you want. Rewind and press Play: the video and the cues run together. The Timeline can also follow SMPTE timecode for frame accuracy.</span></p></li>
+    <li><p><span class="what">Use macros for looks you reuse.</span> <span class="why">A macro called “Lights: Walk-in” holding the MIDI action can go on any slide or timeline, so the note number is set in one place.</span></p></li>
+  </ol>
+  <p class="tip"><b>Why channel 16:</b> the v33 show already uses MIDI channels 1 to 4 for the Stream Deck, 230 notes in all. Keeping ProPresenter on channel 16 means a ProPresenter note can never fire a Stream Deck cue by accident. Some apps count channels 0–15, so Lightkey may show it as 15 or 16; either is the same channel.</p>
+</div>
+
+<div class="part">
+  <div class="part-head"><span class="n">4</span><h2>Catch the notes in Lightkey</h2><span class="where mac">MacBook</span></div>
+  <ol class="steps">
+    <li><p><span class="what">Right-click the cue → External Control → Add Trigger, then fire the ProPresenter action once.</span> <span class="why">Lightkey learns the note and channel from what it receives.</span></p></li>
+    <li><p><span class="what">Change the trigger’s behaviour from Toggle to Activate.</span> <span class="why">With Toggle, the same note arriving twice, as it will when you rehearse the video, switches the cue off again. Activate only ever switches it on.</span></p></li>
+    <li><p><span class="what">Save the show, and write each note down in the cue plan below.</span> <span class="why">The Stream Deck and ProPresenter can both drive the same cue; whichever was pressed last wins.</span></p></li>
+  </ol>
+</div>
+
+<section class="two">
+  <div>
+    <h2>Test it before a service</h2>
+    <ol class="steps">
+      <li><p><span class="what">Restart both machines</span> <span class="why">and check Audio MIDI Setup on the Mac lists the PC under Participants.</span></p></li>
+      <li><p><span class="what">Play the video from the start</span> <span class="why">and watch each cue come on at its moment.</span></p></li>
+      <li><p><span class="what">Play it a second time.</span> <span class="why">Nothing should switch off: that proves every trigger is set to Activate.</span></p></li>
+    </ol>
+  </div>
+  <div>
+    <h2>Every week</h2>
+    <p>Before the service, glance at rtpMIDI on the PC: the MacBook should be under Participants. Apple’s Network MIDI sometimes comes back after a restart enabled but not connected; if the Mac isn’t there, select it under Directory and click Connect. Booth Check keeps the MacBook awake, so the link doesn’t drop mid-service.</p>
+  </div>
+</section>
+
+<section>
+  <h2>If a cue doesn’t fire</h2>
+  <div class="faults">
+    <div class="fault">
+      <p class="sym">“ProPresenter Link” isn’t in ProPresenter’s list.</p>
+      <p class="fix">Check the session is enabled in rtpMIDI, then quit and reopen ProPresenter. <span>It only sees ports that existed when it opened.</span></p>
+    </div>
+    <div class="fault">
+      <p class="sym">The Mac isn’t in rtpMIDI’s Directory.</p>
+      <p class="fix">Add it by hand with + (its IP and port 5004). <span>Check both are on the same network, the Mac session is enabled with “Anyone”, and Bonjour is installed on the PC.</span></p>
+    </div>
+    <div class="fault">
+      <p class="sym">Connected, but Lightkey doesn’t react.</p>
+      <p class="fix">In Lightkey’s MIDI settings, make sure “ProPresenter Link” is listed and switched on as an input. <span>Then check the trigger’s channel and note match what ProPresenter sends, and that the velocity isn’t 0 (a Note On at 0 counts as a Note Off).</span></p>
+    </div>
+    <div class="fault">
+      <p class="sym">The cue comes on, then goes off the next time.</p>
+      <p class="fix">The trigger is still on Toggle. <span>Change it to Activate (step 4b).</span></p>
+    </div>
+    <div class="fault">
+      <p class="sym">It worked last week, now nothing.</p>
+      <p class="fix">One machine restarted and the session didn’t reconnect. <span>In rtpMIDI, select the Mac under Directory and click Connect. If this keeps happening, Bome Network (paid) is a more robust alternative that reconnects by itself.</span></p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Cue plan <span class="who">Channel 16. Fill in as you build the triggers.</span></h2>
+  <table>
+    <thead><tr><th>Note</th><th>Lightkey cue</th><th>Fired from in ProPresenter</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td class="ex">Walk-in look</td><td class="ex">Macro “Lights: Walk-in”, on the countdown video’s first frame</td></tr>
+      <tr><td class="num"></td><td></td><td></td></tr>
+      <tr><td class="num"></td><td></td><td></td></tr>
+      <tr><td class="num"></td><td></td><td></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>Written 26 September 2026 for ProPresenter 7 on Windows and Lightkey with the v33 show. Menu names come from the vendors’ own guides; check them against the versions installed. Sources: tobias-erichsen.de (rtpMIDI and its tutorial); renewedvision.com (“ProPresenter + Lightkey”, “Automate with Timeline”); support.renewedvision.com (“Devices: MIDI” setup, “Sending MIDI cues”); lightkeyapp.com/en/help.</footer>
+
+</body>
+</html>
