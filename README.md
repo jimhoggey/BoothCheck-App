@@ -21,19 +21,22 @@ Then it only checks, and expects the show and Stream Deck to be login items them
 
 ## What this Mac does
 
-Not every Mac is the booth. **This Mac** (in the window's header) asks what this one is for, with a
-switch for each part of the rig:
+Not every Mac is the lighting booth. **This Mac** (in the window's header) lists the apps this Mac
+runs, each with a switch. Switching an app on switches on every check that belongs to it:
 
-| Switch | Checks it covers |
+| On this Mac | What Booth Check does |
 |---|---|
-| Lightkey runs the show on this Mac | Lightkey running, the right show open, Get the show started |
-| A DMX interface is plugged into this Mac | the interface connected, Lightkey using it |
-| A Stream Deck controls Lightkey here | the deck and its app, Lightkey's MIDI input, App Nap, opening Stream Deck after Lightkey |
-| This Mac stays on for services | charger, sleep, Low Power Mode, starting from the charger, macOS updates, what opens at login |
+| **Lightkey** | checks it's open with the right show, and opens it when the show starts. The show file and **A DMX interface is plugged in here** live inside this row; the DMX option adds the interface-connected and Lightkey-is-using-it checks |
+| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready |
+| **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
+| **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
+| **Start the show when the Mac starts** | opens the apps above at login, in order; the switch's description says exactly what it will open |
 
-Two presets fill them in: **Booth Mac** (everything) and **Lightkey only** (building shows with no
-hardware attached). The first time the window opens, the sheet appears already filled in from what
-Booth Check finds: with the Stream Deck app installed it guesses Booth Mac, otherwise Lightkey only.
+So a ProPresenter Mac is: ProPresenter on, Lightkey and Stream Deck off, stays on, start at login.
+Booth Check keeps it awake, opens ProPresenter at startup, and checks it's running.
+
+The first time the window opens, the sheet appears filled in from what's installed: ProPresenter is
+listed whenever it's installed, and switched on when Lightkey and Stream Deck aren't.
 
 Any single check can also be **muted** with the 🔕 button on its row (or right-click). Muted checks
 stay listed under "Muted on this Mac" with an Unmute button.
@@ -117,8 +120,8 @@ It needs nothing installed. It's one universal app for Apple silicon and Intel, 
 
    or try to open it once, then go to System Settings → Privacy & Security, scroll down, and click
    **Open Anyway**. `docs/Open Booth Check on a new Mac.txt` has the same steps, ready to AirDrop.
-3. In **What does this Mac do?**, pick **Booth Mac** (it appears the first time; later it's under
-   **This Mac**).
+3. In **This Mac** (it opens by itself the first time), switch on the apps this Mac runs, plus
+   **Stays on for services** and **Start the show when the Mac starts**.
 4. Click **Choose show…** and pick the show file this Mac should run.
 5. Allow the two permissions when it asks:
    - **System Events** (asked straight away): to read and change what opens at login.
