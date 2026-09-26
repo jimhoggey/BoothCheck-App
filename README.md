@@ -15,7 +15,8 @@ its window once so whoever sits down sees what to fix.
 
   1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it
   2. Open any other apps, such as ProPresenter
-  3. Open the show in Lightkey (while it opens: "If macOS asks to allow an accessory, click Allow")
+  3. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
+     accessory, click Allow"; Intel Macs never ask)
   4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
   6. Open Stream Deck in the background, so Lightkey stays in front
@@ -67,7 +68,14 @@ the sheet.
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
 | Updates | macOS won't install updates by itself |
-| Check these yourself | USB accessories allowed without asking · no password after idle (macOS doesn't let apps read these two) |
+| Check these yourself | USB accessories allowed without asking *(Apple silicon only; Intel Macs don't ask)* · no password after idle (macOS doesn't let apps read these two) |
+
+**Booth Check won't click macOS's security prompts for you.** macOS blocks apps from pressing
+buttons in its own security dialogs, and an app that could would be able to approve anything. The
+accessory prompt is removed properly with its setting (above).
+
+**Stream Deck opens in the background**, out of sight, which is exactly what App Nap puts to sleep.
+So the "Open Stream Deck" start-up step checks App Nap is off, and warns if it isn't.
 
 **Why only Booth Check should open at login.** Login items all start at once, in no set order. If
 the Stream Deck app wins the race, its MIDI plugin can start before Lightkey's MIDI input exists and

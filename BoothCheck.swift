@@ -254,6 +254,13 @@ func usbDevices(_ output: String) -> [USBDevice] {
     return list
 }
 
+/// "Allow accessory to connect?" only exists on Apple silicon; Intel Macs never ask.
+#if arch(arm64)
+let hasAccessoryPrompt = true
+#else
+let hasAccessoryPrompt = false
+#endif
+
 func isDMXInterface(_ d: USBDevice) -> Bool {
     d.vendorID == IDs.ftdiVendor || d.name.localizedCaseInsensitiveContains("DMX")
 }
@@ -590,6 +597,8 @@ final class Booth: ObservableObject {
     }
     @Published var mutedChecks: [Check] = []
     @Published var offForThisMac = 0
+    /// From the last check: whether App Nap is off Mac-wide. The Stream Deck start-up step needs it.
+    @Published var appNapDisabled = false
 
     /// At login, open the show, wait for Lightkey, then open Stream Deck. On unless switched off.
     @Published var autoStart: Bool = (UserDefaults.standard.object(forKey: IDs.autoStartKey) as? Bool) ?? true {
@@ -830,6 +839,7 @@ final class Booth: ObservableObject {
                                 + (lastTick == nil || gap == 0 ? "." : " (longest gap so far: \(gap) s).")))
         }
 
+        appNapDisabled = s.appNapOff && !appNapSetThisSession      // set this session = not in effect until restart
         if s.appNapOff && appNapSetThisSession {
             out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
                              detail: "Switched off just now.", fix: "Restart the Mac for it to take effect."))
@@ -1210,7 +1220,7 @@ extension Booth {
         case "autoShow": return autoStart && canStartShow
         case "loginShows", "loginShow": return s.alwaysOn && s.lightkey
         case "deckLogin": return s.alwaysOn && s.streamDeck
-        case "acc": return s.alwaysOn && ((s.lightkey && s.dmx) || s.streamDeck)
+        case "acc": return hasAccessoryPrompt && s.alwaysOn && ((s.lightkey && s.dmx) || s.streamDeck)
         default: return true                                  // Booth Check's own checks, extra apps
         }
     }
@@ -1418,7 +1428,8 @@ extension Booth {
                 setStep(i, .failed, "Lightkey isn\u{2019}t installed on this Mac.")
                 return next()
             }
-            setStep(i, .running, "If macOS asks to allow an accessory, click Allow.")
+            // Only Apple silicon laptops ask before trusting a USB accessory; Intel Macs never do.
+            setStep(i, .running, hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil)
             poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
                 if !ok {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
@@ -1464,7 +1475,12 @@ extension Booth {
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = false
                 NSWorkspace.shared.openApplication(at: url, configuration: config)
-                setStep(i, .done, "Opened behind Lightkey.")
+                // Out of sight is exactly what App Nap puts to sleep, so this step depends on it being off.
+                if appNapDisabled {
+                    setStep(i, .done, "Opened behind Lightkey. App Nap is off, so it keeps running there.")
+                } else {
+                    setStep(i, .warn, "Opened behind Lightkey, but App Nap is still on, so the keys can freeze while it\u{2019}s in the background. Turn App Nap off in Booth Check, then restart the Mac.")
+                }
             } else {
                 setStep(i, .failed, "Not installed on this Mac.")
             }
