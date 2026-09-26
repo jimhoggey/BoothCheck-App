@@ -28,6 +28,39 @@ enum IDs {
     static let lightkeyMIDIInput = "Lightkey Input"
     static let showKey = "showPath"
     static let autoStartKey = "startShowAtLogin"
+    static let setupKey = "macSetup"
+    static let mutedKey = "mutedChecks"
+}
+
+/// What this Mac is for. Each switch covers a family of checks; see Booth.applies(_:).
+struct MacSetup: Codable, Equatable {
+    var lightkey = true         // Lightkey runs the show here
+    var dmx = true              // a DMX interface is plugged in here
+    var streamDeck = true       // a Stream Deck controls Lightkey here
+    var alwaysOn = true         // stays on for services: power, sleep, updates, login
+
+    static let booth = MacSetup()
+    static let lightkeyOnly = MacSetup(lightkey: true, dmx: false, streamDeck: false, alwaysOn: false)
+
+    static var saved: MacSetup? {
+        UserDefaults.standard.data(forKey: IDs.setupKey).flatMap { try? JSONDecoder().decode(MacSetup.self, from: $0) }
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: IDs.setupKey) }
+    }
+
+    /// A first guess for a Mac nobody has set up yet: with the Stream Deck app installed it's
+    /// probably the booth; without it, probably a Mac for building shows. The sheet confirms.
+    static func detected() -> MacSetup {
+        let has = { (id: String) in NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil }
+        return has(IDs.streamDeck) ? .booth : MacSetup(lightkey: has(IDs.lightkey), dmx: false, streamDeck: false, alwaysOn: false)
+    }
+
+    var summary: String {
+        [lightkey ? "Lightkey" : nil, dmx ? "DMX interface" : nil, streamDeck ? "Stream Deck" : nil,
+         alwaysOn ? "stays on for services" : nil].compactMap { $0 }.joined(separator: ", ")
+    }
 }
 
 enum Settings {
@@ -363,6 +396,7 @@ enum Action {
     case removeLoginItem(LoginItem)
     case removeShowLoginItems
     case enableAutoBoot(String?)
+    case noStreamDeck
     case open(URL, String)
 
     var label: String {
@@ -376,6 +410,7 @@ enum Action {
         case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
         case .removeLoginItem, .removeShowLoginItems: return "Remove\u{2026}"
         case .enableAutoBoot: return "Turn on\u{2026}"
+        case .noStreamDeck: return "No Stream Deck on this Mac"
         case .open(_, let label): return label
         }
     }
@@ -485,6 +520,27 @@ final class Booth: ObservableObject {
     private var lastTick: Date?
     private var startCompletion: (() -> Void)?
     private var timers: [Timer] = []
+
+    /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
+    @Published var setup: MacSetup = MacSetup.saved ?? MacSetup.detected() {
+        didSet {
+            setup.save()
+            refresh()
+        }
+    }
+    /// True until someone has confirmed the setup sheet once on this Mac.
+    @Published var needsSetup = MacSetup.saved == nil
+    @Published var showSetup = false
+    /// Single checks switched off by hand, by check id.
+    @Published var muted: Set<String> = Set(UserDefaults.standard.stringArray(forKey: IDs.mutedKey) ?? []) {
+        didSet {
+            UserDefaults.standard.set(Array(muted).sorted(), forKey: IDs.mutedKey)
+            refresh()
+        }
+    }
+    @Published var mutedChecks: [Check] = []
+    @Published var offForThisMac = 0
+    @Published var detected: [String] = []
 
     /// At login, open the show, wait for Lightkey, then open Stream Deck. On unless switched off.
     @Published var autoStart: Bool = (UserDefaults.standard.object(forKey: IDs.autoStartKey) as? Bool) ?? true {
@@ -626,11 +682,26 @@ final class Booth: ObservableObject {
             : Check(id: "deck", group: "Stream Deck", title: "Stream Deck plugged in", status: .fail,
                     detail: "No Stream Deck found on USB.", fix: "Check the Stream Deck's USB cable."))
 
-        out.append(deckApp != nil
-            ? Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .ok,
-                    detail: "The Stream Deck app is open.")
-            : Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
-                    detail: "The Stream Deck app isn't open, so the keys do nothing.", action: .launchStreamDeck))
+        let deckInstalled = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) != nil
+        if deckApp != nil {
+            out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .ok,
+                             detail: "The Stream Deck app is open."))
+        } else if deckInstalled {
+            out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
+                             detail: "The Stream Deck app isn't open, so the keys do nothing.", action: .launchStreamDeck))
+        } else {
+            // Not installed at all is the one case where "this Mac doesn't use one" is a safe guess.
+            out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
+                             detail: "The Stream Deck app isn\u{2019}t installed on this Mac.",
+                             fix: "If this Mac doesn\u{2019}t use a Stream Deck, switch its checks off.",
+                             action: .noStreamDeck))
+        }
+        detected = [
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) != nil ? "Lightkey installed" : "Lightkey not installed",
+            deckInstalled ? "Stream Deck app installed" : "Stream Deck app not installed",
+            dmx != nil ? "DMX interface connected" : "no DMX interface connected right now",
+            s.hasBattery ? "a laptop" : "a desktop Mac",
+        ]
 
         // Power & sleep ------------------------------------------------------------------------
         out.append(s.onAC
@@ -747,7 +818,9 @@ final class Booth: ObservableObject {
                 // Booth Check starts everything in order, so shows and Stream Deck shouldn't also open on their own.
                 if let showName {
                     out.append(Check(id: "autoShow", group: "Start at login", title: "Booth Check starts the show", status: .ok,
-                                     detail: "At login it opens \(showName), waits for Lightkey, then opens the Stream Deck app."))
+                                     detail: setup.streamDeck
+                                        ? "At login it opens \(showName), waits for Lightkey, then opens the Stream Deck app."
+                                        : "At login it opens \(showName) in Lightkey."))
                 } else {
                     out.append(Check(id: "autoShow", group: "Start at login", title: "Booth Check starts the show", status: .warn,
                                      detail: "Choose the show this Mac should run.", action: .chooseShow))
@@ -821,7 +894,11 @@ final class Booth: ObservableObject {
                          detail: "Lock Screen \u{2192} Require password after screen saver begins \u{2192} Never.",
                          action: .open(Settings.lockScreen, "Open")))
 
-        checks = out
+        // Only what this Mac is set up for, minus anything muted. Both are counted, never hidden quietly.
+        let relevantChecks = out.filter { applies($0.id) }
+        offForThisMac = out.count - relevantChecks.count
+        mutedChecks = relevantChecks.filter { muted.contains($0.id) }
+        checks = relevantChecks.filter { !muted.contains($0.id) }
         lastPass = pass.entries
         lastChecked = Date()
     }
@@ -927,6 +1004,9 @@ final class Booth: ObservableObject {
                 explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
             return
+        case .noStreamDeck:
+            setup.streamDeck = false
+            logSetting("This Mac has no Stream Deck", "Stream Deck checks switched off; Get the show started no longer opens it.")
         case .enableAutoBoot(let current):
             // A firmware setting with no System Settings page, so this is the one change that asks
             // for the admin password. The sheet shows exactly which command it's for.
@@ -1054,6 +1134,58 @@ extension Booth {
 
     func showWindow() { MainWindow.shared.show() }
 
+    /// Whether a check belongs to what this Mac is set up for.
+    func applies(_ id: String) -> Bool {
+        let s = setup
+        switch id {
+        case "lk", "show": return s.lightkey
+        case "dmx": return s.dmx
+        case "dmxLive": return s.lightkey && s.dmx
+        case "midi": return s.lightkey && s.streamDeck
+        case "deck", "deckapp", "nap": return s.streamDeck
+        case "ac", "sleep", "lpm", "autoboot", "upd", "lock", "selfLogin": return s.alwaysOn
+        case "autoShow", "loginShows", "loginShow": return s.alwaysOn && s.lightkey
+        case "deckLogin": return s.alwaysOn && s.streamDeck
+        case "acc": return s.alwaysOn && (s.dmx || s.streamDeck)
+        default: return true                                  // Booth Check's own checks
+        }
+    }
+
+    /// Starting the show only makes sense where Lightkey runs.
+    var canStartShow: Bool { setup.lightkey }
+
+    /// "4 checks off for this Mac · 1 muted", shown wherever the status is, so a trimmed list is
+    /// never mistaken for a clean one.
+    var offSummary: String? {
+        var parts: [String] = []
+        if offForThisMac > 0 { parts.append("\(offForThisMac) check\(offForThisMac == 1 ? "" : "s") off for this Mac") }
+        if !mutedChecks.isEmpty { parts.append("\(mutedChecks.count) muted") }
+        return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
+    }
+
+    func mute(_ check: Check) {
+        muted.insert(check.id)
+        logSetting("Muted \u{201C}\(check.title)\u{201D}", "It stays listed under Muted on this Mac, with an Unmute button.")
+    }
+
+    func unmute(_ check: Check) {
+        muted.remove(check.id)
+        logSetting("Unmuted \u{201C}\(check.title)\u{201D}", "It\u{2019}s checked again.")
+    }
+
+    func confirmSetup() {
+        setup.save()
+        needsSetup = false
+        showSetup = false
+        logSetting("This Mac: \(setup.summary.isEmpty ? "nothing switched on" : setup.summary)",
+                   "\(offForThisMac) check\(offForThisMac == 1 ? "" : "s") off for this Mac.")
+    }
+
+    /// Booth Check's own settings go in the Log too, so a silenced check can always be traced.
+    func logSetting(_ title: String, _ output: String) {
+        changes.insert(LogEntry(title: title, language: "Booth Check setting", code: title, output: output, status: nil), at: 0)
+    }
+
     /// After login has had its chance: if anything needs attention, open the window once so whoever
     /// sits down sees it. Otherwise stay quietly in the menu bar.
     func reviewStartup() {
@@ -1104,7 +1236,8 @@ extension Booth {
             startNote("Lightkey isn\u{2019}t installed on this Mac.", "NSWorkspace: find \(IDs.lightkey)")
         }
 
-        if waitForLightkey {
+        // Waiting for Lightkey's MIDI input only matters when a Stream Deck is going to look for it.
+        if waitForLightkey && setup.streamDeck {
             waitForMIDI(until: Date().addingTimeInterval(30), lightkeyWasRunning: lightkeyWasRunning)
         } else {
             finishStart(lightkeyWasRunning: lightkeyWasRunning)
@@ -1133,7 +1266,9 @@ extension Booth {
     }
 
     private func finishStart(lightkeyWasRunning: Bool) {
-        if !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck).isEmpty {
+        if !setup.streamDeck {
+            // This Mac has no Stream Deck, so there's nothing more to open.
+        } else if !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck).isEmpty {
             startNote(lightkeyWasRunning ? "The Stream Deck app is already open."
                                          : "The Stream Deck app was already open. If the keys don\u{2019}t respond, quit and reopen it so it finds Lightkey.",
                       "NSWorkspace: list the running apps")
@@ -1420,6 +1555,104 @@ struct UpdateSheet: View {
     }
 }
 
+/// "What does this Mac do?" Each switch turns a family of checks on or off.
+struct SetupSheet: View {
+    @ObservedObject var booth: Booth
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("What does this Mac do?").font(.system(size: 17, weight: .bold))
+                        Text("Booth Check only checks what this Mac is set up for. Switched-off checks are counted at the top of the window, so a shorter list is never mistaken for a clean one.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    HStack(spacing: 8) {
+                        preset("Booth Mac", "Runs services: everything on", .booth)
+                        preset("Lightkey only", "Building shows, no hardware", .lightkeyOnly)
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        toggle($booth.setup.lightkey, "Lightkey runs the show on this Mac",
+                               "Lightkey running, the right show open, and Get the show started.")
+                        toggle($booth.setup.dmx, "A DMX interface is plugged into this Mac",
+                               "The interface is connected, and Lightkey is using it.")
+                        toggle($booth.setup.streamDeck, "A Stream Deck controls Lightkey here",
+                               "The deck and its app, Lightkey\u{2019}s MIDI input, App Nap, and opening Stream Deck after Lightkey.")
+                        toggle($booth.setup.alwaysOn, "This Mac stays on for services",
+                               "Charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login.")
+                        toggle($booth.autoStart, "Start the show when the Mac starts",
+                               "At login, open the show" + (booth.setup.streamDeck ? ", wait for Lightkey, then open Stream Deck." : "."))
+                            .disabled(!(booth.setup.lightkey && booth.setup.alwaysOn))
+                            .opacity(booth.setup.lightkey && booth.setup.alwaysOn ? 1 : 0.45)
+                    }
+
+                    if !booth.detected.isEmpty {
+                        Label("Found on this Mac: " + booth.detected.joined(separator: " \u{00B7} "), systemImage: "magnifyingglass")
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if !booth.mutedChecks.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("MUTED ON THIS MAC").font(.system(size: 11, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+                            ForEach(booth.mutedChecks) { check in
+                                HStack {
+                                    Label(check.title, systemImage: "bell.slash").font(.system(size: 12))
+                                    Spacer()
+                                    Button("Unmute") { booth.unmute(check) }.controlSize(.small)
+                                }
+                            }
+                        }
+                    }
+
+                    Text("To mute a single check instead, use the \(Image(systemName: "bell.slash")) button on its row. The DMX interface can only be switched off here, never from its row: at church, a cable falling out looks exactly like a Mac without one.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(20)
+            }
+            Divider()
+            HStack {
+                Text(booth.offSummary ?? "Everything is checked on this Mac.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { booth.confirmSetup() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+        }
+        .frame(width: 560, height: 620)
+    }
+
+    private func preset(_ title: String, _ subtitle: String, _ value: MacSetup) -> some View {
+        let selected = booth.setup == value
+        return Button { booth.setup = value } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(selected ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.08)))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(selected ? Color.accentColor : Color.clear, lineWidth: 1.5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggle(_ value: Binding<Bool>, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Toggle("", isOn: value).toggleStyle(.switch).labelsHidden().controlSize(.small)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 struct CodeBlock: View {
     let text: String
 
@@ -1572,6 +1805,7 @@ struct LogSheet: View {
 struct CheckRow: View {
     let check: Check
     let perform: (Action) -> Void
+    var mute: ((Check) -> Void)? = nil
     @State private var showInfo = false
 
     var body: some View {
@@ -1614,8 +1848,17 @@ struct CheckRow: View {
             if check.status != .ok, let action = check.action {
                 Button(action.label) { perform(action) }.controlSize(.small)
             }
+            if check.status != .ok, let mute {
+                Button { mute(check) } label: { Image(systemName: "bell.slash").font(.system(size: 11)) }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Mute this check on this Mac. It stays listed under Muted, with Unmute.")
+            }
         }
         .padding(.vertical, 5)
+        .contextMenu {
+            if let mute { Button("Mute \u{201C}\(check.title)\u{201D} on this Mac") { mute(check) } }
+        }
     }
 }
 
@@ -1636,31 +1879,34 @@ struct ContentView: View {
                             .textSelection(.enabled)
                     }
                     if !booth.startNotes.isEmpty { startPanel }
-                    showRow
-                    autoStartRow
+                    if booth.setup.lightkey { showRow }
+                    if booth.setup.lightkey && booth.setup.alwaysOn { autoStartRow }
                     ForEach(groupOrder, id: \.self) { group in
                         let rows = booth.checks.filter { $0.group == group }
                         if !rows.isEmpty {
                             section(group) {
                                 ForEach(rows) { check in
-                                    CheckRow(check: check, perform: booth.perform)
+                                    CheckRow(check: check, perform: booth.perform, mute: booth.mute)
                                     if check.id != rows.last?.id { Divider() }
                                 }
                             }
                         }
-                        if group == "Start at login" { loginList }
+                        if group == "Start at login" && booth.setup.alwaysOn { loginList }
                     }
+                    if !booth.mutedChecks.isEmpty { mutedList }
                     footer
                 }
                 .padding(16)
             }
         }
-        .frame(minWidth: 700, idealWidth: 720, minHeight: 560, idealHeight: 820)
+        .frame(minWidth: 780, idealWidth: 780, minHeight: 560, idealHeight: 820)
         .sheet(item: $booth.pending) { ChangeSheet(change: $0, booth: booth) }
         .sheet(isPresented: $showLog) { LogSheet(booth: booth) }
         .sheet(isPresented: $booth.showUpdate) {
             if let release = booth.latest { UpdateSheet(booth: booth, release: release) }
         }
+        .sheet(isPresented: $booth.showSetup) { SetupSheet(booth: booth) }
+        .onAppear { if booth.needsSetup { booth.showSetup = true } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if booth.pending == nil { booth.refresh() }
         }
@@ -1672,32 +1918,62 @@ struct ContentView: View {
             Image(systemName: symbol).font(.system(size: 30)).foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 20, weight: .bold))
-                Text(booth.lastChecked.map { "Checked at \($0.formatted(date: .omitted, time: .standard)) \u{00B7} checks again every 15 seconds" }
+                Text(booth.lastChecked.map { "Checked at \($0.formatted(date: .omitted, time: .shortened)) \u{00B7} every 15 seconds" }
                      ?? "Booth Check")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                if let off = booth.offSummary {
+                    Button { booth.showSetup = true } label: {
+                        Label(off, systemImage: "slider.horizontal.3").font(.system(size: 11))
+                    }
+                    .buttonStyle(.link)
+                    .help("Change what this Mac is set up for")
+                }
             }
             Spacer()
             if booth.updateAvailable, let release = booth.latest {
                 Button("Update to \(release.version)") { booth.showUpdate = true }
             }
-            Button { booth.startShow() } label: {
-                if booth.starting {
-                    HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Starting\u{2026}") }
-                } else {
-                    Label("Get the show started", systemImage: "play.fill")
+            if booth.canStartShow {
+                Button { booth.startShow() } label: {
+                    if booth.starting {
+                        HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Starting\u{2026}") }
+                    } else {
+                        Label("Get the show started", systemImage: "play.fill")
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .disabled(booth.starting)
+                .help(booth.setup.streamDeck ? "Opens the show in Lightkey, waits for it, then opens the Stream Deck app"
+                                             : "Opens the show in Lightkey")
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.green)
-            .disabled(booth.starting)
-            .help("Opens the show in Lightkey, waits for it, then opens the Stream Deck app")
+            Button { booth.showSetup = true } label: { Label("This Mac", systemImage: "gearshape") }
+                .help("What this Mac is set up for, and which checks are muted")
             Button { showLog = true } label: { Label("Log", systemImage: "list.bullet.rectangle") }
                 .keyboardShortcut("l")
             Button("Check again") { booth.refresh() }.keyboardShortcut("r")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    private var mutedList: some View {
+        section("Muted on this Mac") {
+            ForEach(booth.mutedChecks) { check in
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "bell.slash").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(check.title).font(.system(size: 12, weight: .medium))
+                        Text(check.status == .ok ? "Fine right now." : check.detail)
+                            .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                    Spacer()
+                    Button("Unmute") { booth.unmute(check) }.controlSize(.small)
+                }
+                .padding(.vertical, 4)
+            }
+        }
     }
 
     private var startPanel: some View {
@@ -1830,15 +2106,18 @@ final class MainWindow {
 
     func show() {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 820),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 820),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                              backing: .buffered, defer: false)
             w.title = "Booth Check"
             w.isReleasedWhenClosed = false
             w.contentViewController = NSHostingController(rootView: ContentView(booth: Booth.shared))
-            w.setContentSize(NSSize(width: 720, height: 820))
+            w.setContentSize(NSSize(width: 780, height: 820))
+            w.contentMinSize = NSSize(width: 780, height: 560)
             w.setFrameAutosaveName("BoothCheckMain")
             if !w.setFrameUsingName("BoothCheckMain") { w.center() }
+            // A frame saved by an older, narrower version would clip the header buttons.
+            if w.contentLayoutRect.width < 780 { w.setContentSize(NSSize(width: 780, height: max(w.contentLayoutRect.height, 560))) }
             window = w
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -1914,15 +2193,20 @@ struct MenuPanel: View {
                 }
                 .controlSize(.small)
             }
-            Divider()
-            Button { booth.startShow() } label: {
-                Label(booth.starting ? "Starting\u{2026}" : "Get the show started", systemImage: "play.fill")
-                    .frame(maxWidth: .infinity)
+            if let off = booth.offSummary {
+                Label(off, systemImage: "slider.horizontal.3").font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.green)
-            .controlSize(.large)
-            .disabled(booth.starting)
+            Divider()
+            if booth.canStartShow {
+                Button { booth.startShow() } label: {
+                    Label(booth.starting ? "Starting\u{2026}" : "Get the show started", systemImage: "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .controlSize(.large)
+                .disabled(booth.starting)
+            }
             HStack {
                 Button("Open Booth Check") { booth.showWindow() }
                 Button("Check again") { booth.refresh() }
@@ -1962,7 +2246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         booth.start()
         if !atLogin {
             booth.showWindow()                       // someone opened it on purpose
-        } else if booth.autoStart, booth.showPath != nil {
+        } else if booth.autoStart, booth.canStartShow, booth.setup.alwaysOn, booth.showPath != nil {
             booth.startShow { booth.reviewStartup() }
         } else {
             // Give the other login items time to open before judging.

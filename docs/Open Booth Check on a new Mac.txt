@@ -1,0 +1,27 @@
+OPEN BOOTH CHECK ON A NEW MAC
+
+macOS blocks Booth Check the first time ("could not be verified") because it
+isn't signed with a paid Apple developer account. Do this once per Mac.
+
+
+1. Put Booth Check in Applications.
+
+2. Open Terminal, paste this line and press Return:
+
+xattr -dr com.apple.quarantine "/Applications/Booth Check.app"
+
+3. Open Booth Check.
+
+
+If it's not in Applications, type the start of the command with a space at
+the end, drag Booth Check into the Terminal window, then press Return:
+
+xattr -dr com.apple.quarantine
+
+
+No Terminal? Try to open Booth Check once, then go to
+System Settings > Privacy & Security, scroll down, and click "Open Anyway".
+
+
+Once it's open: Booth Check lives in the menu bar at the top right (no Dock
+icon). Click its icon, then "Open Booth Check" to see the window.
