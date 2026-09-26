@@ -83,7 +83,21 @@
   .setup-page h2 { break-after: avoid; }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6mm; }
 
-  footer { margin-top: 5mm; padding-top: 2.5mm; border-top: 0.3mm solid var(--rule); color: var(--muted); font-size: 7.8pt; }
+  footer { margin-top: 3mm; padding-top: 2mm; border-top: 0.3mm solid var(--rule); color: var(--muted); font-size: 7.8pt; }
+
+  /* the two things a volunteer does: start and end a service */
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; margin-top: 5mm; }
+  .card { border: 0.4mm solid var(--rule); border-radius: 2mm; padding: 3.5mm 4mm 4mm; break-inside: avoid; }
+  .card.start { border-color: #9fcfae; background: #f1f9f3; }
+  .card.end { background: #f5f6f8; }
+  .card h2 { font-size: 16pt; margin-bottom: 0.6mm; }
+  .card h2.go { color: #1f7a45; }
+  .card .sub { color: var(--muted); font-size: 8.6pt; margin-bottom: 3mm; }
+  .card ol.steps { gap: 2.6mm; }
+  .card ol.steps > li { grid-template-columns: 6mm 1fr; gap: 2.4mm; }
+  .card ol.steps > li::before { font-size: 13pt; line-height: 1.1; }
+  .card ol.steps .why { display: block; margin-top: 0.4mm; }
+  .card .aside { margin-top: 3.2mm; padding-top: 2.4mm; border-top: 0.3mm solid var(--rule); color: var(--muted); font-size: 8.4pt; }
 </style>
 </head>
 <body>
@@ -91,31 +105,44 @@
 <header>
   <div class="eyebrow">Lightkey · Stream Deck · Booth Check</div>
   <h1>Lighting Booth Runbook</h1>
-  <p class="lede">Booth Check, the icon at the top right of the menu bar, starts the show and watches the Mac. This page is what’s left for a person.</p>
+  <p class="lede">Volunteers: the two boxes below are all you need. The rest is for when something goes wrong, and for whoever looks after the Mac.</p>
   <div class="current">
     <div><span>Show</span><span class="file">BackupChurch_modular_v33.lightkeyproj</span></div>
     <div><span>Stream Deck</span><b>Lightkey v33 Service Panel</b></div>
-    <div><span>Booth Check</span><b>1.5+</b></div>
+    <div><span>Booth Check</span><b>1.10+</b></div>
   </div>
 </header>
+
+<div class="duo">
+  <div class="card start">
+    <h2 class="go">Starting a service</h2>
+    <p class="sub">About two minutes. Most of it happens by itself.</p>
+    <ol class="steps">
+      <li><p><span class="what">Check the Mac is on the charger.</span> <span class="why">Screen black? Press a key. Mac off? Unplug the charger and plug it back in, then type the Mac’s password.</span></p></li>
+      <li><p><span class="what">Wait for “Ready for the service”.</span> <span class="why">A panel at the top right ticks through the start-up. If Lightkey asks for the password to connect to the lights, type it.</span></p></li>
+      <li><p><span class="what">No panel, or not all green?</span> <span class="why">Click the Booth Check icon at the top right of the menu bar, then <b>Get the show started</b>.</span></p></li>
+      <li><p><span class="what">Check the Stream Deck shows the house-light keys, 2% to 100%.</span> <span class="why">Another page? Press the arrow key until they’re back.</span></p></li>
+      <li><p><span class="what">Test: press House 10%, then press it again.</span> <span class="why">The lights come up, then go off. You’re ready.</span></p></li>
+    </ol>
+  </div>
+  <div class="card end">
+    <h2>Ending a service</h2>
+    <p class="sub">Leave everything running for next time.</p>
+    <ol class="steps">
+      <li><p><span class="what">Haze off.</span> <span class="why">Stream Deck, Punch FX &amp; Haze page: press Haze Off.</span></p></li>
+      <li><p><span class="what">Stage lights off.</span> <span class="why">Stream Deck, Worship Colour page: press Stage Off.</span></p></li>
+      <li><p><span class="what">House lights to what the room needs next.</span> <span class="why">For example, House 100% for packing down.</span></p></li>
+      <li><p><span class="what">Leave the Mac on.</span> <span class="why">Don’t quit Lightkey, don’t shut the Mac down, and keep the charger plugged in. Booth Check keeps it ready.</span></p></li>
+    </ol>
+    <p class="aside">Asked to shut it down? Apple menu → Shut Down. To start it again, unplug the charger and plug it back in.</p>
+  </div>
+</div>
 
 <div class="stop">
   <h2>If the lights run away</h2>
   <p><b>Unplug the Stream Deck’s USB cable</b> and don’t press anything else. If one press changes lots of cues, or Lightkey freezes, this stops it at once.</p>
   <p>Run the rest of the service from Lightkey’s own panel with the mouse, and tell whoever looks after the lighting afterwards.</p>
 </div>
-
-<section>
-  <h2>Before every service</h2>
-  <ol class="steps">
-    <li><p><span class="what">Plug the charger in.</span> <span class="why">The lid can stay closed: the Mac runs from the external screen, keyboard and mouse, but only while it’s on the charger. If the Mac is shut down, unplug the charger and plug it back in to start it.</span></p></li>
-    <li><p><span class="what">Look at Booth Check in the menu bar.</span> <span class="why">A tick means ready; a triangle or cross with a number means something needs fixing, so click it. When the Mac starts, a panel at the top right shows the start-up ticking off, even over full-screen Lightkey, and ends on “Ready for the service”.</span></p></li>
-    <li><p><span class="what">If Lightkey or the Stream Deck app isn’t open, click the Booth Check icon → Get the show started.</span> <span class="why">Same steps: DMX interface, show in Lightkey, Lightkey ready, Stream Deck in the background. When Lightkey asks for the Mac’s password to connect to the DMX interface, type it; that’s expected.</span></p></li>
-    <li><p><span class="what">Hold Option and click Lightkey’s green window button</span> to make it fill the screen. <span class="why">Don’t use true full screen: it moves Lightkey into its own space, and macOS can then let the Stream Deck app fall asleep.</span></p></li>
-    <li><p><span class="what">In the Stream Deck app, check “Lightkey v33 Service Panel” is the profile in use.</span> <span class="why">Booth Check can’t see which profile is selected.</span></p></li>
-    <li><p><span class="what">Press House 10% on the deck, then press it again.</span> <span class="why">The house lights should come up and the key light, then both go off. If that works, the whole chain works.</span></p></li>
-  </ol>
-</section>
 
 <section>
   <h2>Something’s wrong <span class="who">Find the symptom. “Now” is for whoever is in the booth; “For good” is the one-time setup below.</span></h2>
@@ -137,7 +164,7 @@
         <p class="cause">macOS has put the Stream Deck app to sleep. Your presses are queued inside it, not lost.</p>
         <div class="fix">
           <span class="tag now">Now</span><p><b>Stop pressing</b> — every queued press fires when it wakes. Click the Stream Deck app once.</p>
-          <span class="tag setup">For good</span><p>Setup 3 (App Nap), and never true full screen.</p>
+          <span class="tag setup">For good</span><p>Booth Check switches App Nap off at start-up; quit and reopen Stream Deck once.</p>
         </div>
       </div>
     </div>
@@ -214,10 +241,11 @@
   <ol class="steps">
     <li><p><span class="what">Install Booth Check.</span> <span class="why">Download <b>Booth.Check.zip</b> from github.com/jimhoggey/BoothCheck-App/releases and drag Booth Check into Applications. First time only, unblock it with <code>xattr -dr com.apple.quarantine "/Applications/Booth Check.app"</code> in Terminal, or Privacy &amp; Security → <b>Open Anyway</b>. After that it updates itself.</span></p></li>
     <li><p><span class="what">Tell it what this Mac does, choose the show, allow access.</span> <span class="why">In <b>This Mac</b>, switch on Lightkey (with the DMX option), Stream Deck, Stays on for services, and Start the show when the Mac starts. On the main window, <b>Choose show…</b>. Allow control of System Events. On “The right show is open”, click <b>Allow access…</b>, turn Booth Check on under Accessibility, then reopen it.</span></p></li>
-    <li><p><span class="what">Work down Booth Check’s list until everything is a tick.</span> <span class="why">Each item says what to do. Anything that changes the Mac shows the exact command first and runs only when you press Run; anything needing the admin password opens System Settings instead, except starting from the charger, which shows its one <code>sudo</code> command first.</span></p></li>
+    <li><p><span class="what">Work down Booth Check’s list until everything is a tick.</span> <span class="why">Each item says what to do. A change shows its exact command first and runs only when you press Run; most admin changes open System Settings instead.</span></p></li>
     <li><p><span class="what">The settings Booth Check can’t see.</span> <span class="why">On Apple silicon Macs, Privacy &amp; Security → Allow accessories to connect → <b>Always</b> (Intel Macs don’t have it). Lock Screen → screen saver and “Require password…” → Never. Control Centre → Focus → Do Not Disturb, on.</span></p></li>
     <li><p><span class="what">Turn off the Stream Deck app’s own “launch at login”.</span> <span class="why">Booth Check opens it once Lightkey is ready; starting on its own, it can beat Lightkey and the keys stay dead.</span></p></li>
-    <li><p><span class="what">Look after the battery.</span> <span class="why">An always-plugged-in Intel MacBook can swell its battery: turn on battery health management (System Settings → Battery → ⓘ next to Battery Health). If the case bulges or the trackpad lifts, get the battery replaced.</span></p></li>
+    <li><p><span class="what">Look after the battery.</span> <span class="why">Always on the charger, an Intel MacBook’s battery can swell: turn on battery health management (Battery → ⓘ next to Battery Health), and replace it if the case bulges.</span></p></li>
+    <li><p><span class="what">Restart about once a month,</span> <span class="why">a few days before a service, and install macOS updates then. Each restart asks for the password once: with FileVault on, unlocking the disk is the login.</span></p></li>
   </ol>
   <div class="fallback">
     <p class="label">Without Booth Check</p>
@@ -227,18 +255,7 @@ sudo pmset -c sleep 0 displaysleep 0 disksleep 0</pre>
   </div>
 </section>
 
-<section class="pair">
-  <div>
-    <h2>Leave it on</h2>
-    <p>Leave it on, plugged in and logged in, all week. With the lid closed, shut down from the Apple menu and start it by replugging the charger; a vertical stand keeps it cooler. Restart about <b>once a month</b>, a few days before a service, and install macOS updates then.</p>
-  </div>
-  <div>
-    <h2>Why restarts ask for a password</h2>
-    <p>With FileVault on, unlocking the disk <i>is</i> the login, so each restart needs the password once before Booth Check can start the show. Turning FileVault off allows automatic login, but anyone who takes the laptop could read it. Restarting rarely gets the same result.</p>
-  </div>
-</section>
-
-<footer>Written for Booth Check 1.5 and the v33 show, 25 September 2026. When the show version changes, update the names at the top and choose the new show in Booth Check.</footer>
+<footer>Booth Check 1.10 and the v33 show, 26 September 2026. New show version: update the names at the top.</footer>
 
 </body>
 </html>
