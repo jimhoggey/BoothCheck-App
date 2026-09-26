@@ -19,7 +19,8 @@ its window once so whoever sits down sees what to fix.
      accessory, click Allow"; Intel Macs never ask)
   4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
-  6. Open Stream Deck in the background, so Lightkey stays in front
+  6. Switch App Nap off if it's on, then open Stream Deck in the background, so Lightkey stays in
+     front and Stream Deck stays awake behind it
   7. Check everything
 
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
@@ -75,7 +76,14 @@ buttons in its own security dialogs, and an app that could would be able to appr
 accessory prompt is removed properly with its setting (above).
 
 **Stream Deck opens in the background**, out of sight, which is exactly what App Nap puts to sleep.
-So the "Open Stream Deck" start-up step checks App Nap is off, and warns if it isn't.
+So just before opening it, the start-up switches App Nap off if it's still on
+(`defaults write -g NSAppSleepDisabled -bool true`, no password, logged). Apps read that setting when
+they open, so Stream Deck opened straight after stays awake with no restart; if Stream Deck was
+already open, the step says to quit and reopen it once.
+
+**Lightkey asks for the Mac's password** when it connects to the DMX interface, on Intel and Apple
+silicon alike. That's Lightkey's own request, so Booth Check doesn't touch it; the start-up step says
+to type it, and waits a minute for Lightkey to connect.
 
 **Why only Booth Check should open at login.** Login items all start at once, in no set order. If
 the Stream Deck app wins the race, its MIDI plugin can start before Lightkey's MIDI input exists and

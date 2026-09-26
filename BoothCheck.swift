@@ -597,8 +597,6 @@ final class Booth: ObservableObject {
     }
     @Published var mutedChecks: [Check] = []
     @Published var offForThisMac = 0
-    /// From the last check: whether App Nap is off Mac-wide. The Stream Deck start-up step needs it.
-    @Published var appNapDisabled = false
 
     /// At login, open the show, wait for Lightkey, then open Stream Deck. On unless switched off.
     @Published var autoStart: Bool = (UserDefaults.standard.object(forKey: IDs.autoStartKey) as? Bool) ?? true {
@@ -839,10 +837,10 @@ final class Booth: ObservableObject {
                                 + (lastTick == nil || gap == 0 ? "." : " (longest gap so far: \(gap) s).")))
         }
 
-        appNapDisabled = s.appNapOff && !appNapSetThisSession      // set this session = not in effect until restart
         if s.appNapOff && appNapSetThisSession {
             out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
-                             detail: "Switched off just now.", fix: "Restart the Mac for it to take effect."))
+                             detail: "Switched off just now. Apps opened from now on stay awake.",
+                             fix: "If Stream Deck was already open, quit and reopen it once."))
         } else if s.appNapOff {
             out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .ok,
                              detail: "macOS won't put the Stream Deck app to sleep."))
@@ -1039,7 +1037,7 @@ final class Booth: ObservableObject {
             let args = ["write", "-g", "NSAppSleepDisabled", "-bool", "true"]
             pending = PendingChange(
                 key: "appnap", title: "Turn App Nap off",
-                explanation: "Stops macOS putting apps in the background to sleep, which is what freezes the Stream Deck. It applies to every app on this Mac and takes effect after a restart. No password needed.",
+                explanation: "Stops macOS putting apps in the background to sleep, which is what freezes the Stream Deck. It applies to every app on this Mac, from the next time each app opens, so quit and reopen Stream Deck once if it's already open. No password needed. Get the show started also does this automatically before opening Stream Deck.",
                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                 undo: commandLine("/usr/bin/defaults", ["delete", "-g", "NSAppSleepDisabled"]),
                 run: { shell("/usr/bin/defaults", args) })
@@ -1428,8 +1426,11 @@ extension Booth {
                 setStep(i, .failed, "Lightkey isn\u{2019}t installed on this Mac.")
                 return next()
             }
-            // Only Apple silicon laptops ask before trusting a USB accessory; Intel Macs never do.
-            setStep(i, .running, hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil)
+            // Two different prompts can appear here: Lightkey asking for the Mac's password to take
+            // the DMX interface (any Mac), and macOS asking to allow the accessory (Apple silicon only).
+            let hints = [setup.dmx ? "If Lightkey asks for your password to connect to the DMX interface, type it." : nil,
+                         hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil].compactMap { $0 }
+            setStep(i, .running, hints.isEmpty ? nil : hints.joined(separator: " "))
             poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
                 if !ok {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
@@ -1455,7 +1456,9 @@ extension Booth {
                 setStep(i, .warn, "Lightkey isn\u{2019}t open.")
                 return next()
             }
-            poll(every: 2, for: 20, background: true, {
+            // A minute, so a person has time to type the password Lightkey asks for.
+            setStep(i, .running, "If Lightkey asks for your password to connect to the DMX interface, type it.")
+            poll(every: 2, for: 60, background: true, {
                 !usbConnections(shell("/usr/sbin/ioreg", ["-l", "-w0", "-c", "IOUserClient"]).out, pid: pid).isEmpty
                     || shell("/usr/sbin/lsof", ["-p", String(pid), "-Fn"]).out.split(separator: "\n").contains {
                         $0.hasPrefix("n/dev/") && ($0.contains("usbserial") || $0.contains("usbmodem"))
@@ -1468,19 +1471,36 @@ extension Booth {
             }
 
         case "deck":
+            // Out of sight is exactly what App Nap puts to sleep, so switch it off before Stream Deck
+            // opens. Apps read the setting when they launch, so this takes effect for Stream Deck
+            // straight away, with no restart. No password needed; the command goes in the Log.
+            let napOff = shell("/usr/bin/defaults", ["read", "-g", "NSAppSleepDisabled"])
+                .out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+            var napSwitched = false
+            if !napOff {
+                let args = ["write", "-g", "NSAppSleepDisabled", "-bool", "true"]
+                let r = shell("/usr/bin/defaults", args)
+                changes.insert(LogEntry(title: "Start-up: switched App Nap off for Stream Deck", language: "Terminal",
+                                        code: commandLine("/usr/bin/defaults", args),
+                                        output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+                napSwitched = r.code == 0
+                if napSwitched { appNapSetThisSession = true }
+            }
+
             if isRunning(IDs.streamDeck) {
-                setStep(i, .done, "Already open.")
+                if napSwitched {
+                    setStep(i, .warn, "Already open, but it started before App Nap was switched off. Quit and reopen Stream Deck once so it stays awake in the background.")
+                } else {
+                    setStep(i, .done, "Already open.")
+                }
             } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
                 // In the background, so Lightkey stays in front and full screen isn't interrupted.
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = false
                 NSWorkspace.shared.openApplication(at: url, configuration: config)
-                // Out of sight is exactly what App Nap puts to sleep, so this step depends on it being off.
-                if appNapDisabled {
-                    setStep(i, .done, "Opened behind Lightkey. App Nap is off, so it keeps running there.")
-                } else {
-                    setStep(i, .warn, "Opened behind Lightkey, but App Nap is still on, so the keys can freeze while it\u{2019}s in the background. Turn App Nap off in Booth Check, then restart the Mac.")
-                }
+                setStep(i, .done, napSwitched
+                    ? "Switched App Nap off, then opened it behind Lightkey, so it keeps running there."
+                    : "Opened behind Lightkey. App Nap is off, so it keeps running there.")
             } else {
                 setStep(i, .failed, "Not installed on this Mac.")
             }
