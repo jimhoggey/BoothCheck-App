@@ -574,8 +574,6 @@ final class Booth: ObservableObject {
     @Published var starting = false
     @Published var bootSteps: [BootStep] = []
     @Published var bootFinished = false
-    @Published var longestGap: TimeInterval = 0
-    private var lastTick: Date?
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -819,23 +817,6 @@ final class Booth: ObservableObject {
             : Check(id: "lpm", group: "Power & sleep", title: "Low Power Mode off", status: .fail,
                     detail: "Low Power Mode slows background apps, including the Stream Deck app.",
                     fix: "Set Low Power Mode to Never.", action: .open(Settings.battery, "Open Battery settings")))
-
-        // Booth Check itself: it opts out of App Nap, and proves it by timing its own 15-second checks.
-        let optedOut = napActivity != nil || (Bundle.main.infoDictionary?["NSAppSleepDisabled"] as? Bool) == true
-        let gap = Int(longestGap.rounded())
-        if !optedOut {
-            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .fail,
-                             detail: "Booth Check could be slowed down while it\u{2019}s in the background.",
-                             fix: "Quit and reopen Booth Check."))
-        } else if longestGap > 60 {
-            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .warn,
-                             detail: "Booth Check was held up for \(gap) seconds between checks.",
-                             fix: "If this keeps happening, check App Nap and Low Power Mode above."))
-        } else {
-            out.append(Check(id: "selfNap", group: "Power & sleep", title: "Booth Check stays awake", status: .ok,
-                             detail: "Booth Check has opted out of App Nap and checks every 15 seconds, even in the background"
-                                + (lastTick == nil || gap == 0 ? "." : " (longest gap so far: \(gap) s).")))
-        }
 
         if s.appNapOff && appNapSetThisSession {
             out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
@@ -1169,7 +1150,9 @@ extension Booth {
 
     /// Icon, colour and headline shared by the window and the menu bar.
     var summary: (symbol: String, color: Color, title: String) {
-        if checks.isEmpty { return ("hourglass", .secondary, "Checking\u{2026}") }
+        if lastChecked == nil { return ("hourglass", .secondary, "Checking\u{2026}") }
+        // Nothing switched on under This Mac (or everything muted): say so rather than show a tick.
+        if checks.isEmpty { return ("circle.dashed", .secondary, "Nothing to check on this Mac") }
         if problemCount == 0 && unknownCount == 0 { return ("checkmark.seal.fill", .green, "Ready for the service") }
         if problemCount == 0 {
             return ("questionmark.circle.fill", .secondary,
@@ -1181,13 +1164,14 @@ extension Booth {
 
     /// The menu bar shows shape rather than colour, since macOS draws menu bar icons in one colour.
     var menuSymbol: String {
-        if checks.isEmpty { return "hourglass" }
+        if lastChecked == nil { return "hourglass" }
+        if checks.isEmpty { return "circle.dashed" }
         if problemCount == 0 { return unknownCount == 0 ? "checkmark.circle" : "questionmark.circle" }
         return anyFailing ? "xmark.octagon" : "exclamationmark.triangle"
     }
 
-    /// Starts the checks, the update checks and the wake watcher. They run whether or not the window
-    /// is open, so the menu bar icon is always current.
+    /// Starts the checks and the update checks. They run whether or not the window is open, so the
+    /// menu bar icon is always current.
     func start() {
         guard timers.isEmpty else { return }
         refresh()
@@ -1198,8 +1182,6 @@ extension Booth {
         }
         for t in [checks, updates] { RunLoop.main.add(t, forMode: .common) }
         timers = [checks, updates]
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
-                                                          queue: .main) { [weak self] _ in self?.macDidWake() }
     }
 
     func showWindow() { MainWindow.shared.show() }
@@ -1209,8 +1191,8 @@ extension Booth {
         let s = setup
         switch id {
         case "lk", "show": return s.lightkey
-        case "dmx": return s.dmx
-        case "dmxLive": return s.lightkey && s.dmx
+        // The DMX interface option sits inside Lightkey's row and hides with it, so it goes with Lightkey.
+        case "dmx", "dmxLive": return s.lightkey && s.dmx
         case "midi": return s.lightkey && s.streamDeck
         case "deck", "deckapp", "nap": return s.streamDeck
         case "ac", "sleep", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
@@ -1306,17 +1288,10 @@ extension Booth {
 // MARK: - Timing and getting the show started
 
 extension Booth {
-    /// Called by the 15-second timer. Measures the gap since the last tick, so Booth Check can tell
-    /// whether it was held up in the background, then checks again.
+    /// Called by the 15-second timer. Holds off while a change is waiting for approval.
     func tick() {
-        let now = Date()
-        if let lastTick { longestGap = max(longestGap, now.timeIntervalSince(lastTick)) }
-        lastTick = now
         if pending == nil { refresh() }
     }
-
-    /// The Mac was asleep, so the gap since the last tick says nothing about Booth Check.
-    func macDidWake() { lastTick = nil }
 
     /// The start-up order, as numbered steps. The same list is shown in This Mac before anyone
     /// restarts, and ticks off live in the start-up panel while it runs.

@@ -39,7 +39,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 
 | On this Mac | What Booth Check does |
 |---|---|
-| **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks |
+| **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks; switching Lightkey off switches those off too |
 | **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
@@ -55,7 +55,8 @@ Any single check can also be **muted** with the 🔕 button on its row (or right
 stay listed under "Muted on this Mac" with an Unmute button.
 
 Nothing is hidden quietly: the header and the menu bar dropdown always say "N checks off for this Mac
-· N muted", and every change is kept in the Log. When the Stream Deck app isn't installed at all, its
+· N muted", and every change is kept in the Log. With nothing switched on, the header says "Nothing to
+check on this Mac" and the menu bar shows a dashed circle, never a tick. When the Stream Deck app isn't installed at all, its
 row offers **No Stream Deck on this Mac**. The DMX interface deliberately has no such shortcut: at a
 service, a cable falling out looks exactly like a Mac without one, so it can only be switched off in
 the sheet.
@@ -66,7 +67,7 @@ the sheet.
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
-| Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · Booth Check itself stays awake · App Nap off |
+| Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking *(Apple silicon only; Intel Macs don't ask)* · no password after idle (macOS doesn't let apps read these two) |
@@ -107,9 +108,9 @@ Lightkey has the interface open: macOS records which app opened each USB driver 
 (`ioreg`), and `lsof` lists the serial ports Lightkey holds. Either one counts. If the lights respond
 and this row disagrees, trust the lights.
 
-**Booth Check stays awake** because it opts out of App Nap (`NSAppSleepDisabled` plus a background
-activity). It proves it by timing its own 15-second checks, and warns if a gap ever passes a minute
-while the Mac was awake.
+**Booth Check keeps itself awake** by opting out of App Nap (`NSAppSleepDisabled` plus a background
+activity), so its checks keep running behind full-screen Lightkey. It has no row of its own: nobody
+could fix anything there, and whether the Mac stays awake is what the Power & sleep checks are for.
 
 ## Get the show started
 
