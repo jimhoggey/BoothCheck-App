@@ -316,6 +316,21 @@ func windowsOf(pid: pid_t) -> (docs: [URL], titles: [String]) {
     return (docs, titles)
 }
 
+/// Whether Lightkey has the chosen show open. Lightkey is a document app, so Accessibility gives each
+/// window's file, and then the path decides: a same-named copy from another folder doesn't count.
+/// Window titles are only the fallback, and must name the show on its own ("Show", "Show — Edited"),
+/// so "Show_v3" can't pass for "Show_v33" and "Show copy" isn't the show.
+func showIsOpen(_ showPath: String, docs: [URL], titles: [String]) -> Bool {
+    let wanted = URL(fileURLWithPath: showPath).standardizedFileURL
+    if !docs.isEmpty { return docs.contains { $0.standardizedFileURL.path == wanted.path } }
+    let names = [wanted.lastPathComponent, wanted.deletingPathExtension().lastPathComponent]
+    return titles.contains { title in
+        ([title] + title.components(separatedBy: " \u{2014} ")).contains {
+            names.contains($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -550,6 +565,23 @@ func undoBootArgs(_ value: String?) -> [String] {
     value.map { ["\(bootVariable)=\($0)"] } ?? ["-d", bootVariable]
 }
 
+/// Apps read the App Nap setting when they open, so only a Stream Deck that was already running
+/// when Booth Check switched it off can still be put to sleep; one opened afterwards is fine.
+func appNapCheck(appNapOff: Bool, switchedOffAt: Date?, deckLaunched: Date?) -> Check {
+    if !appNapOff {
+        return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .fail,
+                     detail: "macOS can put the Stream Deck app to sleep — that's what freezes the keys.",
+                     fix: "Turn it off, then restart the Mac.", action: .fixAppNap)
+    }
+    if let switchedOffAt, let deckLaunched, deckLaunched < switchedOffAt {
+        return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
+                     detail: "Switched off after the Stream Deck app opened, so that copy can still be put to sleep.",
+                     fix: "Quit and reopen Stream Deck once.")
+    }
+    return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .ok,
+                 detail: "macOS won't put the Stream Deck app to sleep.")
+}
+
 final class Booth: ObservableObject {
     static let shared = Booth()
 
@@ -605,7 +637,8 @@ final class Booth: ObservableObject {
     }
 
     private var busy = false
-    private var appNapSetThisSession = false
+    /// When Booth Check switched App Nap off, this session. Apps read the setting when they open.
+    private var appNapSwitchedOffAt: Date?
 
     var showName: String? { showPath.map { URL(fileURLWithPath: $0).lastPathComponent } }
 
@@ -818,18 +851,7 @@ final class Booth: ObservableObject {
                     detail: "Low Power Mode slows background apps, including the Stream Deck app.",
                     fix: "Set Low Power Mode to Never.", action: .open(Settings.battery, "Open Battery settings")))
 
-        if s.appNapOff && appNapSetThisSession {
-            out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
-                             detail: "Switched off just now. Apps opened from now on stay awake.",
-                             fix: "If Stream Deck was already open, quit and reopen it once."))
-        } else if s.appNapOff {
-            out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .ok,
-                             detail: "macOS won't put the Stream Deck app to sleep."))
-        } else {
-            out.append(Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .fail,
-                             detail: "macOS can put the Stream Deck app to sleep — that's what freezes the keys.",
-                             fix: "Turn it off, then restart the Mac.", action: .fixAppNap))
-        }
+        out.append(appNapCheck(appNapOff: s.appNapOff, switchedOffAt: appNapSwitchedOffAt, deckLaunched: deckApp?.launchDate))
 
         // Start at login -----------------------------------------------------------------------
         loginRead = readLoginItems()
@@ -954,6 +976,14 @@ final class Booth: ObservableObject {
             return Check(id: "show", group: "Lighting", title: title, status: .warn,
                          detail: "Booth Check doesn't know which show this Mac should run yet.", action: .chooseShow)
         }
+        // A show that was moved or renamed can't be opened at all, so this comes before anything else.
+        let exists = FileManager.default.fileExists(atPath: showPath)
+        pass.api("The show file", "FileManager: is \(showPath) there", exists ? "Found." : "Not there.")
+        guard exists else {
+            return Check(id: "show", group: "Lighting", title: title, status: .fail,
+                         detail: "Can\u{2019}t find \(showName). It was moved, renamed or deleted.",
+                         fix: "Choose the show again.", action: .chooseShow)
+        }
         guard let lightkey else {
             return Check(id: "show", group: "Lighting", title: title, status: .unknown,
                          detail: "Waiting for Lightkey to open.")
@@ -970,10 +1000,15 @@ final class Booth: ObservableObject {
         pass.api("Which show Lightkey has open", "Accessibility: read the document and title of each Lightkey window",
                  (docs.map(\.path) + titles).joined(separator: "\n").isEmpty ? "(no windows)"
                     : (docs.map(\.path) + titles).joined(separator: "\n"))
-        let wanted = URL(fileURLWithPath: showPath).standardizedFileURL.path
-        let stem = (showName as NSString).deletingPathExtension
-        if docs.contains(where: { $0.standardizedFileURL.path == wanted }) || titles.contains(where: { $0.contains(stem) }) {
+        if showIsOpen(showPath, docs: docs, titles: titles) {
             return Check(id: "show", group: "Lighting", title: title, status: .ok, detail: "\(showName) is open.")
+        }
+        if let copy = docs.first(where: { $0.lastPathComponent == showName }) {
+            let folder = (copy.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
+            return Check(id: "show", group: "Lighting", title: title, status: .fail,
+                         detail: "Lightkey has a different copy of \(showName) open, from \(folder).",
+                         fix: "If that copy is the right one, choose it with Change\u{2026} above. Otherwise open the chosen show.",
+                         action: .openShow)
         }
         let open = docs.map(\.lastPathComponent) + (docs.isEmpty ? titles : [])
         return Check(id: "show", group: "Lighting", title: title, status: .fail,
@@ -1092,7 +1127,9 @@ final class Booth: ObservableObject {
         case .chooseShow:
             chooseShow()
         case .openShow:
-            if let showPath { NSWorkspace.shared.open(URL(fileURLWithPath: showPath)) }
+            if let showPath, !NSWorkspace.shared.open(URL(fileURLWithPath: showPath)) {
+                message = "Couldn\u{2019}t open \(showName ?? "the show"). If it was moved or renamed, choose it again."
+            }
         case .launchStreamDeck:
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
                 NSWorkspace.shared.openApplication(at: url, configuration: .init())
@@ -1117,7 +1154,7 @@ final class Booth: ObservableObject {
         let entry = LogEntry(title: change.title, language: change.language, code: change.code,
                              output: r.out.isEmpty ? "(no output)" : r.out, status: r.code)
         changes.insert(entry, at: 0)
-        if change.key == "appnap", r.code == 0 { appNapSetThisSession = true }
+        if change.key == "appnap", r.code == 0 { appNapSwitchedOffAt = Date() }
         return entry
     }
 
@@ -1148,11 +1185,17 @@ extension Booth {
     var unknownCount: Int { checks.filter { $0.status == .unknown }.count }
     private var anyFailing: Bool { checks.contains { $0.status == .fail } }
 
+    /// Before the first pass, and when nothing applies (nothing switched on under This Mac, or
+    /// everything muted), the window and the menu bar say so the same way rather than show a tick.
+    private var idle: (symbol: String, title: String)? {
+        if lastChecked == nil { return ("hourglass", "Checking\u{2026}") }
+        if checks.isEmpty { return ("circle.dashed", "Nothing to check on this Mac") }
+        return nil
+    }
+
     /// Icon, colour and headline shared by the window and the menu bar.
     var summary: (symbol: String, color: Color, title: String) {
-        if lastChecked == nil { return ("hourglass", .secondary, "Checking\u{2026}") }
-        // Nothing switched on under This Mac (or everything muted): say so rather than show a tick.
-        if checks.isEmpty { return ("circle.dashed", .secondary, "Nothing to check on this Mac") }
+        if let idle { return (idle.symbol, .secondary, idle.title) }
         if problemCount == 0 && unknownCount == 0 { return ("checkmark.seal.fill", .green, "Ready for the service") }
         if problemCount == 0 {
             return ("questionmark.circle.fill", .secondary,
@@ -1164,8 +1207,7 @@ extension Booth {
 
     /// The menu bar shows shape rather than colour, since macOS draws menu bar icons in one colour.
     var menuSymbol: String {
-        if lastChecked == nil { return "hourglass" }
-        if checks.isEmpty { return "circle.dashed" }
+        if let idle { return idle.symbol }
         if problemCount == 0 { return unknownCount == 0 ? "checkmark.circle" : "questionmark.circle" }
         return anyFailing ? "xmark.octagon" : "exclamationmark.triangle"
     }
@@ -1393,7 +1435,9 @@ extension Booth {
 
         case "lightkey":
             let wasRunning = isRunning(IDs.lightkey)
-            if let showPath {
+            // A show that was moved or renamed can't be opened, so open Lightkey on its own and say why.
+            let showMissing = showPath.map { !FileManager.default.fileExists(atPath: $0) } ?? false
+            if let showPath, !showMissing {
                 NSWorkspace.shared.open(URL(fileURLWithPath: showPath))
             } else if !wasRunning, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) {
                 NSWorkspace.shared.openApplication(at: url, configuration: .init())
@@ -1409,6 +1453,8 @@ extension Booth {
             poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
                 if !ok {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
+                } else if showMissing {
+                    self.setStep(i, .failed, "Can\u{2019}t find \(self.showName ?? "the show"): it was moved, renamed or deleted. Open the show from Lightkey\u{2019}s File menu, then choose it again in Booth Check.")
                 } else if self.showPath == nil {
                     self.setStep(i, .warn, "No show is chosen in Booth Check, so open it in Lightkey.")
                 } else {
@@ -1459,7 +1505,7 @@ extension Booth {
                                         code: commandLine("/usr/bin/defaults", args),
                                         output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
                 napSwitched = r.code == 0
-                if napSwitched { appNapSetThisSession = true }
+                if napSwitched { appNapSwitchedOffAt = Date() }
             }
 
             if isRunning(IDs.streamDeck) {

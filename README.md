@@ -80,7 +80,8 @@ accessory prompt is removed properly with its setting (above).
 So just before opening it, the start-up switches App Nap off if it's still on
 (`defaults write -g NSAppSleepDisabled -bool true`, no password, logged). Apps read that setting when
 they open, so Stream Deck opened straight after stays awake with no restart; if Stream Deck was
-already open, the step says to quit and reopen it once.
+already open, the step says to quit and reopen it once, and the App Nap row stays orange until it has
+been (it compares when Stream Deck opened with when App Nap was switched off).
 
 **Lightkey asks for the Mac's password** when it connects to the DMX interface, on Intel and Apple
 silicon alike. That's Lightkey's own request, so Booth Check doesn't touch it; the start-up step says
@@ -102,6 +103,12 @@ Booth Check reads it without a password. Turning it on is the one change that as
 password, because it has no System Settings page; the approval sheet shows the exact `sudo nvram`
 command and its undo first, and you can copy it into Terminal instead. The ⓘ next to the check
 explains it in the app.
+
+**The right show is open** compares the file Lightkey has open with the chosen one, folder and all, so
+a same-named copy in Downloads or a backup folder doesn't pass. (Lightkey is a document app, so macOS
+reports each window's file; window titles are only a fallback, and must name the show exactly.) A show
+that has been moved, renamed or deleted turns the row red straight away, even before Lightkey opens,
+and the start-up says so instead of waiting for a show that can't open.
 
 **Lightkey sending DMX** is experimental. An app can't see the DMX signal, but it can see whether
 Lightkey has the interface open: macOS records which app opened each USB driver connection
