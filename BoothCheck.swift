@@ -265,17 +265,30 @@ func isDMXInterface(_ d: USBDevice) -> Bool {
     d.vendorID == IDs.ftdiVendor || d.name.localizedCaseInsensitiveContains("DMX")
 }
 
-/// USB driver connections that one process has open, from `ioreg -l -c IOUserClient` output. Each
-/// connection records who opened it ("pid 123, Lightkey"); a USB one opened by Lightkey means
+/// The processes that drive Lightkey's DMX output, from `ps -axo pid=,comm=` output: Lightkey itself,
+/// and its OLA server `olad` (Open Lighting Architecture). Lightkey starts olad from /Library/OLA,
+/// and olad opens USB interfaces such as the Open DMX USB through libusb, so the connection is
+/// olad's, not Lightkey's. Lightkey comes first.
+func dmxDriverPIDs(lightkey: pid_t, psOutput: String) -> [pid_t] {
+    [lightkey] + psOutput.split(separator: "\n").compactMap { line in
+        let parts = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1)
+        guard parts.count == 2, let pid = pid_t(parts[0]), pid != lightkey,
+              (String(parts[1]) as NSString).lastPathComponent == "olad" else { return nil }
+        return pid
+    }
+}
+
+/// USB driver connections that these processes have open, from `ioreg -l -c IOUserClient` output.
+/// Each connection records who opened it ("pid 123, Lightkey"); a USB one opened by Lightkey means
 /// Lightkey is driving a USB device, and the DMX interface is the only one it drives.
-func usbConnections(_ output: String, pid: pid_t) -> [String] {
+func usbConnections(_ output: String, pids: [pid_t]) -> [String] {
     var currentClass = ""
     var found: [String] = []
     for raw in output.split(separator: "\n") {
         let line = String(raw)
         if let r = line.range(of: "<class ") {
             currentClass = String(line[r.upperBound...].prefix { $0 != "," && $0 != ">" })
-        } else if line.contains("\"IOUserClientCreator\""), line.contains("\"pid \(pid),"),
+        } else if line.contains("\"IOUserClientCreator\""), pids.contains(where: { line.contains("\"pid \($0),") }),
                   currentClass.localizedCaseInsensitiveContains("USB") {
             found.append("\(currentClass) \u{2014} \(line.components(separatedBy: "= ").last ?? "")")
         }
@@ -534,7 +547,7 @@ struct Snapshot {
     var appNapOff = false
     var usb: [USBDevice] = []
     var autoInstall: String?
-    var lightkeyUSB: [String] = []          // USB driver connections Lightkey has open
+    var lightkeyUSB: [String] = []          // USB driver connections Lightkey or its olad has open
     var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
     var hasBattery = false                  // a laptop, so starting from the charger applies
     var bootValue: String?                  // the firmware setting; nil = not set = factory setting
@@ -669,18 +682,30 @@ final class Booth: ObservableObject {
             s.autoInstall = upd.code == 0 ? upd.out.trimmingCharacters(in: .whitespacesAndNewlines) : nil
 
             // Experimental: is Lightkey actually using the DMX interface? Only worth asking when
-            // both are there. Logged filtered to Lightkey's own entries; the raw output is huge.
+            // both are there. Lightkey drives it through its OLA server, olad, so both processes
+            // count. Logged filtered to their own entries; the raw output is huge.
             if let pid = lightkeyPID, s.usb.contains(where: isDMXInterface) {
+                let psArgs = ["-axo", "pid=,comm="]
+                let ps = shell("/bin/ps", psArgs)
+                let pids = dmxDriverPIDs(lightkey: pid, psOutput: ps.out)
+                let olad = pids.filter { $0 != pid }.map(String.init)
+                pass.entries.append(LogEntry(
+                    title: "Lightkey's DMX server, olad (experimental)", language: "Terminal",
+                    code: commandLine("/bin/ps", psArgs),
+                    output: (olad.isEmpty ? "olad isn\u{2019}t running." : "olad is running (pid \(olad.joined(separator: ", "))).")
+                        + "\n(Only Lightkey\u{2019}s OLA server is shown.)",
+                    status: ps.code))
+                let who = "Lightkey (pid \(pid))" + (olad.isEmpty ? "" : " or olad (pid \(olad.joined(separator: ", ")))")
                 let ioArgs = ["-l", "-w0", "-c", "IOUserClient"]
                 let io = shell("/usr/sbin/ioreg", ioArgs)
-                s.lightkeyUSB = usbConnections(io.out, pid: pid)
+                s.lightkeyUSB = usbConnections(io.out, pids: pids)
                 pass.entries.append(LogEntry(
                     title: "Lightkey's USB connections (experimental)", language: "Terminal",
                     code: commandLine("/usr/sbin/ioreg", ioArgs),
-                    output: (s.lightkeyUSB.isEmpty ? "None opened by Lightkey (pid \(pid))." : s.lightkeyUSB.joined(separator: "\n"))
-                        + "\n(Only connections opened by Lightkey are shown.)",
+                    output: (s.lightkeyUSB.isEmpty ? "None opened by \(who)." : s.lightkeyUSB.joined(separator: "\n"))
+                        + "\n(Only connections opened by Lightkey or olad are shown.)",
                     status: io.code))
-                let lsofArgs = ["-p", String(pid), "-Fn"]
+                let lsofArgs = ["-p", pids.map(String.init).joined(separator: ","), "-Fn"]
                 let ls = shell("/usr/sbin/lsof", lsofArgs)
                 s.lightkeySerial = ls.out.split(separator: "\n").compactMap { line in
                     line.hasPrefix("n/dev/") && (line.contains("usbserial") || line.contains("usbmodem"))
@@ -1480,8 +1505,10 @@ extension Booth {
             // A minute, so a person has time to type the password Lightkey asks for.
             setStep(i, .running, "If Lightkey asks for your password to connect to the DMX interface, type it.")
             poll(every: 2, for: 60, background: true, {
-                !usbConnections(shell("/usr/sbin/ioreg", ["-l", "-w0", "-c", "IOUserClient"]).out, pid: pid).isEmpty
-                    || shell("/usr/sbin/lsof", ["-p", String(pid), "-Fn"]).out.split(separator: "\n").contains {
+                // Asked again each time: olad, which holds the interface for Lightkey, can start late.
+                let pids = dmxDriverPIDs(lightkey: pid, psOutput: shell("/bin/ps", ["-axo", "pid=,comm="]).out)
+                return !usbConnections(shell("/usr/sbin/ioreg", ["-l", "-w0", "-c", "IOUserClient"]).out, pids: pids).isEmpty
+                    || shell("/usr/sbin/lsof", ["-p", pids.map(String.init).joined(separator: ","), "-Fn"]).out.split(separator: "\n").contains {
                         $0.hasPrefix("n/dev/") && ($0.contains("usbserial") || $0.contains("usbmodem"))
                     }
             }) { ok in

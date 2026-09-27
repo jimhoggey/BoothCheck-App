@@ -111,9 +111,10 @@ that has been moved, renamed or deleted turns the row red straight away, even be
 and the start-up says so instead of waiting for a show that can't open.
 
 **Lightkey sending DMX** is experimental. An app can't see the DMX signal, but it can see whether
-Lightkey has the interface open: macOS records which app opened each USB driver connection
-(`ioreg`), and `lsof` lists the serial ports Lightkey holds. Either one counts. If the lights respond
-and this row disagrees, trust the lights.
+Lightkey has the interface open. Lightkey drives USB interfaces through its own OLA server, `olad`
+(Open Lighting Architecture, installed in `/Library/OLA`), so a connection held by either counts:
+macOS records which process opened each USB driver connection (`ioreg`), and `lsof` lists the serial
+ports they hold. If the lights respond and this row disagrees, trust the lights.
 
 **Booth Check keeps itself awake** by opting out of App Nap (`NSAppSleepDisabled` plus a background
 activity), so its checks keep running behind full-screen Lightkey. It has no row of its own: nobody
