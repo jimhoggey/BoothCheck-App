@@ -13,10 +13,15 @@ its window once so whoever sits down sees what to fix.
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
   the top right that floats over everything, full-screen Lightkey included, without taking focus:
 
-  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it
+  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it. If it isn't there
+     after 10 seconds, the step says to unplug the DMX USB cable and plug it back in: an interface
+     left plugged in sometimes only shows up again that way, and the replug is picked up straight
+     away. Usually it's found at once and nothing is asked
   2. Open any other apps, such as ProPresenter
   3. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
-     accessory, click Allow"; Intel Macs never ask)
+     accessory, click Allow"; Intel Macs never ask). Lightkey can drop the request while it's still
+     starting and sit on its start screen, so once it's up Booth Check asks again (an open show just
+     comes to the front) and, with Accessibility allowed, checks the show really opened
   4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
   6. Switch App Nap off if it's on, then open Stream Deck in the background, so Lightkey stays in

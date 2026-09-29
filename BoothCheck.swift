@@ -344,6 +344,19 @@ func showIsOpen(_ showPath: String, docs: [URL], titles: [String]) -> Bool {
     }
 }
 
+enum ShowOpenNext: Equatable { case done, askAgain, notShowing }
+
+/// The start-up's next move once Lightkey is running. `isOpen` says whether Lightkey shows the chosen
+/// show, or is nil when Booth Check can't see its windows (no Accessibility). `attempt` counts how
+/// often Lightkey has already been asked again. Ask up to twice; without Accessibility, once, blind.
+func showOpenNext(isOpen: Bool?, attempt: Int) -> ShowOpenNext {
+    switch isOpen {
+    case true?: return .done
+    case false?: return attempt < 2 ? .askAgain : .notShowing
+    case nil: return attempt == 0 ? .askAgain : .done
+    }
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -743,7 +756,7 @@ final class Booth: ObservableObject {
         } else {
             out.append(Check(id: "dmx", group: "Lighting", title: "DMX interface plugged in", status: .fail,
                              detail: "No USB DMX interface found.",
-                             fix: "Check the DMX USB cable at both ends, then quit and reopen Lightkey."))
+                             fix: "Unplug the DMX USB cable and plug it back in, then quit and reopen Lightkey."))
         }
 
         out.append(lightkey != nil
@@ -1435,11 +1448,20 @@ extension Booth {
 
         switch id {
         case "dmxWait":
+            // Plugged in all along, the interface sometimes isn't seen until it's unplugged and plugged
+            // back in (church Mac, 29 Sept 2026; other restarts found it at once; cause not known yet).
+            // Lightkey isn't open yet, so a replug is safe here and is picked up within a second. Only
+            // ask when it's really missing: not in the first 10 seconds, which a slow start-up needs.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                guard i < self.bootSteps.count, self.bootSteps[i].id == "dmxWait",
+                      self.bootSteps[i].state == .running else { return }
+                self.setStep(i, .running, "Not found yet: unplug the DMX USB cable and plug it back in.")
+            }
             poll(for: 30, background: true, {
                 usbDevices(shell("/usr/sbin/ioreg", ["-p", "IOUSB", "-l", "-w0"]).out).contains(where: isDMXInterface)
             }) { ok in
                 self.setStep(i, ok ? .done : .warn,
-                             ok ? "Found on USB." : "Not found after 30 seconds. Opening Lightkey anyway; check the DMX USB cable.")
+                             ok ? "Found on USB." : "Not found in 30 seconds, so Lightkey opens anyway. No lights? Replug the DMX USB cable, then reopen Lightkey.")
                 next()
             }
 
@@ -1480,10 +1502,11 @@ extension Booth {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
                 } else if showMissing {
                     self.setStep(i, .failed, "Can\u{2019}t find \(self.showName ?? "the show"): it was moved, renamed or deleted. Open the show from Lightkey\u{2019}s File menu, then choose it again in Booth Check.")
-                } else if self.showPath == nil {
-                    self.setStep(i, .warn, "No show is chosen in Booth Check, so open it in Lightkey.")
+                } else if let showPath = self.showPath {
+                    return self.confirmShowOpen(i, showPath, doneText: wasRunning ? "Already open; brought to the front." : "Opened.",
+                                                then: next)
                 } else {
-                    self.setStep(i, .done, wasRunning ? "Already open; brought to the front." : "Opened.")
+                    self.setStep(i, .warn, "No show is chosen in Booth Check, so open it in Lightkey.")
                 }
                 next()
             }
@@ -1563,6 +1586,34 @@ extension Booth {
                 next()
             }
         }
+    }
+
+    /// Lightkey can drop an open request that arrives while it's still starting, then sit on its start
+    /// screen with no show, so nothing drives the DMX interface either (church Mac, 29 Sept 2026). So
+    /// once Lightkey is up, look, and ask it to open the show again if needed: a show that's already
+    /// open just comes to the front. Without Accessibility Booth Check can't see Lightkey's windows,
+    /// so it asks once more anyway.
+    private func confirmShowOpen(_ i: Int, _ showPath: String, doneText: String, then next: @escaping () -> Void) {
+        let url = URL(fileURLWithPath: showPath)
+        func look(_ attempt: Int) {
+            var isOpen: Bool?
+            if AXIsProcessTrusted() {
+                let pid = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
+                isOpen = pid.map { let (docs, titles) = windowsOf(pid: $0); return showIsOpen(showPath, docs: docs, titles: titles) } ?? false
+            }
+            switch showOpenNext(isOpen: isOpen, attempt: attempt) {
+            case .done:
+                self.setStep(i, .done, doneText)
+                next()
+            case .notShowing:
+                self.setStep(i, .warn, "Lightkey is open but not showing \(url.deletingPathExtension().lastPathComponent). Open it from File \u{2192} Open Recent.")
+                next()
+            case .askAgain:
+                NSWorkspace.shared.open(url)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { look(attempt + 1) }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { look(0) }
     }
 
     /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed.
