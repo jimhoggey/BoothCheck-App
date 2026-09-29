@@ -38,13 +38,15 @@
              color: var(--muted); font-size: 11.5pt; }
   .plugged b { color: var(--ink); }
 
-  .block { margin-top: 7mm; border-radius: 3mm; padding: 5mm 6mm 6mm; }
+  .block { margin-top: 6mm; border-radius: 3mm; padding: 5mm 6mm 6mm; }
+  .pair { display: grid; grid-template-columns: 1fr 1.25fr; gap: 5mm; align-items: stretch; }
+  .pair .block { margin-top: 6mm; }
   .block.start { background: var(--go-soft); border: 0.5mm solid #a7d3b5; }
   .block.finish { background: var(--stop-soft); border: 0.5mm solid #cfd3da; }
   .block h2 { font-size: 22pt; margin-bottom: 4mm; }
   .start h2 { color: var(--go); }
 
-  ol { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 4.2mm; }
+  ol { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 3.6mm; }
   li { counter-increment: s; display: grid; grid-template-columns: 11mm 1fr; align-items: baseline; }
   li::before { content: counter(s); font: 700 22pt/1 var(--display); color: var(--amber); }
   .finish li::before { color: var(--stop); }
@@ -55,8 +57,9 @@
   li.done::before { content: "✓"; color: var(--go); }
   li.done { font-weight: 600; font-size: 15pt; color: var(--go); counter-increment: none; }
 
-  .help { margin-top: 7mm; font-size: 11pt; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 1.5mm 5mm; }
-  .help b { color: var(--ink); }
+  .block.trouble { background: #fff8ea; border: 0.5mm solid #ecd3a0; }
+  .trouble h2 { color: var(--amber); }
+  .sorry { margin-top: 4mm; color: var(--muted); font-size: 11pt; }
 </style>
 </head>
 <body>
@@ -71,23 +74,30 @@
   <ol>
     <li><p><b>Open the MacBook and press the power button.</b></p></li>
     <li><p><b>Type the password.</b> <span class="hint">It’s written on the MacBook.</span></p></li>
-    <li><p><b>Wait. Don’t click anything yet.</b> <span class="hint">Booth Check finds the DMX box, then opens Lightkey by itself.</span></p></li>
-    <li><p><b>In Lightkey, click the most recent project:</b> <span class="file">BackupChurch_modular_v30</span></p></li>
+    <li><p><b>Wait. Don’t click anything yet.</b> <span class="hint">Booth Check finds the DMX box, then opens Lightkey by itself. If it says to unplug and replug, it means the USB cable in the blue box: pull it out and plug it back in.</span></p></li>
+    <li><p><b>In Lightkey, click the most recent project:</b> <span class="file">BackupChurch_modular</span></p></li>
     <li><p><b>Tap Authenticate on the Touch Bar, and type the password again.</b></p></li>
     <li class="done"><p>The lights are working.</p></li>
   </ol>
 </div>
 
-<div class="block finish">
-  <h2>Finish</h2>
-  <ol>
-    <li><p><b>Apple menu  → Shut Down.</b></p></li>
-    <li><p><b>Close the lid.</b> <span class="hint">Leave everything plugged in.</span></p></li>
-  </ol>
-</div>
+<div class="pair">
+  <div class="block finish">
+    <h2>Finish</h2>
+    <ol>
+      <li><p><b>Apple menu  →<br>Shut&nbsp;Down.</b></p></li>
+      <li><p><b>Close the lid.</b> <span class="hint">Leave everything plugged in.</span></p></li>
+    </ol>
+  </div>
 
-<div class="help">
-  <b>No lights?</b><p>Check the USB cable is in the blue box, then restart the MacBook.</p>
+  <div class="block trouble">
+    <h2>Something not working?</h2>
+    <ol>
+      <li><p><b>Restart the whole MacBook:</b> Apple menu  → Restart. <span class="hint">Then follow Start again from step 2.</span></p></li>
+      <li><p><b>Still not working?</b> Take a photo of the screen, write down the steps you tried, and send Fynn a message.</p></li>
+    </ol>
+    <p class="sorry">Sorry for the inconvenience, and thank you.</p>
+  </div>
 </div>
 
 </body>
