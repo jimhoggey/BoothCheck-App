@@ -344,16 +344,16 @@ func showIsOpen(_ showPath: String, docs: [URL], titles: [String]) -> Bool {
     }
 }
 
-enum ShowOpenNext: Equatable { case done, askAgain, notShowing }
+enum ShowOpenNext: Equatable { case done, wait, notShowing }
 
-/// The start-up's next move once Lightkey is running. `isOpen` says whether Lightkey shows the chosen
-/// show, or is nil when Booth Check can't see its windows (no Accessibility). `attempt` counts how
-/// often Lightkey has already been asked again. Ask up to twice; without Accessibility, once, blind.
-func showOpenNext(isOpen: Bool?, attempt: Int) -> ShowOpenNext {
+/// The start-up's next move once Lightkey is running. Lightkey doesn't load the show until someone
+/// clicks Authenticate and types the Mac's password (to free the Open DMX USB), so a show that isn't
+/// open yet is waited for, for up to two minutes. `isOpen` is nil when Booth Check can't see
+/// Lightkey's windows (no Accessibility); then it doesn't guess.
+func showOpenNext(isOpen: Bool?, waited: TimeInterval) -> ShowOpenNext {
     switch isOpen {
-    case true?: return .done
-    case false?: return attempt < 2 ? .askAgain : .notShowing
-    case nil: return attempt == 0 ? .askAgain : .done
+    case true?, nil: return .done
+    case false?: return waited < 120 ? .wait : .notShowing
     }
 }
 
@@ -1494,7 +1494,7 @@ extension Booth {
             }
             // Two different prompts can appear here: Lightkey asking for the Mac's password to take
             // the DMX interface (any Mac), and macOS asking to allow the accessory (Apple silicon only).
-            let hints = [setup.dmx ? "If Lightkey asks for your password to connect to the DMX interface, type it." : nil,
+            let hints = [setup.dmx ? "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : nil,
                          hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil].compactMap { $0 }
             setStep(i, .running, hints.isEmpty ? nil : hints.joined(separator: " "))
             poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
@@ -1526,7 +1526,7 @@ extension Booth {
                 return next()
             }
             // A minute, so a person has time to type the password Lightkey asks for.
-            setStep(i, .running, "If Lightkey asks for your password to connect to the DMX interface, type it.")
+            setStep(i, .running, "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password.")
             poll(every: 2, for: 60, background: true, {
                 // Asked again each time: olad, which holds the interface for Lightkey, can start late.
                 let pids = dmxDriverPIDs(lightkey: pid, psOutput: shell("/bin/ps", ["-axo", "pid=,comm="]).out)
@@ -1588,32 +1588,33 @@ extension Booth {
         }
     }
 
-    /// Lightkey can drop an open request that arrives while it's still starting, then sit on its start
-    /// screen with no show, so nothing drives the DMX interface either (church Mac, 29 Sept 2026). So
-    /// once Lightkey is up, look, and ask it to open the show again if needed: a show that's already
-    /// open just comes to the front. Without Accessibility Booth Check can't see Lightkey's windows,
-    /// so it asks once more anyway.
+    /// Lightkey doesn't load the show until someone clicks Authenticate and types the Mac's password
+    /// (it unloads the Mac's FTDI driver to reach the Open DMX USB), and until then it sits on its
+    /// project screen (church Mac, 29 Sept 2026). So with Accessibility, wait for the show and say what
+    /// to do, so the MIDI and DMX steps don't run ahead. Nothing is re-sent: another open request while
+    /// Lightkey's alert is up could only confuse it. Without Accessibility there's nothing to look at.
     private func confirmShowOpen(_ i: Int, _ showPath: String, doneText: String, then next: @escaping () -> Void) {
-        let url = URL(fileURLWithPath: showPath)
-        func look(_ attempt: Int) {
+        let name = URL(fileURLWithPath: showPath).deletingPathExtension().lastPathComponent
+        let started = Date()
+        func look() {
             var isOpen: Bool?
             if AXIsProcessTrusted() {
                 let pid = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
                 isOpen = pid.map { let (docs, titles) = windowsOf(pid: $0); return showIsOpen(showPath, docs: docs, titles: titles) } ?? false
             }
-            switch showOpenNext(isOpen: isOpen, attempt: attempt) {
+            switch showOpenNext(isOpen: isOpen, waited: Date().timeIntervalSince(started)) {
             case .done:
                 self.setStep(i, .done, doneText)
                 next()
             case .notShowing:
-                self.setStep(i, .warn, "Lightkey is open but not showing \(url.deletingPathExtension().lastPathComponent). Open it from File \u{2192} Open Recent.")
+                self.setStep(i, .warn, "\(name) isn\u{2019}t open after 2 minutes. Click Authenticate if Lightkey asks, or open it from File \u{2192} Open Recent.")
                 next()
-            case .askAgain:
-                NSWorkspace.shared.open(url)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { look(attempt + 1) }
+            case .wait:
+                self.setStep(i, .running, "Waiting for \(name). If Lightkey asks, click Authenticate and type the Mac\u{2019}s password.")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { look() }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { look(0) }
+        look()
     }
 
     /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed.

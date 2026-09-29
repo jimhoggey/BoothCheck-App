@@ -19,9 +19,10 @@ its window once so whoever sits down sees what to fix.
      away. Usually it's found at once and nothing is asked
   2. Open any other apps, such as ProPresenter
   3. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
-     accessory, click Allow"; Intel Macs never ask). Lightkey can drop the request while it's still
-     starting and sit on its start screen, so once it's up Booth Check asks again (an open show just
-     comes to the front) and, with Accessibility allowed, checks the show really opened
+     accessory, click Allow"; Intel Macs never ask). With an Open DMX USB, Lightkey doesn't load the
+     show until someone clicks **Authenticate** and types the Mac's password (it frees the interface
+     from the Mac's own FTDI driver), so with Accessibility allowed this step waits for the show, up to
+     two minutes, and says what to do; the MIDI and DMX steps then don't run ahead
   4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
   6. Switch App Nap off if it's on, then open Stream Deck in the background, so Lightkey stays in
