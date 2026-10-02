@@ -357,6 +357,27 @@ func showOpenNext(isOpen: Bool?, waited: TimeInterval) -> ShowOpenNext {
     }
 }
 
+/// Where the replug sign's animation is; `phase` turns through one loop per 1.0. Returns how far the
+/// plug is out (0 = in, 1 = all the way out) and which step is lit (1 = unplug, 2 = plug back in).
+func replugFrame(_ phase: Double) -> (out: Double, step: Int) {
+    let p = phase - phase.rounded(.down)
+    func ease(_ t: Double) -> Double { t * t * (3 - 2 * t) }
+    switch p {
+    case ..<0.15: return (0, 1)                                 // in, about to come out
+    case ..<0.40: return (ease((p - 0.15) / 0.25), 1)           // sliding out
+    case ..<0.55: return (1, 2)                                 // out
+    case ..<0.80: return (1 - ease((p - 0.55) / 0.25), 2)       // sliding back in
+    default: return (0, 2)                                      // in again
+    }
+}
+
+/// Whether a finished start-up should settle: it ended with warnings (say, a DMX link Booth Check
+/// couldn't confirm while someone was still typing Lightkey's password), but nothing needs fixing now.
+/// The panel then turns green and goes, instead of staying up for good (church Mac, 3 Oct 2026).
+func startUpSettles(finished: Bool, running: Bool, alreadySettled: Bool, problems: Int) -> Bool {
+    finished && !running && !alreadySettled && problems == 0
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -632,6 +653,8 @@ final class Booth: ObservableObject {
     @Published var starting = false
     @Published var bootSteps: [BootStep] = []
     @Published var bootFinished = false
+    /// Set once a finished start-up has turned green late (see `settleStartUp`).
+    private var bootSettled = false
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -1006,6 +1029,21 @@ final class Booth: ObservableObject {
         checks = relevantChecks.filter { !muted.contains($0.id) }
         lastPass = pass.entries
         lastChecked = Date()
+        settleStartUp()
+    }
+
+    /// A start-up can finish with warnings and be fine a minute later, say once Lightkey has the DMX
+    /// interface after the password. The panel used to stay up saying "Started, with warnings" for
+    /// good (church Mac, 3 Oct 2026). So once nothing needs fixing, turn the last step green and let
+    /// the panel go, as an all-green start-up does.
+    private func settleStartUp() {
+        guard startUpSettles(finished: bootFinished, running: starting, alreadySettled: bootSettled, problems: problemCount),
+              BootPanel.shared.isShowing, let last = bootSteps.indices.last, bootSteps[last].id == "check" else { return }
+        bootSettled = true
+        if bootSteps[last].state != .done { setStep(last, .done, "Everything is green now.") }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+            if self.bootFinished && !self.starting { BootPanel.shared.hide() }
+        }
     }
 
     private func showCheck(_ lightkey: NSRunningApplication?, _ pass: Pass) -> Check {
@@ -1401,6 +1439,7 @@ extension Booth {
         guard !starting else { return }
         starting = true
         bootFinished = false
+        bootSettled = false
         bootSteps = plannedSteps(checkOnly: checkOnly)
         BootPanel.shared.show(steps: bootSteps.count)
         runStep(0)
@@ -1417,17 +1456,18 @@ extension Booth {
         }
     }
 
-    /// Re-tests `test` every `interval` seconds until it passes or `timeout` runs out. Shell-based
-    /// tests run off the main thread.
+    /// Re-tests `test` every `interval` seconds until it passes, `timeout` runs out, or `stop` says
+    /// to give up (checked on the main thread). Shell-based tests run off the main thread.
     private func poll(every interval: TimeInterval = 1, for timeout: TimeInterval, background: Bool = false,
-                      _ test: @escaping () -> Bool, done: @escaping (Bool) -> Void) {
+                      _ test: @escaping () -> Bool, stop: @escaping () -> Bool = { false },
+                      done: @escaping (Bool) -> Void) {
         let deadline = Date().addingTimeInterval(timeout)
         func attempt() {
             let evaluate = {
                 let ok = test()
                 DispatchQueue.main.async {
                     if ok { done(true) }
-                    else if Date() > deadline { done(false) }
+                    else if stop() || Date() > deadline { done(false) }
                     else { DispatchQueue.main.asyncAfter(deadline: .now() + interval) { attempt() } }
                 }
             }
@@ -1452,18 +1492,27 @@ extension Booth {
             // back in (church Mac, 29 Sept 2026; other restarts found it at once; cause not known yet).
             // Lightkey isn't open yet, so a replug is safe here and is picked up within a second. Only
             // ask when it's really missing: not in the first 10 seconds, which a slow start-up needs.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            // Then a big sign in the middle of the screen says so (the panel's small text got missed),
+            // and the wait runs to 90 s so someone can get to the cable; it can also be skipped.
+            var skipped = false
+            let ask = DispatchWorkItem {
                 guard i < self.bootSteps.count, self.bootSteps[i].id == "dmxWait",
                       self.bootSteps[i].state == .running else { return }
-                self.setStep(i, .running, "Not found yet: unplug the DMX USB cable and plug it back in.")
+                self.setStep(i, .running, "Not found yet: unplug the DMX box\u{2019}s USB cable and plug it back in.")
+                ReplugOverlay.shared.show { skipped = true }
             }
-            poll(for: 30, background: true, {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: ask)
+            poll(for: 90, background: true, {
                 usbDevices(shell("/usr/sbin/ioreg", ["-p", "IOUSB", "-l", "-w0"]).out).contains(where: isDMXInterface)
-            }) { ok in
+            }, stop: { skipped }, done: { ok in
+                ask.cancel()
+                if ok { ReplugOverlay.shared.found() } else { ReplugOverlay.shared.hide() }
                 self.setStep(i, ok ? .done : .warn,
-                             ok ? "Found on USB." : "Not found in 30 seconds, so Lightkey opens anyway. No lights? Replug the DMX USB cable, then reopen Lightkey.")
+                             ok ? "Found on USB."
+                                : skipped ? "Skipped, so Lightkey opens without it."
+                                : "Not found in 90 seconds, so Lightkey opens anyway. No lights? Replug the DMX USB cable, then reopen Lightkey.")
                 next()
-            }
+            })
 
         case _ where id.hasPrefix("app:"):
             let bundleID = String(id.dropFirst(4))
@@ -2518,9 +2567,11 @@ struct BootView: View {
     var body: some View {
         let allGood = booth.bootSteps.allSatisfy { $0.state == .done }
         let n = booth.problemCount
+        // Green once the steps all are, or once every check is, even if a step warned on the way.
+        let ready = allGood || (n == 0 && booth.unknownCount == 0 && !booth.checks.isEmpty)
         let (symbol, color, title): (String, Color, String) =
             !booth.bootFinished ? ("play.circle.fill", .green, "Starting the show")
-            : allGood ? ("checkmark.seal.fill", .green, "Ready for the service")
+            : ready ? ("checkmark.seal.fill", .green, "Ready for the service")
             : n > 0 ? ("exclamationmark.triangle.fill", .orange, "\(n) thing\(n == 1 ? "" : "s") to fix")
             : ("exclamationmark.triangle.fill", .orange, "Started, with warnings")
         VStack(alignment: .leading, spacing: 12) {
@@ -2577,6 +2628,171 @@ final class BootPanel {
     }
 
     func hide() { panel?.orderOut(nil) }
+
+    var isShowing: Bool { panel?.isVisible ?? false }
+}
+
+/// The replug sign's state: the start-up sets `found` when the DMX box is back.
+final class ReplugModel: ObservableObject {
+    @Published var found = false
+    var skip: (() -> Void)?
+}
+
+/// The big "unplug and replug" card. Volunteers missed the small text in the top-right panel, so
+/// this one is meant to be impossible to miss: large words, the same names as the booth docs (the
+/// blue ENTTEC box), and the plug moving out and back in.
+struct ReplugCard: View {
+    @ObservedObject var model: ReplugModel
+
+    var body: some View {
+        VStack(spacing: 22) {
+            if model.found {
+                Spacer(minLength: 0)
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 110)).foregroundStyle(.green)
+                Text("Found it").font(.system(size: 40, weight: .bold))
+                Text("Carrying on with the start-up.").font(.system(size: 20)).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            } else {
+                Text("Unplug the USB cable from the DMX box, then plug it back in")
+                    .font(.system(size: 34, weight: .bold))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                TimelineView(.animation) { context in
+                    ReplugAnimation(phase: context.date.timeIntervalSinceReferenceDate / 3.2)
+                }
+                .frame(height: 190)
+                Text("The blue ENTTEC box that runs the lights. Booth Check carries on by itself as soon as it sees it again.")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Carry on without it") { model.skip?() }
+                    .controlSize(.large)
+            }
+        }
+        .padding(44)
+        .frame(width: 700, height: 600)
+        .background(RoundedRectangle(cornerRadius: 28).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+    }
+}
+
+/// One frame of a USB plug coming out of the blue DMX box and going back in, with the two steps
+/// lighting up in turn. `phase` turns through one loop per 1.0 (see `replugFrame`).
+struct ReplugAnimation: View {
+    let phase: Double
+
+    var body: some View {
+        let frame = replugFrame(phase)
+        VStack(spacing: 22) {
+            // The plug sits under the box, so its metal tip disappears into the socket when it's in.
+            ZStack(alignment: .leading) {
+                HStack(spacing: 0) {
+                    Rectangle()
+                        .fill(LinearGradient(colors: [Color(white: 0.55), Color(white: 0.92), Color(white: 0.55)],
+                                             startPoint: .top, endPoint: .bottom))
+                        .frame(width: 36, height: 16)
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color(white: 0.96))
+                        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.black.opacity(0.3), lineWidth: 1.5))
+                        .frame(width: 84, height: 44)
+                    Capsule().fill(Color(white: 0.35)).frame(width: 200, height: 14)
+                }
+                .offset(x: 150 - 36 + frame.out * 110)
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(red: 0.13, green: 0.40, blue: 0.85))
+                    .overlay(Text("DMX").font(.system(size: 24, weight: .heavy)).foregroundStyle(.white.opacity(0.92)))
+                    .overlay(alignment: .trailing) {
+                        RoundedRectangle(cornerRadius: 3).fill(Color.black.opacity(0.8))
+                            .frame(width: 10, height: 24).padding(.trailing, 8)
+                    }
+                    .frame(width: 150, height: 112)
+            }
+            .frame(width: 570, height: 120, alignment: .leading)
+            HStack(spacing: 36) {
+                step(1, "Unplug", lit: frame.step == 1)
+                step(2, "Plug back in", lit: frame.step == 2)
+            }
+        }
+    }
+
+    private func step(_ n: Int, _ label: String, lit: Bool) -> some View {
+        HStack(spacing: 10) {
+            Text("\(n)")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(lit ? Color.accentColor : Color.secondary.opacity(0.45)))
+            Text(label)
+                .font(.system(size: 22, weight: lit ? .bold : .regular))
+                .foregroundStyle(lit ? Color.primary : Color.secondary)
+        }
+    }
+}
+
+/// A borderless panel can't become key, so its first click could be spent on the window instead of the
+/// button. This one can; being non-activating, it still doesn't bring Booth Check to the front.
+final class ClickablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+/// The replug sign on screen: the card in the middle of the main screen over a dimmed backdrop, above
+/// everything, full-screen apps included. Neither takes focus, and the backdrop lets clicks through.
+/// The start-up shows it when the DMX box isn't seen and takes it away once it is.
+final class ReplugOverlay {
+    static let shared = ReplugOverlay()
+    private let model = ReplugModel()
+    private var backdrop: NSWindow?
+    private var card: NSPanel?
+
+    func show(onSkip: @escaping () -> Void) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        model.found = false
+        model.skip = onSkip
+        if backdrop == nil {
+            let b = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            b.backgroundColor = NSColor.black.withAlphaComponent(0.45)
+            b.isOpaque = false
+            b.ignoresMouseEvents = true
+            b.level = .floating
+            b.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            b.isReleasedWhenClosed = false
+            backdrop = b
+        }
+        if card == nil {
+            let p = ClickablePanel(contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
+                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.isFloatingPanel = true
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.hidesOnDeactivate = false
+            p.isReleasedWhenClosed = false
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = true
+            let host = NSHostingController(rootView: ReplugCard(model: model))
+            host.sizingOptions = []
+            p.contentViewController = host
+            card = p
+        }
+        backdrop?.setFrame(screen.frame, display: true)
+        backdrop?.orderFrontRegardless()
+        card?.setContentSize(NSSize(width: 700, height: 600))
+        card?.setFrameOrigin(NSPoint(x: screen.frame.midX - 350, y: screen.frame.midY - 300))
+        card?.orderFrontRegardless()
+    }
+
+    /// The box is back: show "Found it" for a moment, then go.
+    func found() {
+        guard card?.isVisible == true else { return }
+        model.found = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.hide() }
+    }
+
+    func hide() {
+        card?.orderOut(nil)
+        backdrop?.orderOut(nil)
+    }
 }
 
 /// The full window, made on demand and kept for reuse. Built in AppKit rather than as a SwiftUI

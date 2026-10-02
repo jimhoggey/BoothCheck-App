@@ -13,10 +13,12 @@ its window once so whoever sits down sees what to fix.
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
   the top right that floats over everything, full-screen Lightkey included, without taking focus:
 
-  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it. If it isn't there
-     after 10 seconds, the step says to unplug the DMX USB cable and plug it back in: an interface
-     left plugged in sometimes only shows up again that way, and the replug is picked up straight
-     away. Usually it's found at once and nothing is asked
+  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it. Usually it's found at
+     once and nothing is asked. If it isn't there after 10 seconds, a **big sign in the middle of the
+     screen** (over a dimmed backdrop) says to unplug the USB cable from the DMX box and plug it back
+     in, with a short animation of exactly that: an interface left plugged in sometimes only shows up
+     again that way. The replug is picked up within a second ("Found it"), the wait runs up to 90
+     seconds so someone can get to the cable, and **Carry on without it** skips it
   2. Open any other apps, such as ProPresenter
   3. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
      accessory, click Allow"; Intel Macs never ask). With an Open DMX USB, Lightkey doesn't load the
@@ -30,8 +32,10 @@ its window once so whoever sits down sees what to fix.
   7. Check everything
 
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
-  the service" and hides itself; if not it stays, with **Open Booth Check**. After that it never pops
-  up during a service; only the icon changes.
+  the service" and hides itself; if not it stays, with **Open Booth Check**. A step that warned on the
+  way (say, the DMX link before the password was in) doesn't keep it up: once nothing needs fixing,
+  the panel turns green and hides too. After that it never pops up during a service; only the icon
+  changes.
 - **Opened by hand**, it shows the window straight away.
 - **Checks every 15 seconds** in the background, window open or not.
 
@@ -208,6 +212,14 @@ Needs the Xcode Command Line Tools on the Mac doing the build, and nowhere else.
 SDK the installed Swift compiler accepts, builds arm64 and x86_64, joins them, draws the icon, signs
 the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS asks for the two
 permissions again.
+
+The unit tests cover the check logic that doesn't need a running Mac (the show match, App Nap, the
+DMX server, the start-up's waits, the replug animation). They build next to a copy of the app in a
+temporary folder and change nothing:
+
+```bash
+bash tests/run.sh
+```
 
 To try the login behaviour without restarting, open it with `--login`:
 
