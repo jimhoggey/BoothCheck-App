@@ -1,5 +1,6 @@
 build/
 .DS_Store
-# Local only: the knowledge graph (rebuilt with /graphify) and the handoff notes, which describe the booth.
+# Local only: the knowledge graph (rebuilt with /graphify), and Claude's notes and the handoff, which describe the booth.
 graphify-out/
 CLAUDE.md
+HANDOFF.md
