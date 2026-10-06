@@ -28,6 +28,13 @@ expect("once Lightkey holds the DMX interface: hands off again", sign(opened: tr
 expect("no DMX box, so no password to ask for: hands off", sign(asks: false, opened: true, linked: false) == .handsOff,
        "\(sign(asks: false, opened: true, linked: false))")
 
+// 2b. What the banner tells people to do in Lightkey: the two things the booth docs have them do there.
+//     With no show chosen in Booth Check, Lightkey opens on its list of projects (the docs' step 4).
+let named = passwordSignText(show: "BackupChurch_modular_v33"), unnamed = passwordSignText(show: nil)
+expect("the banner says to tap Authenticate", named.contains("Authenticate") && unnamed.contains("Authenticate"), named)
+expect("it names the chosen show to click in Lightkey's list", named.contains("click BackupChurch_modular_v33"), named)
+expect("with no show chosen, it says to click the most recent project", unnamed.contains("most recent"), unnamed)
+
 // 3. Ready for the service: every step went fine, or one warned on the way and every check is green now.
 expect("every step done: ready", startUpReady(steps: [.done, .done, .done], problems: 0, unknown: 0, checks: 12))
 expect("a step warned, every check green now: ready", startUpReady(steps: [.done, .warn, .done], problems: 0, unknown: 0, checks: 12))

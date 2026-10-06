@@ -402,6 +402,14 @@ func startSign(replugShowing: Bool, asksPassword: Bool, lightkeyOpened: Bool, dm
     return asksPassword && lightkeyOpened && !dmxLinked ? .password : .handsOff
 }
 
+/// What the password banner tells people to do in Lightkey: the two things the booth docs have them do
+/// there, and nothing else. Lightkey opens on its list of projects when no show is chosen in Booth
+/// Check (the docs' "click the most recent project"), so then it can't name one.
+func passwordSignText(show: String?) -> String {
+    "If it asks for the password, tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password. "
+        + "If it shows its list of projects, click \(show ?? "the most recent one"). Nothing else needs touching."
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -2901,11 +2909,7 @@ struct StartSignCard: View {
             return ("hand.raised.fill", .orange, "Please don\u{2019}t touch the Mac",
                     "Booth Check is getting the lights ready. This sign goes away by itself when it\u{2019}s done.")
         case .password:
-            // The two things the booth docs have volunteers do in Lightkey, and nothing else.
-            let project = model.show.map { " If it shows its list of projects, click \($0)." } ?? ""
-            return ("key.fill", .blue, "Lightkey may need you",
-                    "If it asks for the password, tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password."
-                        + project + " Nothing else needs touching.")
+            return ("key.fill", .blue, "Lightkey may need you", passwordSignText(show: model.show))
         case .ready:
             return ("checkmark.seal.fill", .green, "Ready for the service", "You can use the Mac now.")
         case .needsLook:

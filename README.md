@@ -40,9 +40,9 @@ its window once so whoever sits down sees what to fix.
   While it runs, a **hands-off sign** fills the middle of the screen over a dimmed backdrop: "Please
   don't touch the Mac", with the step it's on, so nobody clicks around in a half-open Lightkey. From
   the moment Lightkey opens until it has the DMX interface, the sign becomes a banner along the bottom
-  with nothing dimmed, saying the one thing to do: if Lightkey asks for the password, click
-  Authenticate and type it. Lightkey's alert and macOS's password box come up in the middle, so the
-  banner stays clear of them. At the end it says "Ready for the service" (or that something needs a
+  with nothing dimmed, saying what Lightkey may need: Authenticate and the Mac's password, or a click
+  on the show if it opens on its list of projects (with no show chosen in Booth Check). Lightkey's
+  alert and macOS's password box come up in the middle, so the banner stays clear of them. At the end it says "Ready for the service" (or that something needs a
   look, and the panel says what) and goes. The replug sign takes its place while that's up. It never
   takes focus or catches a click, and **Open Booth Check** or **Hide** on the panel takes it away for
   the rest of that start-up.
