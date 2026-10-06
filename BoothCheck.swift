@@ -378,6 +378,30 @@ func startUpSettles(finished: Bool, running: Bool, alreadySettled: Bool, problem
     finished && !running && !alreadySettled && problems == 0
 }
 
+/// Whether a start-up counts as ready for the service: every step went fine, or one warned on the way
+/// but every check is green now. The start-up panel's title and the hands-off sign's last word both
+/// go by this, so they agree.
+func startUpReady(steps: [StepState], problems: Int, unknown: Int, checks: Int) -> Bool {
+    steps.allSatisfy { $0 == .done } || (problems == 0 && unknown == 0 && checks > 0)
+}
+
+/// Whether a start-up gets the hands-off sign: only the one that runs by itself at login (the user
+/// asked for it there, 6 Oct 2026), and only if it opens something; a check-only start-up opens nothing.
+func startUpShowsSign(atLogin: Bool, steps: [String]) -> Bool {
+    atLogin && steps.contains { $0 != "check" }
+}
+
+enum StartSign: Equatable { case none, handsOff, password }
+
+/// What the hands-off sign says at this point of the start-up. Nothing while the replug sign has the
+/// screen. From the moment Lightkey opens until Booth Check sees it holding the DMX interface, Lightkey
+/// may be waiting for someone to click Authenticate and type the Mac's password, so then the sign says
+/// what to do in Lightkey (and moves out of the way of Lightkey's alert) instead of "don't touch".
+func startSign(replugShowing: Bool, asksPassword: Bool, lightkeyOpened: Bool, dmxLinked: Bool) -> StartSign {
+    if replugShowing { return .none }
+    return asksPassword && lightkeyOpened && !dmxLinked ? .password : .handsOff
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -655,6 +679,10 @@ final class Booth: ObservableObject {
     @Published var bootFinished = false
     /// Set once a finished start-up has turned green late (see `settleStartUp`).
     private var bootSettled = false
+    /// The hands-off sign for this start-up (see `startSign`): whether it's up at all, and what it knows.
+    private var signOn = false
+    private var signLightkeyOpened = false
+    private var signDMXLinked = false
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -1260,6 +1288,10 @@ extension Booth {
     var problemCount: Int { checks.filter { $0.status == .fail || $0.status == .warn }.count }
     var unknownCount: Int { checks.filter { $0.status == .unknown }.count }
     private var anyFailing: Bool { checks.contains { $0.status == .fail } }
+    /// Whether the start-up counts as ready for the service (see `startUpReady`).
+    var bootReady: Bool {
+        startUpReady(steps: bootSteps.map(\.state), problems: problemCount, unknown: unknownCount, checks: checks.count)
+    }
 
     /// Before the first pass, and when nothing applies (nothing switched on under This Mac, or
     /// everything muted), the window and the menu bar say so the same way rather than show a tick.
@@ -1302,7 +1334,11 @@ extension Booth {
         timers = [checks, updates]
     }
 
-    func showWindow() { MainWindow.shared.show() }
+    /// Someone who opens the window wants the screen, so the hands-off sign gives way.
+    func showWindow() {
+        dismissStartSign()
+        MainWindow.shared.show()
+    }
 
     /// Whether a check belongs to what this Mac is set up for.
     func applies(_ id: String) -> Bool {
@@ -1434,15 +1470,38 @@ extension Booth {
 
     /// Runs the start-up steps in order, shown live in a small panel that floats over everything,
     /// full-screen Lightkey included. Opens apps only; changes no settings. `checkOnly` is the
-    /// login path on a Mac that doesn't start the show: just check, and show the result.
-    func startShow(checkOnly: Bool = false) {
+    /// login path on a Mac that doesn't start the show: just check, and show the result. `atLogin`
+    /// is the start-up that runs by itself at login, which also puts up the hands-off sign.
+    func startShow(checkOnly: Bool = false, atLogin: Bool = false) {
         guard !starting else { return }
         starting = true
         bootFinished = false
         bootSettled = false
         bootSteps = plannedSteps(checkOnly: checkOnly)
+        signOn = startUpShowsSign(atLogin: atLogin, steps: bootSteps.map(\.id))
+        signLightkeyOpened = isRunning(IDs.lightkey)       // reopened by macOS, it may be asking already
+        signDMXLinked = false
+        ReplugOverlay.shared.onHide = { [weak self] in self?.updateSign() }
         BootPanel.shared.show(steps: bootSteps.count)
         runStep(0)
+    }
+
+    /// Keeps the hands-off sign in step with the start-up (see `startSign`). Called when a step starts
+    /// and when the replug sign comes or goes; Lightkey holding the DMX interface counts from the next step.
+    private func updateSign() {
+        guard signOn, starting else { return }
+        let sign = startSign(replugShowing: ReplugOverlay.shared.isShowing, asksPassword: setup.lightkey && setup.dmx,
+                             lightkeyOpened: signLightkeyOpened, dmxLinked: signDMXLinked)
+        let step = bootSteps.firstIndex { $0.state == .running }
+            .map { "Step \($0 + 1) of \(bootSteps.count): \(bootSteps[$0].title)" }
+        StartSignOverlay.shared.show(sign, step: step ?? "", show: showName.map { ($0 as NSString).deletingPathExtension })
+    }
+
+    /// Someone wants the screen (Open Booth Check, or Hide on the start-up panel), so the hands-off sign
+    /// goes for the rest of this start-up. The start-up itself carries on.
+    func dismissStartSign() {
+        signOn = false
+        StartSignOverlay.shared.hide()
     }
 
     private func setStep(_ i: Int, _ state: StepState, _ detail: String? = nil) {
@@ -1485,6 +1544,8 @@ extension Booth {
         let next = { self.runStep(i + 1) }
         setStep(i, .running)
         let id = bootSteps[i].id
+        if id == "lightkey" { signLightkeyOpened = true }
+        updateSign()
 
         switch id {
         case "dmxWait":
@@ -1500,6 +1561,7 @@ extension Booth {
                       self.bootSteps[i].state == .running else { return }
                 self.setStep(i, .running, "Not found yet: unplug the DMX box\u{2019}s USB cable and plug it back in.")
                 ReplugOverlay.shared.show { skipped = true }
+                self.updateSign()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: ask)
             poll(for: 90, background: true, {
@@ -1584,6 +1646,7 @@ extension Booth {
                         $0.hasPrefix("n/dev/") && ($0.contains("usbserial") || $0.contains("usbmodem"))
                     }
             }) { ok in
+                if ok { self.signDMXLinked = true }     // it has the interface, so it's past its password
                 self.setStep(i, ok ? .done : .warn,
                              ok ? "Lightkey has the interface open."
                                 : "Couldn\u{2019}t confirm (this check is experimental). If the lights respond, all is well.")
@@ -1666,10 +1729,12 @@ extension Booth {
         look()
     }
 
-    /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed.
+    /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed. The
+    /// hands-off sign says which it was for a moment, then goes.
     private func finishBoot() {
         starting = false
         bootFinished = true
+        if signOn { StartSignOverlay.shared.finish(ready: bootReady) }
         if bootSteps.allSatisfy({ $0.state == .done }) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
                 if self.bootFinished && !self.starting { BootPanel.shared.hide() }
@@ -2565,13 +2630,10 @@ struct BootView: View {
     @ObservedObject var booth: Booth
 
     var body: some View {
-        let allGood = booth.bootSteps.allSatisfy { $0.state == .done }
         let n = booth.problemCount
-        // Green once the steps all are, or once every check is, even if a step warned on the way.
-        let ready = allGood || (n == 0 && booth.unknownCount == 0 && !booth.checks.isEmpty)
         let (symbol, color, title): (String, Color, String) =
             !booth.bootFinished ? ("play.circle.fill", .green, "Starting the show")
-            : ready ? ("checkmark.seal.fill", .green, "Ready for the service")
+            : booth.bootReady ? ("checkmark.seal.fill", .green, "Ready for the service")
             : n > 0 ? ("exclamationmark.triangle.fill", .orange, "\(n) thing\(n == 1 ? "" : "s") to fix")
             : ("exclamationmark.triangle.fill", .orange, "Started, with warnings")
         VStack(alignment: .leading, spacing: 12) {
@@ -2585,7 +2647,10 @@ struct BootView: View {
             HStack {
                 Button("Open Booth Check") { booth.showWindow() }
                 Spacer()
-                Button("Hide") { BootPanel.shared.hide() }
+                Button("Hide") {
+                    BootPanel.shared.hide()
+                    booth.dismissStartSign()
+                }
             }
             .controlSize(.small)
         }
@@ -2736,6 +2801,35 @@ final class ClickablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// A borderless window over a whole screen that dims what's behind it and lets every click through,
+/// on every Space, full-screen apps included. The big signs sit on one.
+func dimmingBackdrop(level: NSWindow.Level) -> NSWindow {
+    let b = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+    b.backgroundColor = NSColor.black.withAlphaComponent(0.45)
+    b.isOpaque = false
+    b.ignoresMouseEvents = true
+    b.level = level
+    b.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    b.isReleasedWhenClosed = false
+    return b
+}
+
+/// Sets up a borderless, non-activating panel for one of the big signs: above the floating start-up
+/// panel, on every Space (full-screen apps included), clear around the sign's rounded card.
+func setUpSignPanel(_ p: NSPanel, showing content: some View) {
+    p.isFloatingPanel = true
+    p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+    p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    p.hidesOnDeactivate = false
+    p.isReleasedWhenClosed = false
+    p.backgroundColor = .clear
+    p.isOpaque = false
+    p.hasShadow = true
+    let host = NSHostingController(rootView: content)
+    host.sizingOptions = []
+    p.contentViewController = host
+}
+
 /// The replug sign on screen: the card in the middle of the main screen over a dimmed backdrop, above
 /// everything, full-screen apps included. Neither takes focus, and the backdrop lets clicks through.
 /// The start-up shows it when the DMX box isn't seen and takes it away once it is.
@@ -2744,35 +2838,20 @@ final class ReplugOverlay {
     private let model = ReplugModel()
     private var backdrop: NSWindow?
     private var card: NSPanel?
+    /// Called each time the sign goes, so the hands-off sign can come back.
+    var onHide: (() -> Void)?
+
+    var isShowing: Bool { card?.isVisible ?? false }
 
     func show(onSkip: @escaping () -> Void) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         model.found = false
         model.skip = onSkip
-        if backdrop == nil {
-            let b = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-            b.backgroundColor = NSColor.black.withAlphaComponent(0.45)
-            b.isOpaque = false
-            b.ignoresMouseEvents = true
-            b.level = .floating
-            b.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            b.isReleasedWhenClosed = false
-            backdrop = b
-        }
+        if backdrop == nil { backdrop = dimmingBackdrop(level: .floating) }
         if card == nil {
             let p = ClickablePanel(contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            p.isFloatingPanel = true
-            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
-            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            p.hidesOnDeactivate = false
-            p.isReleasedWhenClosed = false
-            p.backgroundColor = .clear
-            p.isOpaque = false
-            p.hasShadow = true
-            let host = NSHostingController(rootView: ReplugCard(model: model))
-            host.sizingOptions = []
-            p.contentViewController = host
+            setUpSignPanel(p, showing: ReplugCard(model: model))
             card = p
         }
         backdrop?.setFrame(screen.frame, display: true)
@@ -2790,6 +2869,176 @@ final class ReplugOverlay {
     }
 
     func hide() {
+        card?.orderOut(nil)
+        backdrop?.orderOut(nil)
+        onHide?()
+    }
+}
+
+/// The hands-off sign's faces: two while the start-up runs (see `startSign`), and how it ended.
+enum SignFace: Equatable { case handsOff, password, ready, needsLook }
+
+/// What the hands-off sign shows. `banner` puts it along the bottom of the screen instead of the middle;
+/// `show` is the show's name, as Lightkey lists it among its projects.
+final class StartSignModel: ObservableObject {
+    @Published var face: SignFace = .handsOff
+    @Published var banner = false
+    @Published var step = ""
+    @Published var show: String?
+}
+
+/// The hands-off sign (the user asked for it, 6 Oct 2026): while Booth Check opens everything at
+/// login, "Please don't touch the Mac" in the middle of the screen, so nobody clicks around in a
+/// half-open Lightkey. While Lightkey may be asking for the Mac's password, a banner along the bottom
+/// says what to do there and nothing more, clear of Lightkey's alert and macOS's password box. At the
+/// end it says how the start-up went, which is also when the Mac is free to use.
+struct StartSignCard: View {
+    @ObservedObject var model: StartSignModel
+
+    private var look: (symbol: String, color: Color, title: String, text: String) {
+        switch model.face {
+        case .handsOff:
+            return ("hand.raised.fill", .orange, "Please don\u{2019}t touch the Mac",
+                    "Booth Check is getting the lights ready. This sign goes away by itself when it\u{2019}s done.")
+        case .password:
+            // The two things the booth docs have volunteers do in Lightkey, and nothing else.
+            let project = model.show.map { " If it shows its list of projects, click \($0)." } ?? ""
+            return ("key.fill", .blue, "Lightkey may need you",
+                    "If it asks for the password, tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password."
+                        + project + " Nothing else needs touching.")
+        case .ready:
+            return ("checkmark.seal.fill", .green, "Ready for the service", "You can use the Mac now.")
+        case .needsLook:
+            return ("exclamationmark.triangle.fill", .orange, "Started, but something needs a look",
+                    "The panel at the top right says what. You can use the Mac now.")
+        }
+    }
+
+    /// Still starting up, as opposed to saying how it went.
+    private var busy: Bool { model.face == .handsOff || model.face == .password }
+
+    var body: some View {
+        let look = self.look
+        Group {
+            if model.banner {
+                HStack(spacing: 22) {
+                    badge(look.symbol, look.color, size: 80)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(look.title).font(.system(size: 30, weight: .bold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(look.text).font(.system(size: 18)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if busy { stepLine(size: 14) }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 30)
+                .frame(width: StartSignOverlay.bannerSize.width, height: StartSignOverlay.bannerSize.height)
+            } else {
+                VStack(spacing: 20) {
+                    Spacer(minLength: 0)
+                    badge(look.symbol, look.color, size: 120)
+                    Text(look.title).font(.system(size: 42, weight: .bold))
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(look.text).font(.system(size: 20)).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if busy { stepLine(size: 17) }
+                    if model.face == .handsOff && hasAccessoryPrompt {
+                        Text("If macOS asks to allow an accessory, click Allow.")
+                            .font(.system(size: 15)).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(44)
+                .frame(width: StartSignOverlay.cardSize.width, height: StartSignOverlay.cardSize.height)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 28).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+    }
+
+    /// The symbol on a coloured disc. While Booth Check is busy, a ring keeps pulsing out of it.
+    private func badge(_ symbol: String, _ color: Color, size: CGFloat) -> some View {
+        ZStack {
+            if busy {
+                TimelineView(.animation) { context in
+                    let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2.2) / 2.2
+                    Circle().stroke(color.opacity(0.55 * (1 - t)), lineWidth: 5)
+                        .frame(width: size, height: size)
+                        .scaleEffect(1 + 0.4 * t)
+                }
+            }
+            Circle().fill(color).frame(width: size, height: size)
+            Image(systemName: symbol).font(.system(size: size * 0.46, weight: .semibold)).foregroundStyle(.white)
+        }
+        .frame(width: size * 1.45, height: size * 1.45)
+    }
+
+    private func stepLine(size: CGFloat) -> some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text(model.step).font(.system(size: size, weight: .medium))
+        }
+    }
+}
+
+/// The hands-off sign on screen (see `startSign`): in the middle over a dimmed backdrop while Booth
+/// Check opens things, or along the bottom with nothing dimmed while Lightkey may be asking for its
+/// password. It never takes focus and lets every click through: it's a sign, not a lock. Its backdrop
+/// sits just under the floating start-up panel, which stays bright.
+final class StartSignOverlay {
+    static let shared = StartSignOverlay()
+    static let cardSize = NSSize(width: 760, height: 500)
+    static let bannerSize = NSSize(width: 900, height: 190)
+    private let model = StartSignModel()
+    private var backdrop: NSWindow?
+    private var card: NSPanel?
+    private var ending: DispatchWorkItem?
+
+    func show(_ sign: StartSign, step: String, show: String?) {
+        guard sign != .none, let screen = NSScreen.main ?? NSScreen.screens.first else { return hide() }
+        ending?.cancel()
+        model.face = sign == .password ? .password : .handsOff
+        model.banner = sign == .password
+        model.step = step
+        model.show = show
+        if backdrop == nil { backdrop = dimmingBackdrop(level: NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue - 1)) }
+        if card == nil {
+            let p = NSPanel(contentRect: NSRect(origin: .zero, size: Self.cardSize),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            setUpSignPanel(p, showing: StartSignCard(model: model))
+            p.ignoresMouseEvents = true
+            card = p
+        }
+        guard let backdrop, let card else { return }
+        if model.banner {
+            // Lightkey's alert and macOS's password box come up in the middle and nearer the top.
+            backdrop.orderOut(nil)
+            card.setContentSize(Self.bannerSize)
+            card.setFrameOrigin(NSPoint(x: screen.frame.midX - Self.bannerSize.width / 2, y: screen.visibleFrame.minY + 40))
+        } else {
+            backdrop.setFrame(screen.frame, display: true)
+            backdrop.orderFrontRegardless()
+            card.setContentSize(Self.cardSize)
+            card.setFrameOrigin(NSPoint(x: screen.frame.midX - Self.cardSize.width / 2,
+                                        y: screen.frame.midY - Self.cardSize.height / 2))
+        }
+        card.orderFrontRegardless()
+    }
+
+    /// The start-up is over: say how it went, where the sign already is, then go.
+    func finish(ready: Bool) {
+        guard card?.isVisible == true else { return }
+        model.face = ready ? .ready : .needsLook
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        ending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (ready ? 3 : 6), execute: work)
+    }
+
+    func hide() {
+        ending?.cancel()
         card?.orderOut(nil)
         backdrop?.orderOut(nil)
     }
@@ -2939,7 +3188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !atLogin {
             booth.showWindow()                       // someone opened it on purpose
         } else if booth.autoStart, booth.canStartShow {
-            booth.startShow()
+            booth.startShow(atLogin: true)
         } else {
             // Give the other login items time to open before judging.
             DispatchQueue.main.asyncAfter(deadline: .now() + 20) { booth.startShow(checkOnly: true) }

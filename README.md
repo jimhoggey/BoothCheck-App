@@ -36,6 +36,16 @@ its window once so whoever sits down sees what to fix.
   way (say, the DMX link before the password was in) doesn't keep it up: once nothing needs fixing,
   the panel turns green and hides too. After that it never pops up during a service; only the icon
   changes.
+
+  While it runs, a **hands-off sign** fills the middle of the screen over a dimmed backdrop: "Please
+  don't touch the Mac", with the step it's on, so nobody clicks around in a half-open Lightkey. From
+  the moment Lightkey opens until it has the DMX interface, the sign becomes a banner along the bottom
+  with nothing dimmed, saying the one thing to do: if Lightkey asks for the password, click
+  Authenticate and type it. Lightkey's alert and macOS's password box come up in the middle, so the
+  banner stays clear of them. At the end it says "Ready for the service" (or that something needs a
+  look, and the panel says what) and goes. The replug sign takes its place while that's up. It never
+  takes focus or catches a click, and **Open Booth Check** or **Hide** on the panel takes it away for
+  the rest of that start-up.
 - **Opened by hand**, it shows the window straight away.
 - **Checks every 15 seconds** in the background, window open or not.
 
@@ -134,7 +144,8 @@ could fix anything there, and whether the Mac stays awake is what the Power & sl
 
 The green button, in the window header and the menu bar dropdown, runs the same numbered start-up
 by hand, in the same floating panel: anything already open is left alone (the show is just brought to
-the front). It only opens apps; it changes no settings. Each step is kept in the Log.
+the front). It only opens apps; it changes no settings. Each step is kept in the Log. The hands-off
+sign is only for the start-up at login: whoever clicks the button is already at the Mac.
 
 ## Nothing runs behind your back
 
@@ -214,8 +225,8 @@ the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS as
 permissions again.
 
 The unit tests cover the check logic that doesn't need a running Mac (the show match, App Nap, the
-DMX server, the start-up's waits, the replug animation). They build next to a copy of the app in a
-temporary folder and change nothing:
+DMX server, the start-up's waits, the replug animation, the hands-off sign). They build next to a
+copy of the app in a temporary folder and change nothing:
 
 ```bash
 bash tests/run.sh
