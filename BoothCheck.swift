@@ -30,6 +30,9 @@ enum IDs {
     static let autoStartKey = "startShowAtLogin"
     static let setupKey = "macSetup"
     static let mutedKey = "mutedChecks"
+    static let autoShutdownKey = "shutDownByItself"
+    static let shutdownDaysKey = "shutDownDays"
+    static let shutdownMinuteKey = "shutDownMinute"
 }
 
 /// Any other app a production Mac needs open, such as ProPresenter. Booth Check checks it's running
@@ -410,6 +413,52 @@ func passwordSignText(show: String?) -> String {
         + "If it shows its list of projects, click \(show ?? "the most recent one"). Nothing else needs touching."
 }
 
+// MARK: - Shutting the booth down (pure parts)
+
+/// When the booth next shuts down by itself: the first of `days` (Calendar weekdays, 1 = Sunday) at
+/// `minute` minutes after midnight that's after `now`. Nil with no days.
+func nextShutdown(after now: Date, days: Set<Int>, minute: Int, calendar: Calendar = .current) -> Date? {
+    let today = calendar.startOfDay(for: now)
+    for offset in 0...7 {
+        guard let day = calendar.date(byAdding: .day, value: offset, to: today),
+              days.contains(calendar.component(.weekday, from: day)),
+              let time = calendar.date(bySettingHour: minute / 60, minute: minute % 60, second: 0, of: day),
+              time > now else { continue }
+        return time
+    }
+    return nil
+}
+
+enum ShutdownDue: Equatable { case notYet, now, missed }
+
+/// Whether a shutdown set for `at` is due. Only within `grace` of the time: a Mac that was off or
+/// asleep then mustn't shut down the moment it comes back, say for an evening event.
+func shutdownDue(now: Date, at: Date, grace: TimeInterval = 30 * 60) -> ShutdownDue {
+    now < at ? .notYet : now < at.addingTimeInterval(grace) ? .now : .missed
+}
+
+enum QuitNext: Equatable { case done, wait, ask, giveUp }
+
+/// While an app closes for the shutdown: done once it's gone; after 5 seconds it may be asking
+/// something (Lightkey, about saving the show); after 2 minutes, give up and leave the Mac on.
+func quitNext(running: Bool, waited: TimeInterval) -> QuitNext {
+    if !running { return .done }
+    return waited < 5 ? .wait : waited < 120 ? .ask : .giveUp
+}
+
+/// The shutdown warning's countdown: "4:59".
+func countdownText(_ seconds: Int) -> String {
+    "\(seconds / 60):" + String(format: "%02d", seconds % 60)
+}
+
+/// The days the booth shuts down by itself, in words: "Sundays and Wednesdays".
+func shutdownDaysText(_ days: Set<Int>) -> String {
+    if days.count == 7 { return "every day" }
+    let names = ["Sundays", "Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays"]
+    let list = days.sorted().filter { (1...7).contains($0) }.map { names[$0 - 1] }
+    return list.count < 2 ? list.joined() : list.dropLast().joined(separator: ", ") + " and " + list.last!
+}
+
 // MARK: - Login items (System Events)
 
 struct LoginItem: Identifiable {
@@ -720,6 +769,33 @@ final class Booth: ObservableObject {
             refresh()
         }
     }
+
+    /// Shut the booth down by itself at a set time each week, after a 5-minute warning (see
+    /// `shutDownBooth`). Off until someone sets it up in This Mac.
+    @Published var autoShutdown: Bool = UserDefaults.standard.bool(forKey: IDs.autoShutdownKey) {
+        didSet {
+            UserDefaults.standard.set(autoShutdown, forKey: IDs.autoShutdownKey)
+            armShutdown()
+        }
+    }
+    /// The days (Calendar weekdays, 1 = Sunday) and the time (minutes after midnight). Sundays at 1 pm to start with.
+    @Published var shutdownDays: Set<Int> = Set(UserDefaults.standard.array(forKey: IDs.shutdownDaysKey) as? [Int] ?? [1]) {
+        didSet {
+            UserDefaults.standard.set(shutdownDays.sorted(), forKey: IDs.shutdownDaysKey)
+            armShutdown()
+        }
+    }
+    @Published var shutdownMinute: Int = UserDefaults.standard.object(forKey: IDs.shutdownMinuteKey) as? Int ?? 13 * 60 {
+        didSet {
+            UserDefaults.standard.set(shutdownMinute, forKey: IDs.shutdownMinuteKey)
+            armShutdown()
+        }
+    }
+    /// When the set time next comes round (see `armShutdown`), and whether a shutdown is under way.
+    @Published var shutdownAt: Date?
+    @Published var shuttingDown = false
+    private var countdownTimer: Timer?
+    private var closingApps = false
 
     private var busy = false
     /// When Booth Check switched App Nap off, this session. Apps read the setting when they open.
@@ -1333,6 +1409,7 @@ extension Booth {
     func start() {
         guard timers.isEmpty else { return }
         refresh()
+        armShutdown()
         checkForUpdates(userInitiated: false)
         let checks = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.tick() }
         let updates = Timer(timeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
@@ -1453,6 +1530,7 @@ extension Booth {
     /// Called by the 15-second timer. Holds off while a change is waiting for approval.
     func tick() {
         if pending == nil { refresh() }
+        checkShutdownTime()
     }
 
     /// The start-up order, as numbered steps. The same list is shown in This Mac before anyone
@@ -1502,14 +1580,15 @@ extension Booth {
                              lightkeyOpened: signLightkeyOpened, dmxLinked: signDMXLinked)
         let step = bootSteps.firstIndex { $0.state == .running }
             .map { "Step \($0 + 1) of \(bootSteps.count): \(bootSteps[$0].title)" }
-        StartSignOverlay.shared.show(sign, step: step ?? "", show: showName.map { ($0 as NSString).deletingPathExtension })
+        SignOverlay.shared.show(sign, step: step ?? "", show: showName.map { ($0 as NSString).deletingPathExtension })
     }
 
     /// Someone wants the screen (Open Booth Check, or Hide on the start-up panel), so the hands-off sign
     /// goes for the rest of this start-up. The start-up itself carries on.
     func dismissStartSign() {
+        guard signOn else { return }        // the shutdown's countdown uses the same sign
         signOn = false
-        StartSignOverlay.shared.hide()
+        SignOverlay.shared.hide()
     }
 
     private func setStep(_ i: Int, _ state: StepState, _ detail: String? = nil) {
@@ -1742,12 +1821,137 @@ extension Booth {
     private func finishBoot() {
         starting = false
         bootFinished = true
-        if signOn { StartSignOverlay.shared.finish(ready: bootReady) }
+        if signOn { SignOverlay.shared.finish(ready: bootReady) }
+        signOn = false
         if bootSteps.allSatisfy({ $0.state == .done }) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
                 if self.bootFinished && !self.starting { BootPanel.shared.hide() }
             }
         }
+    }
+}
+
+// MARK: - Shutting the booth down
+
+extension Booth {
+    /// Sets when the timed shutdown next warns: the next set time after `now`, or never when it's off.
+    func armShutdown(after now: Date = Date()) {
+        shutdownAt = autoShutdown ? nextShutdown(after: now, days: shutdownDays, minute: shutdownMinute) : nil
+    }
+
+    /// With the 15-second checks: when the set time comes, the warning goes up. Not while the start-up
+    /// runs (it waits until that's done), and not if the Mac was off or asleep at the time.
+    func checkShutdownTime() {
+        guard let at = shutdownAt, !shuttingDown, !starting else { return }
+        switch shutdownDue(now: Date(), at: at) {
+        case .notYet: break
+        case .missed: armShutdown()
+        case .now:
+            armShutdown()
+            shutDownBooth(warning: 5 * 60, timed: true)
+        }
+    }
+
+    /// Shuts the booth down (the user asked for it, 6 Oct 2026): first a warning with Not yet (10
+    /// seconds from the menu, 5 minutes at the set time), then Stream Deck closes, then Lightkey, which
+    /// may ask about saving the show, then macOS shuts down. Closing the apps first also keeps macOS
+    /// from reopening them at the next login, where they'd race the start-up. Every step is logged.
+    func shutDownBooth(warning: Int, timed: Bool = false) {
+        guard !shuttingDown, !starting else { return }
+        shuttingDown = true
+        logShutdown(timed ? "the set time came" : "someone clicked Shut down the booth",
+                    "A \(countdownText(warning)) warning, with Not yet.", status: nil)
+        var left = warning
+        SignOverlay.shared.countdown(left, notYet: { [weak self] in
+            guard let self, !self.closingApps else { return }
+            self.countdownTimer?.invalidate()
+            self.shuttingDown = false
+            SignOverlay.shared.hide()
+            // At the set time, ask again in half an hour, so a Mac that's forgotten still goes off.
+            if timed { self.shutdownAt = Date().addingTimeInterval(30 * 60) }
+            self.logShutdown("Not yet", timed ? "Asking again in 30 minutes." : "Nothing closed.", status: nil)
+        }, now: { [weak self] in self?.closeAppsAndShutDown() })
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            left -= 1
+            SignOverlay.shared.tick(max(left, 0))
+            if left <= 0 { self?.closeAppsAndShutDown() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        countdownTimer = timer
+    }
+
+    private func closeAppsAndShutDown() {
+        guard shuttingDown, !closingApps else { return }
+        closingApps = true
+        countdownTimer?.invalidate()
+        SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Stream Deck\u{2026}")
+        close(IDs.streamDeck, name: "Stream Deck", canForce: true) { _ in
+            SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Lightkey\u{2026}")
+            self.close(IDs.lightkey, name: "Lightkey", canForce: false) { closed in
+                guard closed else {
+                    return self.stayOn("Lightkey didn\u{2019}t close, so Booth Check stopped there. Shut down from the Apple menu when you\u{2019}re ready.")
+                }
+                SignOverlay.shared.present(.shuttingDown, banner: false, step: "Shutting down the Mac\u{2026}")
+                let script = "tell application \"System Events\" to shut down"
+                let r = runAppleScript(script)
+                self.changes.insert(LogEntry(title: "Shut down: asked macOS to shut down", language: "AppleScript", code: script,
+                                             output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+                guard r.code == 0 else {
+                    return self.stayOn("macOS didn\u{2019}t let Booth Check shut it down (\(r.out)). Shut down from the Apple menu.")
+                }
+                // Booth Check quits with everything else. Still here after a minute: another app said no.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+                    if self.shuttingDown {
+                        self.stayOn("macOS didn\u{2019}t finish shutting down: another app may be asking something. Shut down from the Apple menu.")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Asks an app to close and waits for it (see `quitNext`). Stream Deck has nothing to save, so if
+    /// it hangs it's made to quit. Lightkey may be asking about saving the show: that's left to
+    /// whoever is there, with the sign moved down out of its way.
+    private func close(_ bundleID: String, name: String, canForce: Bool, then done: @escaping (Bool) -> Void) {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        guard !apps.isEmpty else {
+            logShutdown("close \(name)", "It wasn\u{2019}t open.", status: nil)
+            return done(true)
+        }
+        apps.forEach { $0.terminate() }
+        let started = Date()
+        var asked = false
+        func look() {
+            switch quitNext(running: apps.contains { !$0.isTerminated }, waited: Date().timeIntervalSince(started)) {
+            case .done:
+                logShutdown("close \(name)", asked && canForce ? "It didn\u{2019}t close when asked, so it was made to quit." : "Closed.", status: 0)
+                done(true)
+            case .wait:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
+            case .ask:
+                if !asked {
+                    asked = true
+                    if canForce { apps.forEach { $0.forceTerminate() } }
+                    else { SignOverlay.shared.present(.lightkeyOpen, banner: true, step: "Closing \(name)\u{2026}") }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
+            case .giveUp:
+                logShutdown("close \(name)", "Still open after 2 minutes.", status: 1)
+                done(false)
+            }
+        }
+        look()
+    }
+
+    private func stayOn(_ note: String) {
+        closingApps = false
+        shuttingDown = false
+        SignOverlay.shared.stayedOn(note)
+        logShutdown("the Mac stays on", note, status: 1)
+    }
+
+    private func logShutdown(_ what: String, _ output: String, status: Int32?) {
+        changes.insert(LogEntry(title: "Shut down: \(what)", language: "Shut down", code: what, output: output, status: status), at: 0)
     }
 }
 
@@ -2075,6 +2279,10 @@ struct SetupSheet: View {
                                 .padding(.leading, indent)
                                 .padding(.bottom, 10)
                         }
+                        Divider().padding(.leading, indent)
+                        SettingRow(symbol: "power", tint: .indigo, title: "Shut down by itself",
+                                   detail: shutdownDetail, isOn: $booth.autoShutdown)
+                        if booth.autoShutdown { shutdownOptions }
                         let others = booth.loginItems.filter { !$0.name.localizedCaseInsensitiveContains("Booth Check") }
                         if !others.isEmpty {
                             Divider().padding(.leading, indent)
@@ -2132,6 +2340,50 @@ struct SetupSheet: View {
             .toggleStyle(.checkbox)
         }
         .padding(.leading, indent)
+    }
+
+    private var shutdownDetail: String {
+        guard booth.autoShutdown else {
+            return "Off: the booth shuts down when someone clicks Shut down the booth in Booth Check\u{2019}s menu."
+        }
+        guard !booth.shutdownDays.isEmpty else { return "Pick the days it shuts down by itself, below." }
+        let days = shutdownDaysText(booth.shutdownDays)
+        let time = Calendar.current.date(bySettingHour: booth.shutdownMinute / 60, minute: booth.shutdownMinute % 60,
+                                         second: 0, of: Date())?.formatted(date: .omitted, time: .shortened) ?? ""
+        return days.prefix(1).uppercased() + days.dropFirst()
+            + " at \(time), if nobody has: a 5-minute warning with Not yet, then Stream Deck and Lightkey close and the Mac shuts down."
+    }
+
+    /// The days and the time the booth shuts down by itself, and when that next is.
+    private var shutdownOptions: some View {
+        let calendar = Calendar.current
+        let time = Binding<Date>(
+            get: { calendar.date(bySettingHour: booth.shutdownMinute / 60, minute: booth.shutdownMinute % 60, second: 0, of: Date()) ?? Date() },
+            set: { booth.shutdownMinute = calendar.component(.hour, from: $0) * 60 + calendar.component(.minute, from: $0) })
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 4) {
+                ForEach(1...7, id: \.self) { day in
+                    Toggle(calendar.shortWeekdaySymbols[day - 1], isOn: Binding(
+                        get: { booth.shutdownDays.contains(day) },
+                        set: { on in
+                            if on { booth.shutdownDays.insert(day) } else { booth.shutdownDays.remove(day) }
+                        }))
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                }
+                DatePicker("at", selection: time, displayedComponents: .hourAndMinute)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .padding(.leading, 6)
+            }
+            // The next time it'll warn: usually the set time, or half an hour after a Not yet.
+            let next = booth.shutdownAt ?? nextShutdown(after: Date(), days: booth.shutdownDays, minute: booth.shutdownMinute)
+            Text(next.map { "Next: \($0.formatted(.dateTime.weekday(.wide).day().month(.wide).hour().minute()))" }
+                 ?? "Pick at least one day.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+        .padding(.leading, indent)
+        .padding(.bottom, 10)
     }
 
     private func group<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
@@ -2883,25 +3135,33 @@ final class ReplugOverlay {
     }
 }
 
-/// The hands-off sign's faces: two while the start-up runs (see `startSign`), and how it ended.
-enum SignFace: Equatable { case handsOff, password, ready, needsLook }
+/// The big sign's faces. While the start-up runs (see `startSign`): hands off, or what Lightkey may
+/// need; then how it ended. While the booth shuts down (see `shutDownBooth`): the countdown with Not
+/// yet, shutting down, Lightkey still open (it may be asking about saving), or the Mac stays on.
+enum SignFace: Equatable { case handsOff, password, ready, needsLook, countdown, shuttingDown, lightkeyOpen, stayedOn }
 
-/// What the hands-off sign shows. `banner` puts it along the bottom of the screen instead of the middle;
-/// `show` is the show's name, as Lightkey lists it among its projects.
-final class StartSignModel: ObservableObject {
+/// What the big sign shows. `banner` puts it along the bottom of the screen instead of the middle;
+/// `show` is the show's name, as Lightkey lists it among its projects; `seconds`, `notYet` and `now`
+/// belong to the shutdown's countdown; `note` says why the Mac stayed on.
+final class SignModel: ObservableObject {
     @Published var face: SignFace = .handsOff
     @Published var banner = false
     @Published var step = ""
     @Published var show: String?
+    @Published var seconds = 0
+    @Published var note = ""
+    var notYet: (() -> Void)?
+    var now: (() -> Void)?
 }
 
-/// The hands-off sign (the user asked for it, 6 Oct 2026): while Booth Check opens everything at
-/// login, "Please don't touch the Mac" in the middle of the screen, so nobody clicks around in a
-/// half-open Lightkey. While Lightkey may be asking for the Mac's password, a banner along the bottom
-/// says what to do there and nothing more, clear of Lightkey's alert and macOS's password box. At the
-/// end it says how the start-up went, which is also when the Mac is free to use.
-struct StartSignCard: View {
-    @ObservedObject var model: StartSignModel
+/// The big sign. At login, the hands-off sign (the user asked for it, 6 Oct 2026): while Booth Check
+/// opens everything, "Please don't touch the Mac" in the middle of the screen, so nobody clicks around
+/// in a half-open Lightkey. While Lightkey may be asking for the Mac's password, a banner along the
+/// bottom says what to do there and nothing more, clear of Lightkey's alert and macOS's password box.
+/// At the end it says how the start-up went, which is also when the Mac is free to use. The same sign
+/// counts down to a shutdown and stays up while the booth shuts down.
+struct SignCard: View {
+    @ObservedObject var model: SignModel
 
     private var look: (symbol: String, color: Color, title: String, text: String) {
         switch model.face {
@@ -2915,11 +3175,24 @@ struct StartSignCard: View {
         case .needsLook:
             return ("exclamationmark.triangle.fill", .orange, "Started, but something needs a look",
                     "The panel at the top right says what. You can use the Mac now.")
+        case .countdown:
+            return ("power", .red, "The booth shuts down in \(countdownText(model.seconds))",
+                    "Stream Deck and Lightkey close, then the Mac shuts down. Leave everything plugged in.")
+        case .shuttingDown:
+            return ("power", .indigo, "Shutting the booth down",
+                    "Please don\u{2019}t touch the Mac. Stream Deck and Lightkey close, then the Mac shuts down.")
+        case .lightkeyOpen:
+            return ("questionmark.circle.fill", .blue, "Lightkey hasn\u{2019}t closed yet",
+                    "If it asks about saving the show, choose Save or Don\u{2019}t Save. Then the Mac shuts down.")
+        case .stayedOn:
+            return ("exclamationmark.triangle.fill", .orange, "The Mac stays on", model.note)
         }
     }
 
-    /// Still starting up, as opposed to saying how it went.
-    private var busy: Bool { model.face == .handsOff || model.face == .password }
+    /// Booth Check is at work, as opposed to saying how something went: the ring keeps pulsing.
+    private var busy: Bool { [.handsOff, .password, .countdown, .shuttingDown, .lightkeyOpen].contains(model.face) }
+    /// The step it's on, with a spinner. The countdown has its buttons instead.
+    private var showsStep: Bool { busy && model.face != .countdown }
 
     var body: some View {
         let look = self.look
@@ -2932,31 +3205,40 @@ struct StartSignCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                         Text(look.text).font(.system(size: 18)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        if busy { stepLine(size: 14) }
+                        if showsStep { stepLine(size: 14) }
                     }
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 30)
-                .frame(width: StartSignOverlay.bannerSize.width, height: StartSignOverlay.bannerSize.height)
+                .frame(width: SignOverlay.bannerSize.width, height: SignOverlay.bannerSize.height)
             } else {
                 VStack(spacing: 20) {
                     Spacer(minLength: 0)
                     badge(look.symbol, look.color, size: 120)
-                    Text(look.title).font(.system(size: 42, weight: .bold))
+                    Text(look.title).font(.system(size: 42, weight: .bold).monospacedDigit())
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(look.text).font(.system(size: 20)).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
-                    if busy { stepLine(size: 17) }
+                    if showsStep { stepLine(size: 17) }
                     if model.face == .handsOff && hasAccessoryPrompt {
                         Text("If macOS asks to allow an accessory, click Allow.")
                             .font(.system(size: 15)).foregroundStyle(.secondary)
                     }
+                    if model.face == .countdown {
+                        HStack(spacing: 14) {
+                            Button("Not yet") { model.notYet?() }
+                            Button("Shut down now") { model.now?() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                        }
+                        .controlSize(.large)
+                    }
                     Spacer(minLength: 0)
                 }
                 .padding(44)
-                .frame(width: StartSignOverlay.cardSize.width, height: StartSignOverlay.cardSize.height)
+                .frame(width: SignOverlay.cardSize.width, height: SignOverlay.cardSize.height)
             }
         }
         .background(RoundedRectangle(cornerRadius: 28).fill(Color(nsColor: .windowBackgroundColor)))
@@ -2988,37 +3270,55 @@ struct StartSignCard: View {
     }
 }
 
-/// The hands-off sign on screen (see `startSign`): in the middle over a dimmed backdrop while Booth
-/// Check opens things, or along the bottom with nothing dimmed while Lightkey may be asking for its
-/// password. It never takes focus and lets every click through: it's a sign, not a lock. Its backdrop
-/// sits just under the floating start-up panel, which stays bright.
-final class StartSignOverlay {
-    static let shared = StartSignOverlay()
+/// The big sign on screen: in the middle over a dimmed backdrop, or along the bottom with nothing
+/// dimmed while Lightkey may be asking something (its password, or whether to save the show), so its
+/// alert stays clear. It never takes focus and lets every click through, except on the countdown's
+/// buttons: it's a sign, not a lock. Its backdrop sits just under the floating start-up panel, which
+/// stays bright.
+final class SignOverlay {
+    static let shared = SignOverlay()
     static let cardSize = NSSize(width: 760, height: 500)
     static let bannerSize = NSSize(width: 900, height: 190)
-    private let model = StartSignModel()
+    private let model = SignModel()
     private var backdrop: NSWindow?
     private var card: NSPanel?
     private var ending: DispatchWorkItem?
 
+    /// The start-up's sign (see `startSign`).
     func show(_ sign: StartSign, step: String, show: String?) {
-        guard sign != .none, let screen = NSScreen.main ?? NSScreen.screens.first else { return hide() }
-        ending?.cancel()
-        model.face = sign == .password ? .password : .handsOff
-        model.banner = sign == .password
-        model.step = step
+        guard sign != .none else { return hide() }
         model.show = show
+        present(sign == .password ? .password : .handsOff, banner: sign == .password, step: step)
+    }
+
+    /// The shutdown's warning: counts down from `seconds`, with Not yet and Shut down now.
+    func countdown(_ seconds: Int, notYet: @escaping () -> Void, now: @escaping () -> Void) {
+        model.notYet = notYet
+        model.now = now
+        model.seconds = seconds
+        present(.countdown, banner: false, step: "")
+    }
+
+    func tick(_ seconds: Int) { model.seconds = seconds }
+
+    /// Puts a face up, in the middle of the screen over the dimmed backdrop or as a banner along the bottom.
+    func present(_ face: SignFace, banner: Bool, step: String) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        ending?.cancel()
+        model.face = face
+        model.banner = banner
+        model.step = step
         if backdrop == nil { backdrop = dimmingBackdrop(level: NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue - 1)) }
         if card == nil {
-            let p = NSPanel(contentRect: NSRect(origin: .zero, size: Self.cardSize),
-                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            setUpSignPanel(p, showing: StartSignCard(model: model))
-            p.ignoresMouseEvents = true
+            let p = ClickablePanel(contentRect: NSRect(origin: .zero, size: Self.cardSize),
+                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            setUpSignPanel(p, showing: SignCard(model: model))
             card = p
         }
         guard let backdrop, let card else { return }
-        if model.banner {
-            // Lightkey's alert and macOS's password box come up in the middle and nearer the top.
+        card.ignoresMouseEvents = face != .countdown        // only the countdown has buttons
+        if banner {
+            // Lightkey's alerts and macOS's password box come up in the middle and nearer the top.
             backdrop.orderOut(nil)
             card.setContentSize(Self.bannerSize)
             card.setFrameOrigin(NSPoint(x: screen.frame.midX - Self.bannerSize.width / 2, y: screen.visibleFrame.minY + 40))
@@ -3035,10 +3335,22 @@ final class StartSignOverlay {
     /// The start-up is over: say how it went, where the sign already is, then go.
     func finish(ready: Bool) {
         guard card?.isVisible == true else { return }
-        model.face = ready ? .ready : .needsLook
+        end(ready ? .ready : .needsLook, after: ready ? 3 : 6)
+    }
+
+    /// The shutdown stopped: say why, then go.
+    func stayedOn(_ note: String) {
+        model.note = note
+        present(.stayedOn, banner: false, step: "")
+        end(.stayedOn, after: 12)
+    }
+
+    private func end(_ face: SignFace, after seconds: TimeInterval) {
+        model.face = face
+        card?.ignoresMouseEvents = true
         let work = DispatchWorkItem { [weak self] in self?.hide() }
         ending = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (ready ? 3 : 6), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
     func hide() {
@@ -3152,6 +3464,13 @@ struct MenuPanel: View {
                 .controlSize(.large)
                 .disabled(booth.starting)
             }
+            // The end of the service: a 10-second countdown with Not yet, then everything closes.
+            Button { booth.shutDownBooth(warning: 10) } label: {
+                Label(booth.shuttingDown ? "Shutting down\u{2026}" : "Shut down the booth", systemImage: "power")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            .disabled(booth.shuttingDown || booth.starting)
             HStack {
                 Button("Open Booth Check") { booth.showWindow() }
                 Button("Check again") { booth.refresh() }

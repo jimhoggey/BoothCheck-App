@@ -8,8 +8,8 @@ its window once so whoever sits down sees what to fix.
 
 - **Lives in the menu bar.** No Dock icon, not in Cmd-Tab, never takes focus from Lightkey. The icon's
   shape shows the state: a tick when everything's fine, a triangle or cross with a count when
-  something needs attention. Click it to see just the problems, **Get the show started**, and
-  **Open Booth Check** for the full window.
+  something needs attention. Click it to see just the problems, **Get the show started**, **Shut
+  down the booth**, and **Open Booth Check** for the full window.
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
   the top right that floats over everything, full-screen Lightkey included, without taking focus:
 
@@ -64,6 +64,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
+| **Shut down by itself** | at the days and time set under it (Sundays at 1 pm to start with), shuts the booth down if nobody has: see [Shut down the booth](#shut-down-the-booth). Off until switched on |
 
 So a ProPresenter Mac is: ProPresenter on, Lightkey and Stream Deck off, stays on, start at login.
 Booth Check keeps it awake, opens ProPresenter at startup, and checks it's running.
@@ -147,6 +148,28 @@ by hand, in the same floating panel: anything already open is left alone (the sh
 the front). It only opens apps; it changes no settings. Each step is kept in the Log. The hands-off
 sign is only for the start-up at login: whoever clicks the button is already at the Mac.
 
+## Shut down the booth
+
+**Shut down the booth**, in the menu bar dropdown, ends the service in one click:
+
+1. A **10-second countdown** comes up in the middle of the screen, with **Not yet** (stops it) and
+   **Shut down now**.
+2. Behind a "Shutting the booth down" sign, **Stream Deck closes**. It has nothing to save, so if
+   it hangs it's made to quit after 5 seconds.
+3. **Lightkey closes.** If it asks about saving the show, the sign moves to the bottom of the screen
+   and waits for an answer. It never answers for you. If Lightkey is still open after 2 minutes,
+   Booth Check stops there and the Mac stays on.
+4. **macOS shuts down** (`tell application "System Events" to shut down`). Any other app can still
+   say no, and then the Mac stays on and the sign says so.
+
+Closing Stream Deck and Lightkey first also keeps macOS from reopening them at the next login, where
+they'd race the start-up. Every step is kept in the Log.
+
+**Shut down by itself** (in This Mac) is the backstop for when nobody remembers. At the set time it
+gives a **5-minute** countdown, then does the same. **Not yet** asks again in half an hour. It only
+goes off within half an hour of the set time, so a Mac that was off or asleep then doesn't shut down
+the moment it comes back, and it waits for a running start-up to finish.
+
 ## Nothing runs behind your back
 
 - **Checks only read.** Every command a check runs is listed in the **Log** (⌘L) with its output.
@@ -185,6 +208,19 @@ It needs nothing installed. It's one universal app for Apple silicon and Intel, 
      Lightkey has open. Turn Booth Check on in the list, then quit and reopen Booth Check.
 6. Under **Start at login**, click **Add to login…** on "Booth Check opens at login", and remove any
    show or Stream Deck entries it points out.
+7. Work down Booth Check's list until everything is a tick. Then the settings it can't read:
+   - On Apple silicon, Privacy & Security → Allow accessories to connect → **Always** (Intel Macs
+     don't have it).
+   - Lock Screen → screen saver and "Require password…" → **Never**.
+   - Control Centre → Focus → **Do Not Disturb** on.
+   - The Stream Deck app's own **Launch at login**, off: Booth Check opens it once Lightkey is ready,
+     and starting on its own it can beat Lightkey and the keys stay dead.
+8. Look after the battery. Always on the charger, an Intel MacBook's battery can swell: turn on
+   battery health management (Battery → ⓘ next to Battery Health), and replace it if the case bulges.
+9. Install macOS updates between services, never just before one. The password at start-up is
+   FileVault unlocking the disk; keep it on.
+10. Print `docs/Lighting_SOP.pdf` for the booth: one page for volunteers with starting, finishing and
+    what to do when something's wrong.
 
 To quit it, click the menu bar icon → Quit. To bring the window back, click the icon → Open Booth
 Check, or open Booth Check again from Applications.
@@ -225,8 +261,8 @@ the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS as
 permissions again.
 
 The unit tests cover the check logic that doesn't need a running Mac (the show match, App Nap, the
-DMX server, the start-up's waits, the replug animation, the hands-off sign). They build next to a
-copy of the app in a temporary folder and change nothing:
+DMX server, the start-up's waits, the replug animation, the hands-off sign, the shutdown's timing).
+They build next to a copy of the app in a temporary folder and change nothing:
 
 ```bash
 bash tests/run.sh

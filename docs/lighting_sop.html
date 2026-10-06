@@ -2,12 +2,12 @@
 <html lang="en-GB">
 <head>
 <meta charset="utf-8">
-<title>Lighting SOP</title>
+<title>Church Lighting</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
-  @page { size: A4; margin: 14mm 16mm; }
+  @page { size: A4; margin: 12mm 13mm; }
 
   :root {
     --ink: #16181d;
@@ -18,7 +18,9 @@
     --stop: #3d4450;
     --stop-soft: #f2f3f5;
     --amber: #a86400;
-    --code: #eef1f5;
+    --amber-rule: #ecd3a0;
+    --red: #b02c24;
+    --red-soft: #fcebe9;
     --display: "IBM Plex Sans Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
     --body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
     --mono: "IBM Plex Mono", Menlo, Consolas, monospace;
@@ -26,79 +28,103 @@
 
   * { box-sizing: border-box; }
   html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  body { margin: 0; background: #fff; color: var(--ink); font: 13pt/1.35 var(--body); }
+  body { margin: 0; background: #fff; color: var(--ink); font: 10.5pt/1.35 var(--body); }
   h1, h2 { font-family: var(--display); margin: 0; }
   p { margin: 0; }
   b { font-weight: 600; }
 
-  h1 { font-size: 34pt; line-height: 1; letter-spacing: -0.01em; }
-  .sub { color: var(--muted); font-size: 12pt; margin-top: 2mm; }
+  h1 { font-size: 30pt; line-height: 1; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 10.5pt; margin-top: 1.6mm; }
 
-  .plugged { margin-top: 7mm; padding: 3.5mm 5mm; border: 0.4mm dashed var(--rule); border-radius: 2mm;
-             color: var(--muted); font-size: 11.5pt; }
+  .plugged { margin-top: 4mm; padding: 2.4mm 4mm; border: 0.4mm dashed var(--rule); border-radius: 2mm;
+             color: var(--muted); font-size: 10pt; }
   .plugged b { color: var(--ink); }
 
-  .block { margin-top: 6mm; border-radius: 3mm; padding: 5mm 6mm 6mm; }
-  .pair { display: grid; grid-template-columns: 1fr 1.25fr; gap: 5mm; align-items: stretch; }
-  .pair .block { margin-top: 6mm; }
-  .block.start { background: var(--go-soft); border: 0.5mm solid #a7d3b5; }
-  .block.finish { background: var(--stop-soft); border: 0.5mm solid #cfd3da; }
-  .block h2 { font-size: 22pt; margin-bottom: 4mm; }
-  .start h2 { color: var(--go); }
+  /* two columns: what to do on the left, what to do when it goes wrong on the right */
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 4.5mm; margin-top: 4.5mm; align-items: start; }
+  .col { display: grid; gap: 4.5mm; }
 
-  ol { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 3.6mm; }
-  li { counter-increment: s; display: grid; grid-template-columns: 11mm 1fr; align-items: baseline; }
-  li::before { content: counter(s); font: 700 22pt/1 var(--display); color: var(--amber); }
+  .block { border-radius: 3mm; padding: 3.6mm 4.5mm 4.2mm; }
+  .block h2 { font-size: 17pt; margin-bottom: 2.4mm; }
+  .block.start { background: var(--go-soft); border: 0.5mm solid #a7d3b5; }
+  .start h2 { color: var(--go); }
+  .block.finish { background: var(--stop-soft); border: 0.5mm solid #cfd3da; }
+
+  ol { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 2.3mm; }
+  li { counter-increment: s; display: grid; grid-template-columns: 7.5mm 1fr; align-items: baseline; }
+  li::before { content: counter(s); font: 700 16pt/1 var(--display); color: var(--amber); }
   .finish li::before { color: var(--stop); }
-  li .hint { display: block; color: var(--muted); font-size: 11pt; margin-top: 0.6mm; }
-  .file { font-family: var(--mono); font-size: 11pt; background: #fff; border: 0.3mm solid var(--rule);
-          padding: 0.3mm 1.6mm; border-radius: 1mm; white-space: nowrap; }
+  .hint { display: block; color: var(--muted); font-size: 9.4pt; margin-top: 0.5mm; }
+  .file { font-family: var(--mono); font-size: 9pt; background: #fff; border: 0.3mm solid var(--rule);
+          padding: 0.1mm 1.2mm; border-radius: 1mm; white-space: nowrap; }
 
   li.done::before { content: "✓"; color: var(--go); }
-  li.done { font-weight: 600; font-size: 15pt; color: var(--go); counter-increment: none; }
+  li.done { font-weight: 600; font-size: 12pt; color: var(--go); counter-increment: none; }
 
-  .block.trouble { background: #fff8ea; border: 0.5mm solid #ecd3a0; }
+  .block.trouble { background: #fff8ea; border: 0.5mm solid var(--amber-rule); }
   .trouble h2 { color: var(--amber); }
-  .sorry { margin-top: 4mm; color: var(--muted); font-size: 11pt; }
+  .row { padding: 1.5mm 0; border-top: 0.3mm solid var(--amber-rule); font-size: 9.6pt; }
+  .row .sym { font-weight: 600; font-size: 10pt; }
+
+  .block.stop { background: var(--red-soft); border: 0.5mm solid var(--red); }
+  .stop h2 { color: var(--red); }
+  .stop .hint { margin-top: 1.4mm; }
+
+  footer { margin-top: 3.5mm; color: var(--muted); font-size: 8.8pt; }
 </style>
 </head>
 <body>
 
 <h1>Church lighting</h1>
-<p class="sub">Lightkey and Booth Check on the MacBook. Shut the MacBook down after every use.</p>
+<p class="sub">Lightkey and Booth Check on the MacBook: how to start, how to finish, and what to do if something’s wrong.</p>
 
 <p class="plugged"><b>Leave everything plugged in:</b> the charger, and the USB cable from the MacBook to the blue ENTTEC Open DMX box.</p>
 
-<div class="block start">
-  <h2>Start</h2>
-  <ol>
-    <li><p><b>Open the MacBook and press the power button.</b></p></li>
-    <li><p><b>Type the password.</b> <span class="hint">It’s written on the MacBook.</span></p></li>
-    <li><p><b>Wait. Don’t click anything yet.</b> <span class="hint">A big sign says not to touch the Mac while Booth Check finds the DMX box and opens Lightkey by itself. If it says to unplug and replug, it means the USB cable in the blue box: pull it out and plug it back in.</span></p></li>
-    <li><p><b>In Lightkey, click the most recent project:</b> <span class="file">BackupChurch_modular</span></p></li>
-    <li><p><b>Tap Authenticate on the Touch Bar, and type the password again.</b></p></li>
-    <li class="done"><p>The lights are working.</p></li>
-  </ol>
-</div>
+<div class="cols">
+  <div class="col">
+    <div class="block start">
+      <h2>Start</h2>
+      <ol>
+        <li><p><b>Open the MacBook and press the power button.</b></p></li>
+        <li><p><b>Type the password.</b> <span class="hint">It’s written on the MacBook.</span></p></li>
+        <li><p><b>Wait, and don’t touch anything.</b> <span class="hint">A big sign says so while Booth Check finds the DMX box and opens Lightkey. If it says to unplug and replug, it means the USB cable in the blue box: pull it out and plug it back in.</span></p></li>
+        <li><p><b>Tap Authenticate on the Touch Bar, and type the password again.</b> <span class="hint">The sign moves to the bottom of the screen when it’s time. If Lightkey shows its list of projects instead, click the newest <span class="file">BackupChurch_modular</span>.</span></p></li>
+        <li><p><b>Test: press House 10% on the Stream Deck, then press it again.</b> <span class="hint">The lights come up, then go off.</span></p></li>
+        <li class="done"><p>Ready for the service.</p></li>
+      </ol>
+    </div>
 
-<div class="pair">
-  <div class="block finish">
-    <h2>Finish</h2>
-    <ol>
-      <li><p><b>Apple menu  →<br>Shut&nbsp;Down.</b></p></li>
-      <li><p><b>Close the lid.</b> <span class="hint">Leave everything plugged in.</span></p></li>
-    </ol>
+    <div class="block finish">
+      <h2>Finish</h2>
+      <ol>
+        <li><p><b>Click the Booth Check icon at the top right of the screen, then Shut down the booth.</b> <span class="hint">Can’t see it? Move the pointer to the very top of the screen. A 10-second countdown comes first (Not yet stops it). If Lightkey asks about saving, click Don’t Save.</span></p></li>
+        <li><p><b>Close the lid.</b> <span class="hint">Leave everything plugged in.</span></p></li>
+      </ol>
+    </div>
   </div>
 
-  <div class="block trouble">
-    <h2>Something not working?</h2>
-    <ol>
-      <li><p><b>Restart the whole MacBook:</b> Apple menu  → Restart. <span class="hint">Then follow Start again from step 2.</span></p></li>
-      <li><p><b>Still not working?</b> Take a photo of the screen, write down the steps you tried, and send Fynn a message.</p></li>
-    </ol>
-    <p class="sorry">Sorry for the inconvenience, and thank you.</p>
+  <div class="col">
+    <div class="block trouble">
+      <h2>Something not working?</h2>
+      <div class="row"><p class="sym">The Booth Check icon (top right) shows a triangle or a cross</p><p>Click it. Each item says what to do.</p></div>
+      <div class="row"><p class="sym">Stream Deck keys do nothing, then all fire at once</p><p><b>Stop pressing:</b> the Mac had put the Stream Deck app to sleep. Click the Stream Deck app once.</p></div>
+      <div class="row"><p class="sym">A key is lit but its cue isn’t on, or the other way round</p><p>Press any key on the page you’re looking at. Lightkey’s own panel is always right.</p></div>
+      <div class="row"><p class="sym">The Stream Deck does nothing at all</p><p>Pick the newest “Lightkey … Service Panel” profile. Still nothing: quit and reopen the Stream Deck app.</p></div>
+      <div class="row"><p class="sym">Cues change in Lightkey, but no lights come on</p><p>Reseat the DMX USB cable at both ends, then quit and reopen Lightkey.</p></div>
+      <div class="row"><p class="sym">Old cues, wrong looks or missing buttons</p><p>File → Open Recent → the newest <span class="file">BackupChurch_modular</span>.</p></div>
+      <div class="row"><p class="sym">The screen is black, or the Mac went to sleep</p><p>Plug the charger in, then press a key.</p></div>
+      <div class="row"><p class="sym">Anything else</p><p><b>Restart the MacBook</b> (Apple menu → Restart) and follow Start from step 2. Still stuck? Take a photo of the screen, write down what you tried, and send Fynn a message.</p></div>
+    </div>
+
+    <div class="block stop">
+      <h2>If the lights run away</h2>
+      <p><b>Unplug the Stream Deck’s USB cable</b> and don’t press anything else. If one press changes lots of cues, or Lightkey freezes, this stops it at once.</p>
+      <p class="hint">Run the rest of the service from Lightkey’s own panel with the mouse, and send Fynn a message afterwards.</p>
+    </div>
   </div>
 </div>
+
+<footer>Sorry for the inconvenience, and thank you. Updated 6 October 2026. If these steps stop matching the screen, send Fynn a message.</footer>
 
 </body>
 </html>
