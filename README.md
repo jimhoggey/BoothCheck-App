@@ -181,7 +181,10 @@ the moment it comes back, and it waits for a running start-up to finish.
 - **No admin password.** Anything that would need it, such as switching sleep off, opens the right
   page of System Settings instead and says which setting to change.
 
-Other buttons only open things: the show, the Stream Deck app, or a page of System Settings.
+Other buttons only open things: the show, the Stream Deck app, or a page of System Settings. The one
+exception is **Shut down the booth**, which closes Stream Deck and Lightkey and shuts the Mac down
+once its countdown runs out (**Not yet** stops it). Its timed version only runs if it's switched on
+in This Mac. Both keep every step in the Log.
 
 ## Putting it on the booth Mac
 
