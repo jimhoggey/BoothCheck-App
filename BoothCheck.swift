@@ -472,6 +472,17 @@ func shouldOpenStreamDeck(enabled: Bool, installed: Bool, running: Bool, busy: B
     enabled && installed && !running && !busy && (!needsLightkey || lightkeyReady) && sinceLast >= 60
 }
 
+/// Whether to restart a running Stream Deck so its keys start clean. A latch key (a colour, a house
+/// level) lights when Lightkey says a cue is on but ignores "off", so a key left lit stays lit after
+/// Lightkey restarts (church Mac, 9 Oct 2026: Lavender lit, Lightkey fresh). A freshly started
+/// Stream Deck has every key dark: it saves no key state (checked on the dev Mac). So: when the
+/// start-up reaches Stream Deck and it's already running, and when Lightkey starts outside a start-up.
+func shouldRestartStreamDeck(enabled: Bool, deckRunning: Bool, startUpDeckStep: Bool,
+                             lightkeyJustLaunched: Bool, busy: Bool) -> Bool {
+    guard enabled && deckRunning else { return false }
+    return startUpDeckStep || (lightkeyJustLaunched && !busy)
+}
+
 /// Whether a start-up gets the hands-off sign: only the one that runs by itself at login (the user
 /// asked for it there, 6 Oct 2026), and only if it opens something; a check-only start-up opens nothing.
 func startUpShowsSign(atLogin: Bool, steps: [String]) -> Bool {
@@ -870,8 +881,10 @@ final class Booth: ObservableObject {
     /// Times this start-up brought Lightkey to the front, and when last (see `shouldFrontLightkey`).
     private var frontAttempts = 0
     private var lastFront: Date?
-    /// When Booth Check last opened Stream Deck (see `keepStreamDeckOpen`).
+    /// When Booth Check last opened Stream Deck (see `keepStreamDeckOpen`), and its watch for Lightkey
+    /// starting outside a start-up (see `watchLightkeyLaunches`).
     private var lastDeckOpen: Date?
+    private var lightkeyLaunchWatch: NSObjectProtocol?
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
@@ -1585,6 +1598,7 @@ extension Booth {
         refresh()
         armShutdown()
         watchPower()
+        watchLightkeyLaunches()
         checkForUpdates(userInitiated: false)
         let checks = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.tick() }
         let updates = Timer(timeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
@@ -1947,16 +1961,25 @@ extension Booth {
             }
 
         case "deck":
-            let result = openStreamDeckInBackground(during: "Start-up")
-            setStep(i, result.state, result.detail)
-            // When the show comes next, give the plugin a few seconds to connect to Lightkey first, so
-            // it's listening when Lightkey sends every cue's state as the show opens.
-            let showNext = bootSteps.indices.contains(i + 1) && bootSteps[i + 1].id == "lightkey"
-            if result.opened && showNext {
-                setStep(i, result.state, result.detail + " Giving it a few seconds to connect before the show opens.")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { next() }
+            let finish: ((state: StepState, detail: String, opened: Bool)) -> Void = { result in
+                self.setStep(i, result.state, result.detail)
+                // When the show comes next, give the plugin a few seconds to connect to Lightkey first,
+                // so it's listening when Lightkey sends every cue's state as the show opens.
+                let showNext = self.bootSteps.indices.contains(i + 1) && self.bootSteps[i + 1].id == "lightkey"
+                if result.opened && showNext {
+                    self.setStep(i, result.state, result.detail + " Giving it a few seconds to connect before the show opens.")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { next() }
+                } else {
+                    next()
+                }
+            }
+            // Already open (say, left running from before): restart it, so no key stays lit from then.
+            if shouldRestartStreamDeck(enabled: true, deckRunning: isRunning(IDs.streamDeck), startUpDeckStep: true,
+                                       lightkeyJustLaunched: false, busy: false) {
+                setStep(i, .running, "Restarting it so every key starts clean\u{2026}")
+                restartStreamDeck(during: "Start-up", then: finish)
             } else {
-                next()
+                finish(openStreamDeckInBackground(during: "Start-up"))
             }
 
         default:        // "check"
@@ -2043,6 +2066,49 @@ extension Booth {
                                 output: napSwitched ? "App Nap was switched off first." : "App Nap is off.", status: 0), at: 0)
         return (.done, napSwitched ? "Switched App Nap off, then opened it in the background, so it keeps running there."
                                    : "Opened in the background. App Nap is off, so it keeps running there.", true)
+    }
+
+    /// Quits Stream Deck (made to quit after 5 seconds if it hangs: it has nothing to save), then opens
+    /// it again in the background, so every key starts dark (see `shouldRestartStreamDeck`). Logged.
+    func restartStreamDeck(during what: String, then done: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck)
+        apps.forEach { _ = $0.terminate() }
+        let started = Date()
+        func look() {
+            let waited = Date().timeIntervalSince(started)
+            if apps.allSatisfy(\.isTerminated) && !isRunning(IDs.streamDeck) {
+                changes.insert(LogEntry(title: "\(what): restarted Stream Deck so its keys start clean", language: "macOS API",
+                                        code: "NSRunningApplication.terminate (Stream Deck), then open it again",
+                                        output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off. A freshly opened Stream Deck has every key dark.",
+                                        status: 0), at: 0)
+                let result = openStreamDeckInBackground(during: what)
+                return done((result.state, "Restarted it so every key starts clean. " + result.detail, result.opened))
+            }
+            if waited > 5 { apps.forEach { _ = $0.forceTerminate() } }
+            if waited > 15 { return done((.warn, "Couldn\u{2019}t restart it, so keys may still be lit from before. Quit and reopen Stream Deck.", false)) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { look() }
+        }
+        look()
+    }
+
+    /// Lightkey started outside a start-up (by hand, or after a crash) while Stream Deck is open: once
+    /// Lightkey's MIDI input is there, restart Stream Deck so no key stays lit from before.
+    func watchLightkeyLaunches() {
+        guard lightkeyLaunchWatch == nil else { return }
+        lightkeyLaunchWatch = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == IDs.lightkey,
+                  shouldRestartStreamDeck(enabled: self.setup.streamDeck, deckRunning: self.isRunning(IDs.streamDeck),
+                                          startUpDeckStep: false, lightkeyJustLaunched: true,
+                                          busy: self.starting || self.shuttingDown) else { return }
+            self.poll(every: 1, for: 30, {
+                MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }
+            }) { _ in
+                guard !self.starting, !self.shuttingDown, self.isRunning(IDs.streamDeck) else { return }
+                self.restartStreamDeck(during: "Lightkey started") { _ in }
+            }
+        }
     }
 
     /// With the 15-second checks, and when Stream Deck is switched on in This Mac: if it's switched on

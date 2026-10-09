@@ -37,5 +37,19 @@ expect("no Lightkey on this Mac: open it anyway", open(lightkeyMac: false, ready
 expect("opened 20 seconds ago: not again yet", !open(since: 20))
 expect("a minute later: again", open(since: 70))
 
+// 3. 1.23: restarting Stream Deck so its keys start clean. A latch key ignores Lightkey's "off", so a
+//    colour left lit stays lit after Lightkey restarts (church Mac, 9 Oct 2026: Lavender). A freshly
+//    started Stream Deck has every key dark (it saves no key state; checked on the dev Mac).
+func restart(on: Bool = true, running: Bool = true, deckStep: Bool = false, lightkeyLaunched: Bool = false, busy: Bool = false) -> Bool {
+    shouldRestartStreamDeck(enabled: on, deckRunning: running, startUpDeckStep: deckStep,
+                            lightkeyJustLaunched: lightkeyLaunched, busy: busy)
+}
+expect("start-up reaches Stream Deck, already running: restart it", restart(deckStep: true))
+expect("start-up, Stream Deck not running: just open it", !restart(running: false, deckStep: true))
+expect("Lightkey started by hand while Stream Deck runs: restart it", restart(lightkeyLaunched: true))
+expect("Lightkey started by the start-up itself: the start-up handles it", !restart(lightkeyLaunched: true, busy: true))
+expect("Stream Deck switched off here: leave it", !restart(on: false, lightkeyLaunched: true))
+expect("nothing happened: leave it", !restart())
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

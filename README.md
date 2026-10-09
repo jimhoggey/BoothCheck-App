@@ -44,6 +44,14 @@ its window once so whoever sits down sees what to fix.
   waits until Lightkey's MIDI input is there, it tries at most once a minute, and never while a
   start-up or shutdown is opening or closing apps.
 
+  **Stream Deck's keys start clean.** A latch key (a colour, a house level) lights when Lightkey says
+  its cue is on but ignores "off", so a key left lit stays lit after Lightkey restarts (Lavender lit
+  on the church Mac, 9 Oct 2026). A freshly opened Stream Deck has every key dark: it saves no key
+  state. So when the start-up finds Stream Deck already open it restarts it, and when Lightkey is
+  started any other way (by hand, after a crash) Booth Check restarts Stream Deck once Lightkey is
+  ready (tested: 3 seconds after Lightkey reopened). Quitting Stream Deck yourself does the same:
+  Booth Check reopens it clean.
+
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
   the service" and hides itself; if not it stays, with **Open Booth Check**. A step that warned on the
   way (say, the DMX link before the password was in) doesn't keep it up: once nothing needs fixing,
