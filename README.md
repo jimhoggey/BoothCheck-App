@@ -68,6 +68,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
 | **Shut down by itself** | at the days and time set under it (Sundays at 1 pm to start with), shuts the booth down if nobody has: see [Shut down the booth](#shut-down-the-booth). Off until switched on |
+| **Shut down when the power goes off** | MacBooks only: when the charger loses power, shuts the booth down after a 1-minute warning (see [Shut down the booth](#shut-down-the-booth)). Off until switched on |
 
 So a ProPresenter Mac is: ProPresenter on, Lightkey and Stream Deck off, stays on, start at login.
 Booth Check keeps it awake, opens ProPresenter at startup, and checks it's running.
@@ -172,6 +173,13 @@ they'd race the start-up. Every step is kept in the Log.
 gives a **5-minute** countdown, then does the same. **Not yet** asks again in half an hour. It only
 goes off within half an hour of the set time, so a Mac that was off or asleep then doesn't shut down
 the moment it comes back, and it waits for a running start-up to finish.
+
+**Shut down when the power goes off** (in This Mac, MacBooks only) does the same when the charger
+loses power while Booth Check is running: a **1-minute** countdown, which stops by itself if the power
+comes back (a bumped plug), or with **Not yet** (then it doesn't ask again until the power comes back
+and goes off once more). A Mac started on battery on purpose is left alone. Together with **Starts up
+when the charger is plugged in**, one switched socket or smart plug turns the whole booth on and off.
+macOS has no setting for this on a MacBook's own battery; its power-cut shutdown is only for a UPS.
 
 ## Nothing runs behind your back
 

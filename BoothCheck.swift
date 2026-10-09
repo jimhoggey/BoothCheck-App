@@ -15,6 +15,7 @@ import AppKit
 import ApplicationServices
 import CoreMIDI
 import CryptoKit
+import IOKit.ps
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -33,6 +34,7 @@ enum IDs {
     static let autoShutdownKey = "shutDownByItself"
     static let shutdownDaysKey = "shutDownDays"
     static let shutdownMinuteKey = "shutDownMinute"
+    static let powerOffKey = "shutDownWhenPowerGoesOff"
 }
 
 /// Any other app a production Mac needs open, such as ProPresenter. Booth Check checks it's running
@@ -332,6 +334,22 @@ func windowsOf(pid: pid_t) -> (docs: [URL], titles: [String]) {
     return (docs, titles)
 }
 
+/// Whether the Mac is running on the charger (or has no battery), read straight from macOS.
+func onACPower() -> Bool {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return true }
+    return (type as String) != "Battery Power"
+}
+
+/// Whether the Mac has a battery of its own: a MacBook.
+func macHasBattery() -> Bool {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return false }
+    return sources.contains { source in
+        (IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any])?["Type"] as? String == "InternalBattery"
+    }
+}
+
 /// Whether an app is showing a button titled Authenticate: Lightkey's alert before it takes the DMX
 /// interface (Accessibility). Only dialogs and sheets are searched, not the show's own big window.
 func asksToAuthenticate(pid: pid_t) -> Bool {
@@ -492,6 +510,38 @@ func quitNext(running: Bool, waited: TimeInterval) -> QuitNext {
 /// The shutdown warning's countdown: "4:59".
 func countdownText(_ seconds: Int) -> String {
     "\(seconds / 60):" + String(format: "%02d", seconds % 60)
+}
+
+/// What started a shutdown: the menu button, the set time each week, or the power going off.
+enum ShutdownReason: Equatable { case button, timed, powerOff }
+
+/// Seconds of warning, with Not yet, before the booth shuts down.
+func shutdownWarning(_ reason: ShutdownReason) -> Int {
+    switch reason {
+    case .button: return 10
+    case .timed: return 5 * 60
+    case .powerOff: return 60
+    }
+}
+
+/// The countdown's words: why the booth is shutting down, and what happens.
+func shutdownWhy(_ reason: ShutdownReason) -> String {
+    switch reason {
+    case .button: return "Stream Deck and Lightkey close, then the Mac shuts down. Leave everything plugged in."
+    case .timed: return "It\u{2019}s the set time. Stream Deck and Lightkey close, then the Mac shuts down."
+    case .powerOff: return "The power went off. Stream Deck and Lightkey close, then the Mac shuts down. Plug it back in to stop this."
+    }
+}
+
+enum PowerNext: Equatable { case nothing, warn, powerBack }
+
+/// What to do about the charger's power (the user asked for it, 9 Oct 2026: power off at the wall
+/// shuts the booth down, as power on starts it). `outage` means the power went off while Booth Check
+/// was running: a Mac started on battery on purpose is left alone. One warning per power cut, and
+/// none while a start-up or another shutdown is under way (it comes once that's done).
+func powerNext(enabled: Bool, onAC: Bool, outage: Bool, handled: Bool, busy: Bool) -> PowerNext {
+    if onAC { return .powerBack }
+    return enabled && outage && !handled && !busy ? .warn : .nothing
 }
 
 /// The days the booth shuts down by itself, in words: "Sundays and Wednesdays".
@@ -837,11 +887,23 @@ final class Booth: ObservableObject {
             armShutdown()
         }
     }
+    /// Shut the booth down when the charger's power goes off, after a 1-minute warning (see
+    /// `powerNext`). Off unless switched on in This Mac.
+    @Published var shutdownOnPowerOff: Bool = UserDefaults.standard.bool(forKey: IDs.powerOffKey) {
+        didSet { UserDefaults.standard.set(shutdownOnPowerOff, forKey: IDs.powerOffKey) }
+    }
     /// When the set time next comes round (see `armShutdown`), and whether a shutdown is under way.
     @Published var shutdownAt: Date?
     @Published var shuttingDown = false
+    private var shutdownReason: ShutdownReason = .button
     private var countdownTimer: Timer?
     private var closingApps = false
+    /// The power, as last read; whether it went off while Booth Check was running; and whether that
+    /// power cut has had its warning.
+    private var powerWasAC = true
+    private var powerOutage = false
+    private var powerOutageWarned = false
+    private var powerWatch: CFRunLoopSource?
 
     private var busy = false
     /// When Booth Check switched App Nap off, this session. Apps read the setting when they open.
@@ -1456,6 +1518,7 @@ extension Booth {
         guard timers.isEmpty else { return }
         refresh()
         armShutdown()
+        watchPower()
         checkForUpdates(userInitiated: false)
         let checks = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.tick() }
         let updates = Timer(timeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
@@ -1577,6 +1640,7 @@ extension Booth {
     func tick() {
         if pending == nil { refresh() }
         checkShutdownTime()
+        checkPower()
     }
 
     /// The start-up order, as numbered steps. The same list is shown in This Mac before anyone
@@ -1924,28 +1988,73 @@ extension Booth {
         case .missed: armShutdown()
         case .now:
             armShutdown()
-            shutDownBooth(warning: 5 * 60, timed: true)
+            shutDownBooth(.timed)
+        }
+    }
+
+    /// Hears the moment the power source changes; the 15-second checks back it up.
+    func watchPower() {
+        powerWasAC = onACPower()
+        guard powerWatch == nil,
+              let source = IOPSNotificationCreateRunLoopSource({ _ in
+                  DispatchQueue.main.async { Booth.shared.checkPower() }
+              }, nil)?.takeRetainedValue() else { return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        powerWatch = source
+    }
+
+    /// The power changed, or the 15-second checks came round: if the charger's power went off while
+    /// Booth Check was running, warn and shut down (see `powerNext`); if it comes back during that
+    /// warning, stop.
+    func checkPower() {
+        let onAC = onACPower()
+        if powerWasAC && !onAC {
+            powerOutage = true
+            logShutdown("the power went off", shutdownOnPowerOff
+                        ? "Running on battery." : "Running on battery. Shut down when the power goes off is off, so nothing happens.",
+                        status: nil)
+        }
+        powerWasAC = onAC
+        switch powerNext(enabled: shutdownOnPowerOff, onAC: onAC, outage: powerOutage, handled: powerOutageWarned,
+                         busy: starting || shuttingDown) {
+        case .nothing: break
+        case .warn:
+            powerOutageWarned = true
+            shutDownBooth(.powerOff)
+        case .powerBack:
+            if powerOutage, shuttingDown, shutdownReason == .powerOff, !closingApps {
+                stopCountdown()
+                SignOverlay.shared.stayedOn("The power came back.")
+                logShutdown("stopped", "The power came back, so the Mac stays on.", status: nil)
+            }
+            powerOutage = false
+            powerOutageWarned = false
         }
     }
 
     /// Shuts the booth down (the user asked for it, 6 Oct 2026): first a warning with Not yet (10
-    /// seconds from the menu, 5 minutes at the set time), then Stream Deck closes, then Lightkey, which
-    /// may ask about saving the show, then macOS shuts down. Closing the apps first also keeps macOS
-    /// from reopening them at the next login, where they'd race the start-up. Every step is logged.
-    func shutDownBooth(warning: Int, timed: Bool = false) {
+    /// seconds from the menu, 5 minutes at the set time, 1 minute when the power goes off), then Stream
+    /// Deck closes, then Lightkey, which may ask about saving the show, then macOS shuts down. Closing
+    /// the apps first also keeps macOS from reopening them at the next login, where they'd race the
+    /// start-up. Every step is logged.
+    func shutDownBooth(_ reason: ShutdownReason) {
         guard !shuttingDown, !starting else { return }
         shuttingDown = true
-        logShutdown(timed ? "the set time came" : "someone clicked Shut down the booth",
+        shutdownReason = reason
+        let warning = shutdownWarning(reason)
+        logShutdown(reason == .button ? "someone clicked Shut down the booth" : reason == .timed ? "the set time came" : "the power is off",
                     "A \(countdownText(warning)) warning, with Not yet.", status: nil)
         var left = warning
-        SignOverlay.shared.countdown(left, notYet: { [weak self] in
+        SignOverlay.shared.countdown(left, why: shutdownWhy(reason), notYet: { [weak self] in
             guard let self, !self.closingApps else { return }
-            self.countdownTimer?.invalidate()
-            self.shuttingDown = false
+            self.stopCountdown()
             SignOverlay.shared.hide()
             // At the set time, ask again in half an hour, so a Mac that's forgotten still goes off.
-            if timed { self.shutdownAt = Date().addingTimeInterval(30 * 60) }
-            self.logShutdown("Not yet", timed ? "Asking again in 30 minutes." : "Nothing closed.", status: nil)
+            // After a power cut, not again until the power comes back and goes off once more.
+            if reason == .timed { self.shutdownAt = Date().addingTimeInterval(30 * 60) }
+            self.logShutdown("Not yet", reason == .timed ? "Asking again in 30 minutes."
+                             : reason == .powerOff ? "Not asking again until the power comes back and goes off again."
+                             : "Nothing closed.", status: nil)
         }, now: { [weak self] in self?.closeAppsAndShutDown() })
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             left -= 1
@@ -1954,6 +2063,11 @@ extension Booth {
         }
         RunLoop.main.add(timer, forMode: .common)
         countdownTimer = timer
+    }
+
+    private func stopCountdown() {
+        countdownTimer?.invalidate()
+        shuttingDown = false
     }
 
     private func closeAppsAndShutDown() {
@@ -2359,6 +2473,15 @@ struct SetupSheet: View {
                         SettingRow(symbol: "power", tint: .indigo, title: "Shut down by itself",
                                    detail: shutdownDetail, isOn: $booth.autoShutdown)
                         if booth.autoShutdown { shutdownOptions }
+                        // Only a MacBook runs on when the power goes; a desktop Mac just goes off.
+                        if macHasBattery() {
+                            Divider().padding(.leading, indent)
+                            SettingRow(symbol: "bolt.slash.fill", tint: .orange, title: "Shut down when the power goes off",
+                                       detail: booth.shutdownOnPowerOff
+                                        ? "When the charger loses power, say switched off at the wall: a 1-minute warning with Not yet, then Stream Deck and Lightkey close and the Mac shuts down. Power back during the warning stops it."
+                                        : "Off: on battery, the Mac keeps running.",
+                                       isOn: $booth.shutdownOnPowerOff)
+                        }
                         let others = booth.loginItems.filter { !$0.name.localizedCaseInsensitiveContains("Booth Check") }
                         if !others.isEmpty {
                             Divider().padding(.leading, indent)
@@ -3219,7 +3342,7 @@ enum SignFace: Equatable { case handsOff, password, ready, needsLook, countdown,
 /// What the big sign shows. `banner` puts it along the bottom of the screen instead of the middle;
 /// `show` is the show's name, as Lightkey lists it among its projects; `asking` is Lightkey's
 /// Authenticate alert being up; `seconds`, `notYet` and `now` belong to the shutdown's countdown;
-/// `note` says why the Mac stayed on.
+/// `note` says why the booth is shutting down, or why the Mac stayed on.
 final class SignModel: ObservableObject {
     @Published var face: SignFace = .handsOff
     @Published var banner = false
@@ -3255,8 +3378,7 @@ struct SignCard: View {
             return ("exclamationmark.triangle.fill", .orange, "Started, but something needs a look",
                     "The panel at the top right says what. You can use the Mac now.")
         case .countdown:
-            return ("power", .red, "The booth shuts down in \(countdownText(model.seconds))",
-                    "Stream Deck and Lightkey close, then the Mac shuts down. Leave everything plugged in.")
+            return ("power", .red, "The booth shuts down in \(countdownText(model.seconds))", model.note)
         case .shuttingDown:
             return ("power", .indigo, "Shutting the booth down",
                     "Please don\u{2019}t touch the Mac. Stream Deck and Lightkey close, then the Mac shuts down.")
@@ -3371,7 +3493,8 @@ final class SignOverlay {
     }
 
     /// The shutdown's warning: counts down from `seconds`, with Not yet and Shut down now.
-    func countdown(_ seconds: Int, notYet: @escaping () -> Void, now: @escaping () -> Void) {
+    func countdown(_ seconds: Int, why: String, notYet: @escaping () -> Void, now: @escaping () -> Void) {
+        model.note = why
         model.notYet = notYet
         model.now = now
         model.seconds = seconds
@@ -3547,7 +3670,7 @@ struct MenuPanel: View {
                 .disabled(booth.starting)
             }
             // The end of the service: a 10-second countdown with Not yet, then everything closes.
-            Button { booth.shutDownBooth(warning: 10) } label: {
+            Button { booth.shutDownBooth(.button) } label: {
                 Label(booth.shuttingDown ? "Shutting down\u{2026}" : "Shut down the booth", systemImage: "power")
                     .frame(maxWidth: .infinity)
             }

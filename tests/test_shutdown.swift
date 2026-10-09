@@ -46,5 +46,23 @@ expect("two days, in week order", shutdownDaysText([4, 1]) == "Sundays and Wedne
 expect("three days", shutdownDaysText([1, 2, 3]) == "Sundays, Mondays and Tuesdays", shutdownDaysText([1, 2, 3]))
 expect("every day", shutdownDaysText(Set(1...7)) == "every day", shutdownDaysText(Set(1...7)))
 
+// 5. 1.20: shutting down when the power goes off (This Mac switch, off unless switched on).
+func power(on: Bool = true, ac: Bool, outage: Bool, handled: Bool = false, busy: Bool = false) -> PowerNext {
+    powerNext(enabled: on, onAC: ac, outage: outage, handled: handled, busy: busy)
+}
+expect("on the charger: power's back", power(ac: true, outage: false) == .powerBack)
+expect("switch off: nothing, even when the power goes", power(on: false, ac: false, outage: true) == .nothing)
+expect("started on battery, no power cut seen: nothing", power(ac: false, outage: false) == .nothing)
+expect("the power went off while running: warn", power(ac: false, outage: true) == .warn)
+expect("already warned this time: nothing", power(ac: false, outage: true, handled: true) == .nothing)
+expect("a start-up or shutdown under way: not yet", power(ac: false, outage: true, busy: true) == .nothing)
+
+expect("button: a 10-second warning", shutdownWarning(.button) == 10)
+expect("set time: 5 minutes", shutdownWarning(.timed) == 300)
+expect("power off: 1 minute", shutdownWarning(.powerOff) == 60)
+expect("power off: the sign says why, and how to stop it", shutdownWhy(.powerOff).contains("power") && shutdownWhy(.powerOff).contains("Plug"),
+       shutdownWhy(.powerOff))
+expect("set time: the sign says why", shutdownWhy(.timed).contains("set time"), shutdownWhy(.timed))
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
