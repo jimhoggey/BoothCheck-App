@@ -90,7 +90,7 @@ the sheet.
 
 | Group | Checks |
 |---|---|
-| Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey's MIDI input ready for the Stream Deck |
+| Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey connects without the password · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
@@ -108,9 +108,14 @@ they open, so Stream Deck opened straight after stays awake with no restart; if 
 already open, the step says to quit and reopen it once, and the App Nap row stays orange until it has
 been (it compares when Stream Deck opened with when App Nap was switched off).
 
-**Lightkey asks for the Mac's password** when it connects to the DMX interface, on Intel and Apple
-silicon alike. That's Lightkey's own request, so Booth Check doesn't touch it; the start-up step says
-to type it, and waits a minute for Lightkey to connect.
+**Lightkey asks for the Mac's password** (Authenticate) when it connects to the DMX interface, on
+Intel and Apple silicon alike: it unloads the Mac's FTDI driver first. Its hidden setting
+`DontUnloadFTDIDrivers` skips that, and on the church Mac with its Open DMX USB the lights work with it
+on and nothing asks (tested 9 October 2026). **Lightkey connects without the password** checks the
+setting, and **Switch it on…** shows the command (`defaults write de.monospc.Lightkey
+DontUnloadFTDIDrivers -bool true`) and its undo before running it. With it on, the start-up's sign
+stays on "Please don't touch the Mac" the whole way. Without it, the start-up says to type the
+password, and waits a minute for Lightkey to connect.
 
 **Why only Booth Check should open at login.** Login items all start at once, in no set order. If
 the Stream Deck app wins the race, its MIDI plugin can start before Lightkey's MIDI input exists and
@@ -251,7 +256,10 @@ anything happens:
 3. Unzip it (`ditto`).
 4. Check it's Booth Check at the version offered, with an intact signature (`codesign --verify`).
 5. Move the current copy to the Trash and put the new one in its place.
-6. Reopen. macOS asks for the two permissions again, because it's a new build.
+6. Reopen. Since 1.21 every build is signed with the same certificate, so macOS keeps both
+   permissions. Before that, each build was new to macOS: the update to 1.21 (or later) from an older
+   version needs them once more. In Accessibility, remove the old Booth Check entry with **−**, then
+   click **Allow access…** in Booth Check and turn the new one on.
 
 If any check fails, nothing changes, and every step is kept in the Log. The app has to be somewhere
 it can write, such as Applications, not run straight from Downloads.
@@ -271,8 +279,10 @@ next login, and "The right show is open" checks against it straight away.
 
 Needs the Xcode Command Line Tools on the Mac doing the build, and nowhere else. The script picks an
 SDK the installed Swift compiler accepts, builds arm64 and x86_64, joins them, draws the icon, signs
-the app ad hoc, and zips it. Rebuilding changes the app's signature, so macOS asks for the two
-permissions again.
+the app, and zips it. It signs with the **Booth Check Signing** certificate when that's in the Mac's
+keychain (a self-signed code-signing certificate, made once on the Mac that releases Booth Check), so
+every build has the same signature and macOS keeps Booth Check's permissions across updates. Without
+it, the build is signed ad hoc, a new signature each time.
 
 The unit tests cover the check logic that doesn't need a running Mac (the show match, App Nap, the
 DMX server, the start-up's waits, the replug animation, the hands-off sign, the shutdown's timing).

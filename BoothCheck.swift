@@ -371,6 +371,11 @@ func asksToAuthenticate(pid: pid_t) -> Bool {
     }
 }
 
+/// Whether `defaults read` printed a true boolean. A key that isn't set prints nothing on stdout.
+func defaultsSaysOn(_ output: String) -> Bool {
+    ["1", "true", "yes"].contains(output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+}
+
 /// Apps whose window must keep the keyboard: macOS's password box, permission prompts, the login window.
 let promptApps: Set<String> = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter", "com.apple.coreservices.uiagent",
                                "com.apple.accessibility.universalAccessAuthWarn", "com.apple.loginwindow"]
@@ -670,7 +675,7 @@ enum Status {
 }
 
 enum Action {
-    case fixAppNap, chooseShow, openShow, launchStreamDeck
+    case fixAppNap, chooseShow, openShow, launchStreamDeck, lightkeyNoPassword
     case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
     case removeLoginItem(LoginItem)
     case removeShowLoginItems
@@ -686,6 +691,7 @@ enum Action {
         case .chooseShow: return "Choose show\u{2026}"
         case .openShow: return "Open the show"
         case .launchStreamDeck: return "Open Stream Deck"
+        case .lightkeyNoPassword: return "Switch it on\u{2026}"
         case .allowAccessibility, .allowAutomation: return "Allow access\u{2026}"
         case .makeLoginShow: return "Make it the login show\u{2026}"
         case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
@@ -758,6 +764,7 @@ struct Snapshot {
     var lightkeyUSB: [String] = []          // USB driver connections Lightkey or its olad has open
     var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
     var hasBattery = false                  // a laptop, so starting from the charger applies
+    var lightkeyNoPassword = false          // Lightkey's DontUnloadFTDIDrivers is on
     var bootValue: String?                  // the firmware setting; nil = not set = factory setting
     var bootReadFailed = false
 }
@@ -836,6 +843,9 @@ final class Booth: ObservableObject {
     /// Times this start-up brought Lightkey to the front, and when last (see `shouldFrontLightkey`).
     private var frontAttempts = 0
     private var lastFront: Date?
+    /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
+    /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
+    private var lightkeyMayAsk = true
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -921,6 +931,8 @@ final class Booth: ObservableObject {
             let batt = pass.sh("Power source", "/usr/bin/pmset", ["-g", "batt"]).out
             s.onAC = batt.contains("'AC Power'")
             s.hasBattery = batt.contains("InternalBattery")
+            s.lightkeyNoPassword = defaultsSaysOn(pass.sh("Lightkey connects without the password", "/usr/bin/defaults",
+                                                          ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
             if s.hasBattery {
                 let boot = pass.sh("Starts from the charger", "/usr/sbin/nvram", [bootVariable])
                 if boot.code == 0 {
@@ -1027,6 +1039,18 @@ final class Booth: ObservableObject {
                              detail: "Lightkey is open, but it doesn\u{2019}t seem to be using the DMX interface.",
                              fix: "In Lightkey, check the interface is chosen for the universe. If it is, unplug and replug the interface, then quit and reopen Lightkey. This check is new: if the lights respond, trust the lights."))
         }
+
+        // Lightkey asks for the Mac's password (Authenticate) before it takes the DMX interface, unless
+        // its hidden DontUnloadFTDIDrivers setting is on. On the church Mac (Intel, Open DMX USB) the
+        // lights work with it on and nothing asks (9 Oct 2026).
+        let passTitle = "Lightkey connects without the password"
+        out.append(s.lightkeyNoPassword
+            ? Check(id: "lkpass", group: "Lighting", title: passTitle, status: .ok,
+                    detail: "Lightkey\u{2019}s DontUnloadFTDIDrivers setting is on, so it doesn\u{2019}t ask to Authenticate.")
+            : Check(id: "lkpass", group: "Lighting", title: passTitle, status: .warn,
+                    detail: "Lightkey asks for the Mac\u{2019}s password (Authenticate) each time it connects to the DMX interface.",
+                    fix: "Switch on Lightkey\u{2019}s DontUnloadFTDIDrivers setting, and it stops asking. Tested on the church Mac with its Open DMX USB.",
+                    action: .lightkeyNoPassword))
 
         let midi = MIDIWatch.shared.destinationNames()
         pass.api("Lightkey's MIDI input", "CoreMIDI: list the MIDI destinations", midi.isEmpty ? "(none)" : midi.joined(separator: "\n"))
@@ -1287,9 +1311,12 @@ final class Booth: ObservableObject {
         guard AXIsProcessTrusted() else {
             pass.api("Which show Lightkey has open", "Accessibility: read Lightkey's window titles",
                      "Not allowed yet — Booth Check isn't turned on under Accessibility.")
+            // macOS ties the permission to the app's signature. Builds before 1.21 were signed ad hoc, a
+            // new signature every time, so after an update the old entry stayed switched on in the list
+            // but didn't count (church Mac, 9 Oct 2026).
             return Check(id: "show", group: "Lighting", title: title, status: .unknown,
                          detail: "Booth Check needs permission to read Lightkey's window title.",
-                         fix: "Turn Booth Check on under Accessibility. You may need to reopen Booth Check afterwards.",
+                         fix: "Turn Booth Check on under Accessibility, then quit and reopen Booth Check. Already on? That's an older copy: select it, click \u{2212} to remove it, then click Allow access\u{2026} again.",
                          action: .allowAccessibility)
         }
         let (docs, titles) = windowsOf(pid: lightkey.processIdentifier)
@@ -1352,6 +1379,15 @@ final class Booth: ObservableObject {
                 explanation: "Stops macOS putting apps in the background to sleep, which is what freezes the Stream Deck. It applies to every app on this Mac, from the next time each app opens, so quit and reopen Stream Deck once if it's already open. No password needed. Get the show started also does this automatically before opening Stream Deck.",
                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                 undo: commandLine("/usr/bin/defaults", ["delete", "-g", "NSAppSleepDisabled"]),
+                run: { shell("/usr/bin/defaults", args) })
+            return
+        case .lightkeyNoPassword:
+            let args = ["write", IDs.lightkey, "DontUnloadFTDIDrivers", "-bool", "true"]
+            pending = PendingChange(
+                key: "lkpass", title: "Lightkey without the password",
+                explanation: "Lightkey normally unloads the Mac\u{2019}s FTDI driver before it takes the DMX interface, and that needs the Mac\u{2019}s password (Authenticate). This hidden Lightkey setting skips that step. On the church Mac, with its Open DMX USB, the lights work with it on and nothing asks (9 Oct 2026). It\u{2019}s saved in Lightkey\u{2019}s settings for this account and survives restarts. Quit Lightkey first, or it applies from the next time Lightkey opens. If the lights ever stop working, run the undo command. No password needed.",
+                language: "Terminal", code: commandLine("/usr/bin/defaults", args),
+                undo: commandLine("/usr/bin/defaults", ["delete", IDs.lightkey, "DontUnloadFTDIDrivers"]),
                 run: { shell("/usr/bin/defaults", args) })
             return
         case .makeLoginShow:
@@ -1540,7 +1576,7 @@ extension Booth {
         switch id {
         case "lk", "show": return s.lightkey
         // The DMX interface option sits inside Lightkey's row and hides with it, so it goes with Lightkey.
-        case "dmx", "dmxLive": return s.lightkey && s.dmx
+        case "dmx", "dmxLive", "lkpass": return s.lightkey && s.dmx
         case "midi": return s.lightkey && s.streamDeck
         case "deck", "deckapp", "nap": return s.streamDeck
         case "ac", "sleep", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
@@ -1680,6 +1716,8 @@ extension Booth {
         frontAttempts = 0
         lastFront = nil
         SignOverlay.shared.setAsking(false)
+        lightkeyMayAsk = setup.lightkey && setup.dmx
+            && !defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
         ReplugOverlay.shared.onHide = { [weak self] in self?.updateSign() }
         BootPanel.shared.show(steps: bootSteps.count)
         runStep(0)
@@ -1689,7 +1727,7 @@ extension Booth {
     /// and when the replug sign comes or goes; Lightkey holding the DMX interface counts from the next step.
     private func updateSign() {
         guard signOn, starting else { return }
-        let sign = startSign(replugShowing: ReplugOverlay.shared.isShowing, asksPassword: setup.lightkey && setup.dmx,
+        let sign = startSign(replugShowing: ReplugOverlay.shared.isShowing, asksPassword: lightkeyMayAsk,
                              lightkeyOpened: signLightkeyOpened, dmxLinked: signDMXLinked)
         let step = bootSteps.firstIndex { $0.state == .running }
             .map { "Step \($0 + 1) of \(bootSteps.count): \(bootSteps[$0].title)" }
@@ -1805,7 +1843,7 @@ extension Booth {
             }
             // Two different prompts can appear here: Lightkey asking for the Mac's password to take
             // the DMX interface (any Mac), and macOS asking to allow the accessory (Apple silicon only).
-            let hints = [setup.dmx ? "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : nil,
+            let hints = [lightkeyMayAsk ? "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : nil,
                          hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil].compactMap { $0 }
             setStep(i, .running, hints.isEmpty ? nil : hints.joined(separator: " "))
             poll(for: 45, {
@@ -1840,7 +1878,7 @@ extension Booth {
                 return next()
             }
             // A minute, so a person has time to type the password Lightkey asks for.
-            setStep(i, .running, "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password.")
+            setStep(i, .running, lightkeyMayAsk ? "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : nil)
             poll(every: 2, for: 60, background: true, {
                 // Asked again each time: olad, which holds the interface for Lightkey, can start late.
                 let pids = dmxDriverPIDs(lightkey: pid, psOutput: shell("/bin/ps", ["-axo", "pid=,comm="]).out)
@@ -1920,6 +1958,10 @@ extension Booth {
                 asking = pid.map(asksToAuthenticate) ?? false
             }
             SignOverlay.shared.setAsking(asking)
+            if asking && !self.lightkeyMayAsk {         // it asks after all, say the setting was reset
+                self.lightkeyMayAsk = true
+                self.updateSign()
+            }
             switch showOpenNext(isOpen: isOpen, waited: Date().timeIntervalSince(started)) {
             case .done:
                 self.setStep(i, .done, doneText)
@@ -1931,7 +1973,9 @@ extension Booth {
                 self.frontLightkeyIfBehind()
                 self.setStep(i, .running, asking
                     ? "Lightkey is asking for the password: tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password."
-                    : "Waiting for \(name). If Lightkey asks, click Authenticate and type the Mac\u{2019}s password. Can\u{2019}t see Lightkey? Click its icon in the Dock.")
+                    : "Waiting for \(name)."
+                        + (self.lightkeyMayAsk ? " If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : "")
+                        + " Can\u{2019}t see Lightkey? Click its icon in the Dock.")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { look() }
             }
         }

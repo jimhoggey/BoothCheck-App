@@ -57,6 +57,13 @@ expect("Booth Check's own window in front: leave it", !front(me, 0, 0))
 expect("again only after 10 seconds", !front("com.apple.finder", 1, 5) && front("com.apple.finder", 1, 12))
 expect("no more than three times", !front("com.apple.finder", 3, 60))
 
+// 2e. 1.21: Lightkey's DontUnloadFTDIDrivers setting (church Mac, 9 Oct 2026: on, no Authenticate,
+//     lights work), read from `defaults read`'s output. With it on, there's no password to ask for.
+expect("defaults says 1: on", defaultsSaysOn("1\n"))
+expect("defaults says true: on", defaultsSaysOn("true"))
+expect("defaults says 0: off", !defaultsSaysOn("0\n"))
+expect("not set (defaults prints an error, nothing on stdout): off", !defaultsSaysOn(""))
+
 // 3. Ready for the service: every step went fine, or one warned on the way and every check is green now.
 expect("every step done: ready", startUpReady(steps: [.done, .done, .done], problems: 0, unknown: 0, checks: 12))
 expect("a step warned, every check green now: ready", startUpReady(steps: [.done, .warn, .done], problems: 0, unknown: 0, checks: 12))

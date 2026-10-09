@@ -43,9 +43,19 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 
-# Ad-hoc signature: required for the app to run on Apple silicon at all. Not a paid Developer ID, so
-# the first launch on each Mac needs right-click -> Open.
-codesign --force --sign - "$APP"
+# Signed with Booth Check's own certificate when it's in this Mac's keychain: macOS ties Accessibility
+# and System Events permissions to the signature, and a certificate keeps it the same from one build to
+# the next, so updates keep their permissions. Anywhere else, an ad-hoc signature, which every Mac needs
+# to run the app at all but which changes with every build. Neither is a paid Developer ID, so the first
+# launch on each Mac needs Privacy & Security -> Open Anyway (right-click -> Open no longer works).
+IDENTITY="Booth Check Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
+    codesign --force --sign "$IDENTITY" "$APP"
+    echo "Signed with: $IDENTITY"
+else
+    codesign --force --sign - "$APP"
+    echo "Signed ad hoc (no \"$IDENTITY\" certificate in this Mac's keychain)"
+fi
 
 (cd build && ditto -c -k --keepParent "Booth Check.app" "Booth Check.zip")
 rm -rf build/BoothCheck-* build/make_icon build/AppIcon.iconset build/icon_1024.png
