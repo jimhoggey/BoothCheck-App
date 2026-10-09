@@ -20,7 +20,13 @@ its window once so whoever sits down sees what to fix.
      again that way. The replug is picked up within a second ("Found it"), the wait runs up to 90
      seconds so someone can get to the cable, and **Carry on without it** skips it
   2. Open any other apps, such as ProPresenter
-  3. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
+  3. With a Stream Deck: open **Lightkey without the show**, wait for its MIDI input (the Stream
+     Deck plugin looks for it when it starts), switch App Nap off if it's on, open **Stream Deck in
+     the background**, and give its plugin 10 seconds to connect. Lightkey sends every cue's state
+     once, at the moment the show opens, so the deck is listening by then and its Default key lights
+     (tested with the DMX box and a Stream Deck XL, 9 Oct 2026: Lightkey 1.4 s, Stream Deck 2.4 s,
+     the show 13.8 s, Default sent as on)
+  4. Open the show in Lightkey (on Apple silicon, while it opens: "If macOS asks to allow an
      accessory, click Allow"; Intel Macs never ask). With an Open DMX USB, Lightkey doesn't load the
      show until someone clicks **Authenticate** and types the Mac's password (it frees the interface
      from the Mac's own FTDI driver), so with Accessibility allowed this step waits for the show, up to
@@ -28,11 +34,15 @@ its window once so whoever sits down sees what to fix.
      up behind another app (its alert, and the Touch Bar's Authenticate, only show while it's in
      front), Booth Check brings it forward: at most three times, ten seconds apart, and never over
      macOS's password box. It also sees when Lightkey's Authenticate alert is up and says so
-  4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
-  6. Switch App Nap off if it's on, then open Stream Deck in the background, so Lightkey stays in
-     front and Stream Deck stays awake behind it
+  6. Without Lightkey on this Mac, Stream Deck opens here instead
   7. Check everything
+
+  After the start-up, **Stream Deck stays open**: when it's switched on in This Mac and its app
+  isn't running (switched on just now, Booth Check reopened after an update, or someone quit it),
+  Booth Check opens it in the background within 15 seconds, App Nap off first. On a Lightkey Mac it
+  waits until Lightkey's MIDI input is there, it tries at most once a minute, and never while a
+  start-up or shutdown is opening or closing apps.
 
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
   the service" and hides itself; if not it stays, with **Open Booth Check**. A step that warned on the

@@ -445,6 +445,33 @@ func startUpReady(steps: [StepState], problems: Int, unknown: Int, checks: Int) 
     steps.allSatisfy { $0 == .done } || (problems == 0 && unknown == 0 && checks > 0)
 }
 
+/// The start-up's steps, by id, in order. The DMX interface first (Lightkey attaches when it opens),
+/// then other apps. With a Stream Deck on a Lightkey Mac: Lightkey without the show, its MIDI input
+/// (the Stream Deck plugin looks for it when it starts), Stream Deck, and only then the show. Lightkey
+/// sends every cue's state once, the moment a show opens, and opening the show again sends nothing;
+/// a deck that wasn't listening yet showed Default off while it was on (rig-tested, 9 Oct 2026).
+func startUpOrder(lightkey: Bool, dmx: Bool, streamDeck: Bool, apps: [String], checkOnly: Bool) -> [String] {
+    if checkOnly { return ["check"] }
+    let deckFirst = lightkey && streamDeck
+    var steps: [String] = []
+    if lightkey && dmx { steps.append("dmxWait") }
+    steps += apps
+    if deckFirst { steps += ["lightkeyApp", "midi", "deck"] }
+    if lightkey { steps.append("lightkey") }
+    if lightkey && dmx { steps.append("dmxLink") }
+    if streamDeck && !deckFirst { steps.append("deck") }
+    return steps + ["check"]
+}
+
+/// Whether to open Stream Deck now, outside the start-up (the user, 9 Oct 2026: switched on in This
+/// Mac, it didn't open). Switched on, installed and not running; not while a start-up or a shutdown
+/// is opening or closing apps; on a Lightkey Mac only once Lightkey's MIDI input exists, since the
+/// plugin looks for it when it starts; and at most once a minute, so a crashing app isn't hammered.
+func shouldOpenStreamDeck(enabled: Bool, installed: Bool, running: Bool, busy: Bool,
+                          needsLightkey: Bool, lightkeyReady: Bool, sinceLast: TimeInterval) -> Bool {
+    enabled && installed && !running && !busy && (!needsLightkey || lightkeyReady) && sinceLast >= 60
+}
+
 /// Whether a start-up gets the hands-off sign: only the one that runs by itself at login (the user
 /// asked for it there, 6 Oct 2026), and only if it opens something; a check-only start-up opens nothing.
 func startUpShowsSign(atLogin: Bool, steps: [String]) -> Bool {
@@ -843,6 +870,8 @@ final class Booth: ObservableObject {
     /// Times this start-up brought Lightkey to the front, and when last (see `shouldFrontLightkey`).
     private var frontAttempts = 0
     private var lastFront: Date?
+    /// When Booth Check last opened Stream Deck (see `keepStreamDeckOpen`).
+    private var lastDeckOpen: Date?
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
@@ -853,6 +882,7 @@ final class Booth: ObservableObject {
         didSet {
             setup.save()
             refresh()
+            if setup.streamDeck && !oldValue.streamDeck { keepStreamDeckOpen() }    // switched on just now
         }
     }
     /// True until someone has confirmed the setup sheet once on this Mac.
@@ -1677,27 +1707,30 @@ extension Booth {
         if pending == nil { refresh() }
         checkShutdownTime()
         checkPower()
+        keepStreamDeckOpen()
     }
 
     /// The start-up order, as numbered steps. The same list is shown in This Mac before anyone
     /// restarts, and ticks off live in the start-up panel while it runs.
     func plannedSteps(checkOnly: Bool = false) -> [BootStep] {
-        var steps: [BootStep] = []
-        if !checkOnly {
-            // Lightkey attaches to the DMX interface when it opens, so the interface comes first.
-            if setup.lightkey && setup.dmx { steps.append(BootStep(id: "dmxWait", title: "Wait for the DMX interface")) }
-            for app in setup.apps where app.on { steps.append(BootStep(id: "app:\(app.bundleID)", title: "Open \(app.name)")) }
-            if setup.lightkey {
-                let show = showName.map { ($0 as NSString).deletingPathExtension }
-                steps.append(BootStep(id: "lightkey", title: show.map { "Open \($0) in Lightkey" } ?? "Open Lightkey"))
+        let apps = setup.apps.filter(\.on)
+        let ids = startUpOrder(lightkey: setup.lightkey, dmx: setup.dmx, streamDeck: setup.streamDeck,
+                               apps: apps.map { "app:\($0.bundleID)" }, checkOnly: checkOnly)
+        let show = showName.map { ($0 as NSString).deletingPathExtension }
+        return ids.map { id in
+            let title: String
+            switch id {
+            case "dmxWait": title = "Wait for the DMX interface"
+            case "lightkeyApp": title = "Open Lightkey"
+            case "midi": title = "Wait for Lightkey to be ready for the Stream Deck"
+            case "deck": title = "Open Stream Deck in the background"
+            case "lightkey": title = show.map { "Open \($0) in Lightkey" } ?? "Open Lightkey"
+            case "dmxLink": title = "Lightkey connects to the DMX interface"
+            case "check": title = "Check everything"
+            default: title = "Open " + (apps.first { "app:\($0.bundleID)" == id }?.name ?? id)
             }
-            // The Stream Deck plugin looks for Lightkey's MIDI input when it starts.
-            if setup.lightkey && setup.streamDeck { steps.append(BootStep(id: "midi", title: "Wait for Lightkey to be ready for the Stream Deck")) }
-            if setup.lightkey && setup.dmx { steps.append(BootStep(id: "dmxLink", title: "Lightkey connects to the DMX interface")) }
-            if setup.streamDeck { steps.append(BootStep(id: "deck", title: "Open Stream Deck in the background")) }
+            return BootStep(id: id, title: title)
         }
-        steps.append(BootStep(id: "check", title: "Check everything"))
-        return steps
     }
 
     /// Runs the start-up steps in order, shown live in a small panel that floats over everything,
@@ -1782,7 +1815,7 @@ extension Booth {
         let next = { self.runStep(i + 1) }
         setStep(i, .running)
         let id = bootSteps[i].id
-        if id == "lightkey" { signLightkeyOpened = true }
+        if id == "lightkey" || id == "lightkeyApp" { signLightkeyOpened = true }
         updateSign()
 
         switch id {
@@ -1894,41 +1927,37 @@ extension Booth {
                 next()
             }
 
-        case "deck":
-            // Out of sight is exactly what App Nap puts to sleep, so switch it off before Stream Deck
-            // opens. Apps read the setting when they launch, so this takes effect for Stream Deck
-            // straight away, with no restart. No password needed; the command goes in the Log.
-            let napOff = shell("/usr/bin/defaults", ["read", "-g", "NSAppSleepDisabled"])
-                .out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
-            var napSwitched = false
-            if !napOff {
-                let args = ["write", "-g", "NSAppSleepDisabled", "-bool", "true"]
-                let r = shell("/usr/bin/defaults", args)
-                changes.insert(LogEntry(title: "Start-up: switched App Nap off for Stream Deck", language: "Terminal",
-                                        code: commandLine("/usr/bin/defaults", args),
-                                        output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
-                napSwitched = r.code == 0
-                if napSwitched { appNapSwitchedOffAt = Date() }
+        case "lightkeyApp":
+            // Lightkey on its own, so its MIDI ports exist and Stream Deck can connect before the show
+            // opens (see `startUpOrder`). Launched without a show it opens none (rig, 9 Oct 2026).
+            if isRunning(IDs.lightkey) {
+                setStep(i, .done, "Already open.")
+                return next()
+            }
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) else {
+                setStep(i, .failed, "Lightkey isn\u{2019}t installed on this Mac.")
+                return next()
+            }
+            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            poll(for: 45, {
+                NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.isFinishedLaunching == true
+            }) { ok in
+                self.setStep(i, ok ? .done : .failed, ok ? "Opened, without the show for now." : "Lightkey didn\u{2019}t open within 45 seconds.")
+                next()
             }
 
-            if isRunning(IDs.streamDeck) {
-                if napSwitched {
-                    setStep(i, .warn, "Already open, but it started before App Nap was switched off. Quit and reopen Stream Deck once so it stays awake in the background.")
-                } else {
-                    setStep(i, .done, "Already open.")
-                }
-            } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
-                // In the background, so Lightkey stays in front and full screen isn't interrupted.
-                let config = NSWorkspace.OpenConfiguration()
-                config.activates = false
-                NSWorkspace.shared.openApplication(at: url, configuration: config)
-                setStep(i, .done, napSwitched
-                    ? "Switched App Nap off, then opened it behind Lightkey, so it keeps running there."
-                    : "Opened behind Lightkey. App Nap is off, so it keeps running there.")
+        case "deck":
+            let result = openStreamDeckInBackground(during: "Start-up")
+            setStep(i, result.state, result.detail)
+            // When the show comes next, give the plugin a few seconds to connect to Lightkey first, so
+            // it's listening when Lightkey sends every cue's state as the show opens.
+            let showNext = bootSteps.indices.contains(i + 1) && bootSteps[i + 1].id == "lightkey"
+            if result.opened && showNext {
+                setStep(i, result.state, result.detail + " Giving it a few seconds to connect before the show opens.")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { next() }
             } else {
-                setStep(i, .failed, "Not installed on this Mac.")
+                next()
             }
-            next()
 
         default:        // "check"
             refresh()
@@ -1980,6 +2009,52 @@ extension Booth {
             }
         }
         look()
+    }
+
+    /// Opens Stream Deck behind everything, App Nap off first: out of sight is exactly what App Nap puts
+    /// to sleep, and apps read the setting when they launch, so it takes effect straight away. No
+    /// password needed; both go in the Log.
+    func openStreamDeckInBackground(during what: String) -> (state: StepState, detail: String, opened: Bool) {
+        let napOff = defaultsSaysOn(shell("/usr/bin/defaults", ["read", "-g", "NSAppSleepDisabled"]).out)
+        var napSwitched = false
+        if !napOff {
+            let args = ["write", "-g", "NSAppSleepDisabled", "-bool", "true"]
+            let r = shell("/usr/bin/defaults", args)
+            changes.insert(LogEntry(title: "\(what): switched App Nap off for Stream Deck", language: "Terminal",
+                                    code: commandLine("/usr/bin/defaults", args),
+                                    output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+            napSwitched = r.code == 0
+            if napSwitched { appNapSwitchedOffAt = Date() }
+        }
+        if isRunning(IDs.streamDeck) {
+            return napSwitched
+                ? (.warn, "Already open, but it started before App Nap was switched off. Quit and reopen Stream Deck once so it stays awake in the background.", false)
+                : (.done, "Already open.", false)
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) else {
+            return (.failed, "Not installed on this Mac.", false)
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false                    // Lightkey stays in front, full screen undisturbed
+        NSWorkspace.shared.openApplication(at: url, configuration: config)
+        lastDeckOpen = Date()
+        changes.insert(LogEntry(title: "\(what): opened Stream Deck in the background", language: "macOS API",
+                                code: "NSWorkspace.openApplication (Stream Deck, activates = false)",
+                                output: napSwitched ? "App Nap was switched off first." : "App Nap is off.", status: 0), at: 0)
+        return (.done, napSwitched ? "Switched App Nap off, then opened it in the background, so it keeps running there."
+                                   : "Opened in the background. App Nap is off, so it keeps running there.", true)
+    }
+
+    /// With the 15-second checks, and when Stream Deck is switched on in This Mac: if it's switched on
+    /// but its app isn't running, open it (see `shouldOpenStreamDeck`).
+    func keepStreamDeckOpen() {
+        guard shouldOpenStreamDeck(enabled: setup.streamDeck,
+                                   installed: NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) != nil,
+                                   running: isRunning(IDs.streamDeck), busy: starting || shuttingDown,
+                                   needsLightkey: setup.lightkey,
+                                   lightkeyReady: MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) },
+                                   sinceLast: Date().timeIntervalSince(lastDeckOpen ?? .distantPast)) else { return }
+        _ = openStreamDeckInBackground(during: "Stream Deck is switched on")
     }
 
     /// Brings Lightkey to the front if it opened behind something, so its Authenticate alert shows on
