@@ -332,6 +332,40 @@ func windowsOf(pid: pid_t) -> (docs: [URL], titles: [String]) {
     return (docs, titles)
 }
 
+/// Whether an app is showing a button titled Authenticate: Lightkey's alert before it takes the DMX
+/// interface (Accessibility). Only dialogs and sheets are searched, not the show's own big window.
+func asksToAuthenticate(pid: pid_t) -> Bool {
+    func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+    }
+    func children(_ element: AXUIElement) -> [AXUIElement] { attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+    func hasButton(_ element: AXUIElement, depth: Int) -> Bool {
+        if attribute(element, kAXRoleAttribute) as? String == kAXButtonRole,
+           (attribute(element, kAXTitleAttribute) as? String)?.localizedCaseInsensitiveContains("authenticate") == true { return true }
+        return depth > 0 && children(element).contains { hasButton($0, depth: depth - 1) }
+    }
+    let windows = attribute(AXUIElementCreateApplication(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
+    return windows.contains { window in
+        let subrole = attribute(window, kAXSubroleAttribute) as? String
+        if subrole == kAXDialogSubrole || subrole == kAXSystemDialogSubrole { return hasButton(window, depth: 3) }
+        return children(window).contains { attribute($0, kAXRoleAttribute) as? String == kAXSheetRole && hasButton($0, depth: 3) }
+    }
+}
+
+/// Apps whose window must keep the keyboard: macOS's password box, permission prompts, the login window.
+let promptApps: Set<String> = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter", "com.apple.coreservices.uiagent",
+                               "com.apple.accessibility.universalAccessAuthWarn", "com.apple.loginwindow"]
+
+/// Whether the start-up should bring Lightkey to the front. Behind another app, its Authenticate alert
+/// can't be seen and the Touch Bar doesn't offer it (church Mac, 9 Oct 2026: nothing on screen until
+/// someone clicked Lightkey). Never over macOS's password box or a permission prompt, never over
+/// Booth Check's own window, and at most three times, ten seconds apart, so it doesn't fight anyone.
+func shouldFrontLightkey(frontmost: String?, me: String?, attempts: Int, sinceLast: TimeInterval) -> Bool {
+    if let app = frontmost, app == IDs.lightkey || app == me || promptApps.contains(app) { return false }
+    return attempts == 0 || (attempts < 3 && sinceLast >= 10)
+}
+
 /// Whether Lightkey has the chosen show open. Lightkey is a document app, so Accessibility gives each
 /// window's file, and then the path decides: a same-named copy from another folder doesn't count.
 /// Window titles are only the fallback, and must name the show on its own ("Show", "Show — Edited"),
@@ -410,7 +444,16 @@ func startSign(replugShowing: Bool, asksPassword: Bool, lightkeyOpened: Bool, dm
 /// Check (the docs' "click the most recent project"), so then it can't name one.
 func passwordSignText(show: String?) -> String {
     "If it asks for the password, tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password. "
-        + "If it shows its list of projects, click \(show ?? "the most recent one"). Nothing else needs touching."
+        + "If it lists its projects, click \(show ?? "the most recent one"). Can\u{2019}t see Lightkey? Click its icon in the Dock."
+}
+
+/// The password banner's title and words: plain when Lightkey's Authenticate alert is up (seen
+/// through Accessibility), otherwise what it may ask for and how to find Lightkey.
+func passwordSign(show: String?, asking: Bool) -> (title: String, text: String) {
+    asking ? ("Lightkey is asking for the password",
+              "Tap Authenticate on the Touch Bar (or click it on screen), then type the Mac\u{2019}s password. "
+                + "Can\u{2019}t see it? Click Lightkey\u{2019}s icon in the Dock.")
+           : ("Lightkey may need you", passwordSignText(show: show))
 }
 
 // MARK: - Shutting the booth down (pure parts)
@@ -740,6 +783,9 @@ final class Booth: ObservableObject {
     private var signOn = false
     private var signLightkeyOpened = false
     private var signDMXLinked = false
+    /// Times this start-up brought Lightkey to the front, and when last (see `shouldFrontLightkey`).
+    private var frontAttempts = 0
+    private var lastFront: Date?
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -1567,6 +1613,9 @@ extension Booth {
         signOn = startUpShowsSign(atLogin: atLogin, steps: bootSteps.map(\.id))
         signLightkeyOpened = isRunning(IDs.lightkey)       // reopened by macOS, it may be asking already
         signDMXLinked = false
+        frontAttempts = 0
+        lastFront = nil
+        SignOverlay.shared.setAsking(false)
         ReplugOverlay.shared.onHide = { [weak self] in self?.updateSign() }
         BootPanel.shared.show(steps: bootSteps.count)
         runStep(0)
@@ -1695,7 +1744,10 @@ extension Booth {
             let hints = [setup.dmx ? "If Lightkey asks, click Authenticate and type the Mac\u{2019}s password." : nil,
                          hasAccessoryPrompt ? "If macOS asks to allow an accessory, click Allow." : nil].compactMap { $0 }
             setStep(i, .running, hints.isEmpty ? nil : hints.joined(separator: " "))
-            poll(for: 45, { self.isRunning(IDs.lightkey) }) { ok in
+            poll(for: 45, {
+                NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.isFinishedLaunching == true
+            }) { ok in
+                if ok { self.frontLightkeyIfBehind() }
                 if !ok {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
                 } else if showMissing {
@@ -1797,10 +1849,13 @@ extension Booth {
         let started = Date()
         func look() {
             var isOpen: Bool?
+            var asking = false
             if AXIsProcessTrusted() {
                 let pid = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
                 isOpen = pid.map { let (docs, titles) = windowsOf(pid: $0); return showIsOpen(showPath, docs: docs, titles: titles) } ?? false
+                asking = pid.map(asksToAuthenticate) ?? false
             }
+            SignOverlay.shared.setAsking(asking)
             switch showOpenNext(isOpen: isOpen, waited: Date().timeIntervalSince(started)) {
             case .done:
                 self.setStep(i, .done, doneText)
@@ -1809,11 +1864,32 @@ extension Booth {
                 self.setStep(i, .warn, "\(name) isn\u{2019}t open after 2 minutes. Click Authenticate if Lightkey asks, or open it from File \u{2192} Open Recent.")
                 next()
             case .wait:
-                self.setStep(i, .running, "Waiting for \(name). If Lightkey asks, click Authenticate and type the Mac\u{2019}s password.")
+                self.frontLightkeyIfBehind()
+                self.setStep(i, .running, asking
+                    ? "Lightkey is asking for the password: tap Authenticate on the Touch Bar (or click it), then type the Mac\u{2019}s password."
+                    : "Waiting for \(name). If Lightkey asks, click Authenticate and type the Mac\u{2019}s password. Can\u{2019}t see Lightkey? Click its icon in the Dock.")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { look() }
             }
         }
         look()
+    }
+
+    /// Brings Lightkey to the front if it opened behind something, so its Authenticate alert shows on
+    /// screen and on the Touch Bar (see `shouldFrontLightkey`). Logged each time.
+    private func frontLightkeyIfBehind() {
+        guard let lightkey = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first,
+              lightkey.isFinishedLaunching else { return }
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        guard shouldFrontLightkey(frontmost: frontmost?.bundleIdentifier, me: Bundle.main.bundleIdentifier,
+                                  attempts: frontAttempts, sinceLast: Date().timeIntervalSince(lastFront ?? .distantPast)) else { return }
+        frontAttempts += 1
+        lastFront = Date()
+        let ok = lightkey.activate(options: [])
+        changes.insert(LogEntry(title: "Start-up: brought Lightkey to the front", language: "macOS API",
+                                code: "NSRunningApplication.activate (Lightkey)",
+                                output: "It was behind \(frontmost?.localizedName ?? "another app"), where its Authenticate alert can\u{2019}t be seen. "
+                                    + (ok ? "Done." : "macOS didn\u{2019}t allow it."),
+                                status: ok ? 0 : 1), at: 0)
     }
 
     /// All green: the panel hides itself shortly after. Anything else: it stays until dismissed. The
@@ -3141,13 +3217,15 @@ final class ReplugOverlay {
 enum SignFace: Equatable { case handsOff, password, ready, needsLook, countdown, shuttingDown, lightkeyOpen, stayedOn }
 
 /// What the big sign shows. `banner` puts it along the bottom of the screen instead of the middle;
-/// `show` is the show's name, as Lightkey lists it among its projects; `seconds`, `notYet` and `now`
-/// belong to the shutdown's countdown; `note` says why the Mac stayed on.
+/// `show` is the show's name, as Lightkey lists it among its projects; `asking` is Lightkey's
+/// Authenticate alert being up; `seconds`, `notYet` and `now` belong to the shutdown's countdown;
+/// `note` says why the Mac stayed on.
 final class SignModel: ObservableObject {
     @Published var face: SignFace = .handsOff
     @Published var banner = false
     @Published var step = ""
     @Published var show: String?
+    @Published var asking = false
     @Published var seconds = 0
     @Published var note = ""
     var notYet: (() -> Void)?
@@ -3169,7 +3247,8 @@ struct SignCard: View {
             return ("hand.raised.fill", .orange, "Please don\u{2019}t touch the Mac",
                     "Booth Check is getting the lights ready. This sign goes away by itself when it\u{2019}s done.")
         case .password:
-            return ("key.fill", .blue, "Lightkey may need you", passwordSignText(show: model.show))
+            let words = passwordSign(show: model.show, asking: model.asking)
+            return ("key.fill", .blue, words.title, words.text)
         case .ready:
             return ("checkmark.seal.fill", .green, "Ready for the service", "You can use the Mac now.")
         case .needsLook:
@@ -3300,6 +3379,9 @@ final class SignOverlay {
     }
 
     func tick(_ seconds: Int) { model.seconds = seconds }
+
+    /// Whether Lightkey's Authenticate alert is up, for the password banner's words.
+    func setAsking(_ asking: Bool) { if model.asking != asking { model.asking = asking } }
 
     /// Puts a face up, in the middle of the screen over the dimmed backdrop or as a banner along the bottom.
     func present(_ face: SignFace, banner: Bool, step: String) {

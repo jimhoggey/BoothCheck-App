@@ -35,6 +35,28 @@ expect("the banner says to tap Authenticate", named.contains("Authenticate") && 
 expect("it names the chosen show to click in Lightkey's list", named.contains("click BackupChurch_modular_v33"), named)
 expect("with no show chosen, it says to click the most recent project", unnamed.contains("most recent"), unnamed)
 
+// 2c. 1.19: the banner says plainly when Lightkey's Authenticate alert is up, and otherwise how to
+//     find Lightkey (church Mac, 9 Oct 2026: nothing on screen until someone clicked Lightkey).
+let asking = passwordSign(show: "BackupChurch_modular_v30", asking: true)
+let waiting = passwordSign(show: "BackupChurch_modular_v30", asking: false)
+expect("alert up: the title says Lightkey is asking", asking.title.contains("asking for the password"), asking.title)
+expect("alert up: tap Authenticate", asking.text.contains("Authenticate"), asking.text)
+expect("no alert seen: how to find Lightkey", waiting.text.contains("Dock"), waiting.text)
+expect("no alert seen: still names the show", waiting.text.contains("BackupChurch_modular_v30"), waiting.text)
+
+// 2d. Bringing Lightkey to the front when it opened behind something, without fighting anyone.
+let me = "app.boothcheck.BoothCheck"
+func front(_ app: String?, _ tries: Int, _ since: TimeInterval) -> Bool {
+    shouldFrontLightkey(frontmost: app, me: me, attempts: tries, sinceLast: since)
+}
+expect("behind Finder: bring it forward", front("com.apple.finder", 0, 0))
+expect("already in front: leave it", !front(IDs.lightkey, 0, 0))
+expect("macOS's password box in front: never", !front("com.apple.SecurityAgent", 0, 0))
+expect("a permission prompt in front: never", !front("com.apple.UserNotificationCenter", 0, 0))
+expect("Booth Check's own window in front: leave it", !front(me, 0, 0))
+expect("again only after 10 seconds", !front("com.apple.finder", 1, 5) && front("com.apple.finder", 1, 12))
+expect("no more than three times", !front("com.apple.finder", 3, 60))
+
 // 3. Ready for the service: every step went fine, or one warned on the way and every check is green now.
 expect("every step done: ready", startUpReady(steps: [.done, .done, .done], problems: 0, unknown: 0, checks: 12))
 expect("a step warned, every check green now: ready", startUpReady(steps: [.done, .warn, .done], problems: 0, unknown: 0, checks: 12))

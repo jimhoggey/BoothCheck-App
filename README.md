@@ -24,7 +24,10 @@ its window once so whoever sits down sees what to fix.
      accessory, click Allow"; Intel Macs never ask). With an Open DMX USB, Lightkey doesn't load the
      show until someone clicks **Authenticate** and types the Mac's password (it frees the interface
      from the Mac's own FTDI driver), so with Accessibility allowed this step waits for the show, up to
-     two minutes, and says what to do; the MIDI and DMX steps then don't run ahead
+     two minutes, and says what to do; the MIDI and DMX steps then don't run ahead. If Lightkey ends
+     up behind another app (its alert, and the Touch Bar's Authenticate, only show while it's in
+     front), Booth Check brings it forward: at most three times, ten seconds apart, and never over
+     macOS's password box. It also sees when Lightkey's Authenticate alert is up and says so
   4. Wait for Lightkey's MIDI input, which the Stream Deck plugin looks for when it starts
   5. Confirm Lightkey has the DMX interface open (experimental)
   6. Switch App Nap off if it's on, then open Stream Deck in the background, so Lightkey stays in
