@@ -371,6 +371,13 @@ func asksToAuthenticate(pid: pid_t) -> Bool {
     }
 }
 
+/// The `defaults` arguments that switch Lightkey's DontUnloadFTDIDrivers on, or remove it again: the
+/// same command the Terminal test on the church Mac used (9 Oct 2026), and its undo.
+func lightkeyPasswordCommand(on: Bool) -> [String] {
+    on ? ["write", IDs.lightkey, "DontUnloadFTDIDrivers", "-bool", "true"]
+       : ["delete", IDs.lightkey, "DontUnloadFTDIDrivers"]
+}
+
 /// Whether `defaults read` printed a true boolean. A key that isn't set prints nothing on stdout.
 func defaultsSaysOn(_ output: String) -> Bool {
     ["1", "true", "yes"].contains(output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
@@ -940,6 +947,23 @@ final class Booth: ObservableObject {
             armShutdown()
         }
     }
+    /// Lightkey's DontUnloadFTDIDrivers, as last read (each check pass): on, it connects to the DMX
+    /// interface without asking for the Mac's password. Its This Mac switch calls `setLightkeyNoPassword`.
+    @Published var lightkeyNoPassword = defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
+
+    /// Switches Lightkey's DontUnloadFTDIDrivers on or off from This Mac, with the same `defaults`
+    /// command the Terminal test used (no password; it's Lightkey's own setting for this account). The
+    /// switch's description shows the command; the run and its output go in the Log.
+    func setLightkeyNoPassword(_ on: Bool) {
+        let args = lightkeyPasswordCommand(on: on)
+        let r = shell("/usr/bin/defaults", args)
+        changes.insert(LogEntry(title: on ? "This Mac: Lightkey connects without the password" : "This Mac: Lightkey asks for the password again",
+                                language: "Terminal", code: commandLine("/usr/bin/defaults", args),
+                                output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+        lightkeyNoPassword = defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
+        refresh()
+    }
+
     /// Shut the booth down when the charger's power goes off, after a 1-minute warning (see
     /// `powerNext`). Off unless switched on in This Mac.
     @Published var shutdownOnPowerOff: Bool = UserDefaults.standard.bool(forKey: IDs.powerOffKey) {
@@ -1311,6 +1335,7 @@ final class Booth: ObservableObject {
 
         // Only what this Mac is set up for, minus anything muted. Both are counted, never hidden quietly.
         let relevantChecks = out.filter { applies($0.id) }
+        if lightkeyNoPassword != s.lightkeyNoPassword { lightkeyNoPassword = s.lightkeyNoPassword }
         offForThisMac = out.count - relevantChecks.count
         mutedChecks = relevantChecks.filter { muted.contains($0.id) }
         checks = relevantChecks.filter { !muted.contains($0.id) }
@@ -1425,12 +1450,12 @@ final class Booth: ObservableObject {
                 run: { shell("/usr/bin/defaults", args) })
             return
         case .lightkeyNoPassword:
-            let args = ["write", IDs.lightkey, "DontUnloadFTDIDrivers", "-bool", "true"]
+            let args = lightkeyPasswordCommand(on: true)
             pending = PendingChange(
                 key: "lkpass", title: "Lightkey without the password",
                 explanation: "Lightkey normally unloads the Mac\u{2019}s FTDI driver before it takes the DMX interface, and that needs the Mac\u{2019}s password (Authenticate). This hidden Lightkey setting skips that step. On the church Mac, with its Open DMX USB, the lights work with it on and nothing asks (9 Oct 2026). It\u{2019}s saved in Lightkey\u{2019}s settings for this account and survives restarts. Quit Lightkey first, or it applies from the next time Lightkey opens. If the lights ever stop working, run the undo command. No password needed.",
                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
-                undo: commandLine("/usr/bin/defaults", ["delete", IDs.lightkey, "DontUnloadFTDIDrivers"]),
+                undo: commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: false)),
                 run: { shell("/usr/bin/defaults", args) })
             return
         case .makeLoginShow:
@@ -2722,6 +2747,21 @@ struct SetupSheet: View {
                 }
             }
             .toggleStyle(.checkbox)
+            if booth.setup.dmx {
+                // Lightkey's own setting, not Booth Check's: the switch runs the command it shows.
+                Toggle(isOn: Binding(get: { booth.lightkeyNoPassword }, set: { booth.setLightkeyNoPassword($0) })) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Connect without asking for the password").font(.system(size: 12))
+                        Text("Lightkey skips Authenticate (works with the church\u{2019}s Open DMX USB) from the next time it opens. "
+                             + (booth.lightkeyNoPassword ? "Unticking runs: " : "Ticking runs: ")
+                             + commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: !booth.lightkeyNoPassword)))
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                .toggleStyle(.checkbox)
+            }
         }
         .padding(.leading, indent)
     }

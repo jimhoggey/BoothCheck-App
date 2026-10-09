@@ -131,7 +131,10 @@ Intel and Apple silicon alike: it unloads the Mac's FTDI driver first. Its hidde
 `DontUnloadFTDIDrivers` skips that, and on the church Mac with its Open DMX USB the lights work with it
 on and nothing asks (tested 9 October 2026). **Lightkey connects without the password** checks the
 setting, and **Switch it on…** shows the command (`defaults write de.monospc.Lightkey
-DontUnloadFTDIDrivers -bool true`) and its undo before running it. With it on, the start-up's sign
+DontUnloadFTDIDrivers -bool true`) and its undo before running it. The same setting is a checkbox in
+This Mac, under Lightkey's DMX interface: **Connect without asking for the password**. It shows the
+command it will run (`defaults delete …` to undo), needs no Terminal and no password, logs the run,
+and applies from the next time Lightkey opens. With it on, the start-up's sign
 stays on "Please don't touch the Mac" the whole way. Without it, the start-up says to type the
 password, and waits a minute for Lightkey to connect.
 

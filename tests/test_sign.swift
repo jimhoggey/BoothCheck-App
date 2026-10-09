@@ -64,6 +64,14 @@ expect("defaults says true: on", defaultsSaysOn("true"))
 expect("defaults says 0: off", !defaultsSaysOn("0\n"))
 expect("not set (defaults prints an error, nothing on stdout): off", !defaultsSaysOn(""))
 
+// 2f. 1.24: the This Mac switch runs exactly what the Terminal test did, and its undo.
+expect("switch on: defaults write … -bool true",
+       lightkeyPasswordCommand(on: true) == ["write", "de.monospc.Lightkey", "DontUnloadFTDIDrivers", "-bool", "true"],
+       "\(lightkeyPasswordCommand(on: true))")
+expect("switch off: defaults delete …",
+       lightkeyPasswordCommand(on: false) == ["delete", "de.monospc.Lightkey", "DontUnloadFTDIDrivers"],
+       "\(lightkeyPasswordCommand(on: false))")
+
 // 3. Ready for the service: every step went fine, or one warned on the way and every check is green now.
 expect("every step done: ready", startUpReady(steps: [.done, .done, .done], problems: 0, unknown: 0, checks: 12))
 expect("a step warned, every check green now: ready", startUpReady(steps: [.done, .warn, .done], problems: 0, unknown: 0, checks: 12))
