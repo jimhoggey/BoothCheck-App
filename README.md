@@ -110,7 +110,7 @@ the sheet.
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey connects without the password · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running |
-| Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · Low Power Mode off · App Nap off |
+| Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · the screen stays on · Low Power Mode off · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking *(Apple silicon only; Intel Macs don't ask)* · no password after idle (macOS doesn't let apps read these two) |
@@ -125,6 +125,15 @@ So just before opening it, the start-up switches App Nap off if it's still on
 they open, so Stream Deck opened straight after stays awake with no restart; if Stream Deck was
 already open, the step says to quit and reopen it once, and the App Nap row stays orange until it has
 been (it compares when Stream Deck opened with when App Nap was switched off).
+
+**The screen stays on.** With **Stays on for services** switched on and the Mac on the charger,
+Booth Check asks macOS to keep the display awake, the request a video player or Keynote makes
+(`PreventUserIdleDisplaySleep`; the same as `caffeinate -d`). It changes no setting, needs no
+password, ends when Booth Check quits or the Mac goes onto battery, and is logged when it starts and
+stops. Why: on the church Mac the screen was set never to turn off, yet after a while untouched it
+went to the screen saver (on macOS 26 that's the wallpaper, so it looks like the desktop picture),
+and Stream Deck went quiet with it. **The screen stays on** reads the request back from
+`pmset -g assertions`.
 
 **Lightkey asks for the Mac's password** (Authenticate) when it connects to the DMX interface, on
 Intel and Apple silicon alike: it unloads the Mac's FTDI driver first. Its hidden setting
@@ -186,9 +195,12 @@ sign is only for the start-up at login: whoever clicks the button is already at 
    **Shut down now**.
 2. Behind a "Shutting the booth down" sign, **Stream Deck closes**. It has nothing to save, so if
    it hangs it's made to quit after 5 seconds.
-3. **Lightkey closes.** If it asks about saving the show, the sign moves to the bottom of the screen
-   and waits for an answer. It never answers for you. If Lightkey is still open after 2 minutes,
-   Booth Check stops there and the Mac stays on.
+3. **Lightkey closes.** In Live mode, when it's the front app, Lightkey asks "Are you sure you want to
+   quit Lightkey?"; Booth Check presses its **Quit** (Accessibility, the permission it already has
+   for reading the show). Still open after 15 seconds, say asking to save the show, it's made to
+   quit, as Force Quit does: changes since the show opened aren't saved, the same as **Don't Save**,
+   and Booth Check opens the chosen show file next time anyway. Nothing waits for a person. Only if
+   Lightkey survives even that does Booth Check stop and leave the Mac on.
 4. **macOS shuts down** (`tell application "System Events" to shut down`). Any other app can still
    say no, and then the Mac stays on and the sign says so.
 
@@ -251,7 +263,10 @@ It needs nothing installed. It's one universal app for Apple silicon and Intel, 
 7. Work down Booth Check's list until everything is a tick. Then the settings it can't read:
    - On Apple silicon, Privacy & Security → Allow accessories to connect → **Always** (Intel Macs
      don't have it).
-   - Lock Screen → screen saver and "Require password…" → **Never**.
+   - The screen saver → **Never**. On macOS 26 it's under **Wallpaper → Screen Saver… → Start Screen
+     Saver**, not Lock Screen, and it starts after 20 minutes unless changed; earlier macOS has it in
+     Lock Screen. Also Lock Screen → "Require password…" → **Never**. (Booth Check keeps the screen
+     awake anyway; this is the backstop.)
    - Control Centre → Focus → **Do Not Disturb** on.
    - The Stream Deck app's own **Launch at login**, off: Booth Check opens it once Lightkey is ready,
      and starting on its own it can beat Lightkey and the keys stay dead.

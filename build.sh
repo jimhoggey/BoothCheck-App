@@ -7,12 +7,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# A Command Line Tools update can leave the default SDK newer than the compiler. Use the first SDK this
-# compiler actually accepts.
+# A Command Line Tools update can leave the default SDK newer than the compiler, or (CLT 27.0, Oct 2026)
+# make SwiftUI's @State a macro whose plugin only ships with Xcode. Use the first SDK this compiler
+# actually builds a SwiftUI view with.
 pick_sdk() {
     local probe
     probe=$(mktemp -d)
-    printf 'import SwiftUI\n' > "$probe/p.swift"
+    printf 'import SwiftUI\nstruct P: View { @State var n = 0; var body: some View { Text("\\(n)") } }\n' > "$probe/p.swift"
     for sdk in "$(xcrun --show-sdk-path 2>/dev/null)" /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
         [ -d "$sdk" ] || continue
         if swiftc -sdk "$sdk" -typecheck "$probe/p.swift" 2>/dev/null; then echo "$sdk"; rm -rf "$probe"; return; fi

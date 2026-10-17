@@ -31,11 +31,28 @@ expect("at the time: now", shutdownDue(now: at, at: at) == .now)
 expect("ten minutes late (it was asleep): still now", shutdownDue(now: date(11, 13, 10), at: at) == .now)
 expect("over half an hour late: missed, wait for the next", shutdownDue(now: date(11, 13, 31), at: at) == .missed)
 
-// 3. Waiting for an app to close: Lightkey may ask about saving the show; never wait for ever.
-expect("closed: done", quitNext(running: false, waited: 1) == .done)
-expect("still closing: wait", quitNext(running: true, waited: 2) == .wait)
-expect("still open after 5 seconds: it may be asking something", quitNext(running: true, waited: 6) == .ask)
-expect("still open after 2 minutes: give up, the Mac stays on", quitNext(running: true, waited: 121) == .giveUp)
+// 3. Waiting for an app to close. 1.25: nothing waits for a person any more (church Mac, Oct 2026:
+//    Lightkey asked "Are you sure you want to quit Lightkey?" and the Mac stayed on). Still open after
+//    its time (Stream Deck 5 s, Lightkey 15 s) it's made to quit; if even that fails, the Mac stays on.
+expect("closed: done", quitNext(running: false, waited: 1, forceAfter: 15) == .done)
+expect("still closing: wait", quitNext(running: true, waited: 2, forceAfter: 15) == .wait)
+expect("Lightkey still open at 10 s: wait (its Quit question gets answered)", quitNext(running: true, waited: 10, forceAfter: 15) == .wait)
+expect("Lightkey still open after 15 s: make it quit", quitNext(running: true, waited: 16, forceAfter: 15) == .force)
+expect("Stream Deck still open after 5 s: make it quit", quitNext(running: true, waited: 6, forceAfter: 5) == .force)
+expect("made to quit and still there 15 s later: give up, the Mac stays on", quitNext(running: true, waited: 31, forceAfter: 15) == .giveUp)
+
+// 3b. Which button to press: Quit on Lightkey's own "Are you sure you want to quit Lightkey?", and
+//     nothing else, ever (not Save, Don't Save or Cancel, and nothing on any other question).
+let sure = "Are you sure you want to quit Lightkey?"
+expect("the quit question: press Quit",
+       quitButton(texts: [sure], buttons: ["Quit", "Cancel"], message: sure, quit: "Quit") == 0)
+expect("Quit second in the list: still Quit",
+       quitButton(texts: ["", sure], buttons: ["Cancel", "Quit"], message: sure, quit: "Quit") == 1)
+expect("a save question: press nothing",
+       quitButton(texts: ["Do you want to save the changes made to the document?"], buttons: ["Save", "Cancel", "Don\u{2019}t Save"],
+                  message: sure, quit: "Quit") == nil)
+expect("the quit question with no Quit button: press nothing",
+       quitButton(texts: [sure], buttons: ["OK", "Cancel"], message: sure, quit: "Quit") == nil)
 
 // 4. Words on the sign and in This Mac.
 expect("countdown 5:00", countdownText(300) == "5:00", countdownText(300))

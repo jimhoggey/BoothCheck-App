@@ -16,6 +16,7 @@ import ApplicationServices
 import CoreMIDI
 import CryptoKit
 import IOKit.ps
+import IOKit.pwr_mgt
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -350,25 +351,58 @@ func macHasBattery() -> Bool {
     }
 }
 
+private func axAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+}
+
+private func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    axAttribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
+}
+
+/// An app's dialogs and its windows' sheets, not the show's own big window (Accessibility).
+private func axQuestions(pid: pid_t) -> [AXUIElement] {
+    let windows = axAttribute(AXUIElementCreateApplication(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
+    return windows.flatMap { window -> [AXUIElement] in
+        let subrole = axAttribute(window, kAXSubroleAttribute) as? String
+        if subrole == kAXDialogSubrole || subrole == kAXSystemDialogSubrole { return [window] }
+        return axChildren(window).filter { axAttribute($0, kAXRoleAttribute) as? String == kAXSheetRole }
+    }
+}
+
 /// Whether an app is showing a button titled Authenticate: Lightkey's alert before it takes the DMX
 /// interface (Accessibility). Only dialogs and sheets are searched, not the show's own big window.
 func asksToAuthenticate(pid: pid_t) -> Bool {
-    func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        var value: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
-    }
-    func children(_ element: AXUIElement) -> [AXUIElement] { attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
     func hasButton(_ element: AXUIElement, depth: Int) -> Bool {
-        if attribute(element, kAXRoleAttribute) as? String == kAXButtonRole,
-           (attribute(element, kAXTitleAttribute) as? String)?.localizedCaseInsensitiveContains("authenticate") == true { return true }
-        return depth > 0 && children(element).contains { hasButton($0, depth: depth - 1) }
+        if axAttribute(element, kAXRoleAttribute) as? String == kAXButtonRole,
+           (axAttribute(element, kAXTitleAttribute) as? String)?.localizedCaseInsensitiveContains("authenticate") == true { return true }
+        return depth > 0 && axChildren(element).contains { hasButton($0, depth: depth - 1) }
     }
-    let windows = attribute(AXUIElementCreateApplication(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
-    return windows.contains { window in
-        let subrole = attribute(window, kAXSubroleAttribute) as? String
-        if subrole == kAXDialogSubrole || subrole == kAXSystemDialogSubrole { return hasButton(window, depth: 3) }
-        return children(window).contains { attribute($0, kAXRoleAttribute) as? String == kAXSheetRole && hasButton($0, depth: 3) }
+    return axQuestions(pid: pid).contains { hasButton($0, depth: 3) }
+}
+
+/// Presses Quit on Lightkey's "Are you sure you want to quit Lightkey?" if it's up (see `quitButton`),
+/// through Accessibility. It's Lightkey's own question, not a macOS security prompt: a sheet on the
+/// show's window with the question and Cancel and Quit (dev Mac, Lightkey 6.0.2, 17 Oct 2026; pressing
+/// Quit there closed Lightkey cleanly). Returns whether it pressed.
+func pressQuitIfAsked(pid: pid_t, message: String, quit: String) -> Bool {
+    func collect(_ element: AXUIElement, depth: Int, texts: inout [String], buttons: inout [AXUIElement]) {
+        let role = axAttribute(element, kAXRoleAttribute) as? String
+        if role == kAXStaticTextRole {
+            texts += [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute].compactMap { axAttribute(element, $0) as? String }
+        }
+        if role == kAXButtonRole { buttons.append(element) }
+        if depth > 0 { axChildren(element).forEach { collect($0, depth: depth - 1, texts: &texts, buttons: &buttons) } }
     }
+    for question in axQuestions(pid: pid) {
+        var texts: [String] = [], buttons: [AXUIElement] = []
+        collect(question, depth: 3, texts: &texts, buttons: &buttons)
+        let titles = buttons.map { axAttribute($0, kAXTitleAttribute) as? String ?? "" }
+        if let i = quitButton(texts: texts, buttons: titles, message: message, quit: quit) {
+            return AXUIElementPerformAction(buttons[i], kAXPressAction as CFString) == .success
+        }
+    }
+    return false
 }
 
 /// The `defaults` arguments that switch Lightkey's DontUnloadFTDIDrivers on, or remove it again: the
@@ -548,13 +582,68 @@ func shutdownDue(now: Date, at: Date, grace: TimeInterval = 30 * 60) -> Shutdown
     now < at ? .notYet : now < at.addingTimeInterval(grace) ? .now : .missed
 }
 
-enum QuitNext: Equatable { case done, wait, ask, giveUp }
+enum QuitNext: Equatable { case done, wait, force, giveUp }
 
-/// While an app closes for the shutdown: done once it's gone; after 5 seconds it may be asking
-/// something (Lightkey, about saving the show); after 2 minutes, give up and leave the Mac on.
-func quitNext(running: Bool, waited: TimeInterval) -> QuitNext {
+/// While an app closes for the shutdown: done once it's gone. Still open after `forceAfter` seconds
+/// (Stream Deck 5, Lightkey 15, by when its quit question has had Quit pressed, so it's probably
+/// asking to save the show) it's made to quit, like Force Quit; still there 15 seconds after that,
+/// give up and leave the Mac on. Nothing waits for a person any more (1.25: on the church Mac,
+/// Lightkey asked "Are you sure you want to quit Lightkey?" and the Mac stayed on).
+func quitNext(running: Bool, waited: TimeInterval, forceAfter: TimeInterval) -> QuitNext {
     if !running { return .done }
-    return waited < 5 ? .wait : waited < 120 ? .ask : .giveUp
+    return waited < forceAfter ? .wait : waited < forceAfter + 15 ? .force : .giveUp
+}
+
+/// Which button to press on a sheet or dialog while Lightkey closes for the shutdown: Quit, and only
+/// on Lightkey's own "Are you sure you want to quit Lightkey?" (`message`). Never Save, Don't Save or
+/// Cancel, and nothing at all on any other question. `texts` and `buttons` are what the sheet shows.
+func quitButton(texts: [String], buttons: [String], message: String, quit: String) -> Int? {
+    guard texts.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == message }) else { return nil }
+    return buttons.firstIndex(of: quit)
+}
+
+/// Lightkey's own words for its quit question and its Quit button, read from Lightkey in the Mac's
+/// language; English if they can't be read. Lightkey 6 asks only in Live mode, when it's the front
+/// app (read from its code, 17 Oct 2026), which is how the booth runs it.
+func lightkeyQuitWords(_ app: URL?) -> (message: String, quit: String) {
+    let bundle = app.flatMap { Bundle(url: $0) }
+    func word(_ key: String, _ english: String) -> String {
+        guard let w = bundle?.localizedString(forKey: key, value: nil, table: nil), w != key, !w.isEmpty else { return english }
+        return w
+    }
+    return (word("QuitConfirmationAlert-MessageText", "Are you sure you want to quit Lightkey?"),
+            word("QuitConfirmationAlert-QuitButton", "Quit"))
+}
+
+/// The name Booth Check's keep-the-screen-on request has in `pmset -g assertions`.
+let screenAssertionName = "Booth Check keeps the booth screen on"
+
+/// Whether Booth Check should keep the screen on: Stays on for services switched on, and on the
+/// charger. On battery (say a power cut) the screen may turn off as usual.
+func keepsScreenOn(alwaysOn: Bool, onAC: Bool) -> Bool { alwaysOn && onAC }
+
+/// Whether `pmset -g assertions` lists Booth Check's keep-the-screen-on request.
+func holdsScreenAssertion(_ output: String) -> Bool {
+    output.split(separator: "\n").contains {
+        $0.contains("PreventUserIdleDisplaySleep") && $0.contains("named: \"\(screenAssertionName)\"")
+    }
+}
+
+/// The screen stays on: Booth Check's keep-the-screen-on request (`keepScreenOn`), as macOS lists it.
+func screenCheck(held: Bool, onAC: Bool) -> Check {
+    let title = "The screen stays on"
+    if held {
+        return Check(id: "screen", group: "Power & sleep", title: title, status: .ok,
+                     detail: "Booth Check keeps the screen awake while it runs on the charger, so the screen saver and lock screen don\u{2019}t start.")
+    }
+    if !onAC {
+        return Check(id: "screen", group: "Power & sleep", title: title, status: .warn,
+                     detail: "On battery, Booth Check lets the screen turn off.", fix: "Plug in the charger.")
+    }
+    return Check(id: "screen", group: "Power & sleep", title: title, status: .fail,
+                 detail: "macOS isn\u{2019}t keeping the screen awake for Booth Check, so the screen saver can start after a while untouched, and Stream Deck with it.",
+                 fix: "Quit and reopen Booth Check. Still red: in Lock Screen, set \u{201C}Start Screen Saver when inactive\u{201D} to Never.",
+                 action: .open(Settings.lockScreen, "Open Lock Screen settings"))
 }
 
 /// The shutdown warning's countdown: "4:59".
@@ -810,6 +899,7 @@ struct Snapshot {
     var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
     var hasBattery = false                  // a laptop, so starting from the charger applies
     var lightkeyNoPassword = false          // Lightkey's DontUnloadFTDIDrivers is on
+    var screenKeptOn = false                // macOS lists Booth Check's keep-the-screen-on request
     var bootValue: String?                  // the firmware setting; nil = not set = factory setting
     var bootReadFailed = false
 }
@@ -985,6 +1075,10 @@ final class Booth: ObservableObject {
     private var busy = false
     /// When Booth Check switched App Nap off, this session. Apps read the setting when they open.
     private var appNapSwitchedOffAt: Date?
+    /// Booth Check's keep-the-screen-on request while it's held (see `keepScreenOn`), and whether
+    /// macOS turned it down (logged once, not every 15 seconds).
+    private var screenAssertion: IOPMAssertionID = 0
+    private var screenAssertionRefused = false
 
     var showName: String? { showPath.map { URL(fileURLWithPath: $0).lastPathComponent } }
 
@@ -1009,6 +1103,7 @@ final class Booth: ObservableObject {
                 }
             }
             s.ac = pmsetSection(pass.sh("Sleep settings", "/usr/bin/pmset", ["-g", "custom"]).out, "AC Power")
+            s.screenKeptOn = holdsScreenAssertion(pass.sh("What keeps the screen on", "/usr/bin/pmset", ["-g", "assertions"]).out)
             s.appNapOff = pass.sh("App Nap setting", "/usr/bin/defaults", ["read", "-g", "NSAppSleepDisabled"])
                 .out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
             s.usb = usbDevices(pass.sh("USB devices", "/usr/sbin/ioreg", ["-p", "IOUSB", "-l", "-w0"]).out)
@@ -1214,6 +1309,7 @@ final class Booth: ObservableObject {
             out.append(Check(id: "sleep", group: "Power & sleep", title: "Never sleeps on the charger", status: .ok,
                              detail: "The Mac and its screen stay awake while on the charger."))
         }
+        out.append(screenCheck(held: s.screenKeptOn, onAC: s.onAC))
 
         let lowPower = s.ac["lowpowermode"]
         out.append(lowPower == nil || lowPower == "0"
@@ -1620,6 +1716,7 @@ extension Booth {
     /// menu bar icon is always current.
     func start() {
         guard timers.isEmpty else { return }
+        keepScreenOn()
         refresh()
         armShutdown()
         watchPower()
@@ -1648,7 +1745,7 @@ extension Booth {
         case "dmx", "dmxLive", "lkpass": return s.lightkey && s.dmx
         case "midi": return s.lightkey && s.streamDeck
         case "deck", "deckapp", "nap": return s.streamDeck
-        case "ac", "sleep", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
+        case "ac", "sleep", "screen", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
         case "selfLogin": return s.alwaysOn || (autoStart && canStartShow)
         case "autoShow": return autoStart && canStartShow
         case "loginShows", "loginShow": return s.alwaysOn && s.lightkey
@@ -1743,6 +1840,7 @@ extension Booth {
 extension Booth {
     /// Called by the 15-second timer. Holds off while a change is waiting for approval.
     func tick() {
+        keepScreenOn()
         if pending == nil { refresh() }
         checkShutdownTime()
         checkPower()
@@ -2202,6 +2300,37 @@ extension Booth {
         }
     }
 
+    /// Keeps the screen on while Stays on for services is switched on and the Mac is on the charger
+    /// (`keepsScreenOn`), with macOS's "keep the display awake" request, the one a video player
+    /// holds. The user asked, 17 Oct 2026: on the church Mac, with the screen set never to turn off,
+    /// it still went to the screen saver after a while untouched, and Stream Deck went with it. It
+    /// changes no setting and ends when Booth Check quits. Starting and stopping it are logged.
+    func keepScreenOn() {
+        let want = keepsScreenOn(alwaysOn: setup.alwaysOn, onAC: onACPower())
+        let code = "IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, \u{201C}\(screenAssertionName)\u{201D})"
+        if want, screenAssertion == 0 {
+            var id: IOPMAssertionID = 0
+            let r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                                IOPMAssertionLevel(kIOPMAssertionLevelOn), screenAssertionName as CFString, &id)
+            if r == kIOReturnSuccess {
+                screenAssertion = id
+                screenAssertionRefused = false
+                changes.insert(LogEntry(title: "Screen: keep it on", language: "macOS", code: code,
+                                        output: "Held while Booth Check runs on the charger. `pmset -g assertions` lists it.", status: 0), at: 0)
+            } else if !screenAssertionRefused {
+                screenAssertionRefused = true
+                changes.insert(LogEntry(title: "Screen: keep it on", language: "macOS", code: code,
+                                        output: "macOS said no (error \(r)).", status: r), at: 0)
+            }
+        } else if !want, screenAssertion != 0 {
+            IOPMAssertionRelease(screenAssertion)
+            screenAssertion = 0
+            changes.insert(LogEntry(title: "Screen: let macOS turn it off again", language: "macOS",
+                                    code: "IOPMAssertionRelease(\u{201C}\(screenAssertionName)\u{201D})",
+                                    output: setup.alwaysOn ? "On battery." : "Stays on for services is switched off.", status: 0), at: 0)
+        }
+    }
+
     /// Hears the moment the power source changes; the 15-second checks back it up.
     func watchPower() {
         powerWasAC = onACPower()
@@ -2244,7 +2373,8 @@ extension Booth {
 
     /// Shuts the booth down (the user asked for it, 6 Oct 2026): first a warning with Not yet (10
     /// seconds from the menu, 5 minutes at the set time, 1 minute when the power goes off), then Stream
-    /// Deck closes, then Lightkey, which may ask about saving the show, then macOS shuts down. Closing
+    /// Deck closes, then Lightkey (its quit question answered, made to quit if it hangs on, see
+    /// `close`), then macOS shuts down. Closing
     /// the apps first also keeps macOS from reopening them at the next login, where they'd race the
     /// start-up. Every step is logged.
     func shutDownBooth(_ reason: ShutdownReason) {
@@ -2285,11 +2415,11 @@ extension Booth {
         closingApps = true
         countdownTimer?.invalidate()
         SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Stream Deck\u{2026}")
-        close(IDs.streamDeck, name: "Stream Deck", canForce: true) { _ in
+        close(IDs.streamDeck, name: "Stream Deck", forceAfter: 5) { _ in
             SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Lightkey\u{2026}")
-            self.close(IDs.lightkey, name: "Lightkey", canForce: false) { closed in
+            self.close(IDs.lightkey, name: "Lightkey", forceAfter: 15) { closed in
                 guard closed else {
-                    return self.stayOn("Lightkey didn\u{2019}t close, so Booth Check stopped there. Shut down from the Apple menu when you\u{2019}re ready.")
+                    return self.stayOn("Lightkey didn\u{2019}t close, even when made to quit, so Booth Check stopped there. Shut down from the Apple menu.")
                 }
                 SignOverlay.shared.present(.shuttingDown, banner: false, step: "Shutting down the Mac\u{2026}")
                 let script = "tell application \"System Events\" to shut down"
@@ -2309,10 +2439,12 @@ extension Booth {
         }
     }
 
-    /// Asks an app to close and waits for it (see `quitNext`). Stream Deck has nothing to save, so if
-    /// it hangs it's made to quit. Lightkey may be asking about saving the show: that's left to
-    /// whoever is there, with the sign moved down out of its way.
-    private func close(_ bundleID: String, name: String, canForce: Bool, then done: @escaping (Bool) -> Void) {
+    /// Asks an app to close and waits for it (see `quitNext`); nothing waits for a person (the user
+    /// asked, 17 Oct 2026). Lightkey's "Are you sure you want to quit Lightkey?" gets Quit pressed
+    /// (`pressQuitIfAsked`). Still open after `forceAfter` seconds, it's made to quit: Stream Deck has
+    /// nothing to save, and for Lightkey that's Don't Save, which the guide says anyway (Booth Check
+    /// always opens the chosen show file).
+    private func close(_ bundleID: String, name: String, forceAfter: TimeInterval, then done: @escaping (Bool) -> Void) {
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
         guard !apps.isEmpty else {
             logShutdown("close \(name)", "It wasn\u{2019}t open.", status: nil)
@@ -2320,23 +2452,33 @@ extension Booth {
         }
         apps.forEach { $0.terminate() }
         let started = Date()
-        var asked = false
+        let words = bundleID == IDs.lightkey ? lightkeyQuitWords(apps.first?.bundleURL) : nil
+        var pressed = false, forced = false
         func look() {
-            switch quitNext(running: apps.contains { !$0.isTerminated }, waited: Date().timeIntervalSince(started)) {
+            let running = apps.contains { !$0.isTerminated }
+            if running, !pressed, !forced, let words,
+               apps.contains(where: { pressQuitIfAsked(pid: $0.processIdentifier, message: words.message, quit: words.quit) }) {
+                pressed = true
+                logShutdown("close \(name)", "\(name) asked \u{201C}\(words.message)\u{201D}, so Booth Check pressed \(words.quit).", status: 0)
+            }
+            switch quitNext(running: running, waited: Date().timeIntervalSince(started), forceAfter: forceAfter) {
             case .done:
-                logShutdown("close \(name)", asked && canForce ? "It didn\u{2019}t close when asked, so it was made to quit." : "Closed.", status: 0)
+                logShutdown("close \(name)", !forced ? "Closed."
+                            : bundleID == IDs.lightkey
+                            ? "It didn\u{2019}t close within \(Int(forceAfter)) seconds (it may have been asking to save the show), so it was made to quit, as Force Quit does. Changes to the show since it opened weren\u{2019}t saved, as with Don\u{2019}t Save."
+                            : "It didn\u{2019}t close within \(Int(forceAfter)) seconds, so it was made to quit, as Force Quit does.",
+                            status: 0)
                 done(true)
             case .wait:
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
-            case .ask:
-                if !asked {
-                    asked = true
-                    if canForce { apps.forEach { $0.forceTerminate() } }
-                    else { SignOverlay.shared.present(.lightkeyOpen, banner: true, step: "Closing \(name)\u{2026}") }
+            case .force:
+                if !forced {
+                    forced = true
+                    apps.forEach { $0.forceTerminate() }
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
             case .giveUp:
-                logShutdown("close \(name)", "Still open after 2 minutes.", status: 1)
+                logShutdown("close \(name)", "Still open, even after being made to quit.", status: 1)
                 done(false)
             }
         }
@@ -3561,8 +3703,8 @@ final class ReplugOverlay {
 
 /// The big sign's faces. While the start-up runs (see `startSign`): hands off, or what Lightkey may
 /// need; then how it ended. While the booth shuts down (see `shutDownBooth`): the countdown with Not
-/// yet, shutting down, Lightkey still open (it may be asking about saving), or the Mac stays on.
-enum SignFace: Equatable { case handsOff, password, ready, needsLook, countdown, shuttingDown, lightkeyOpen, stayedOn }
+/// yet, shutting down, or the Mac stays on.
+enum SignFace: Equatable { case handsOff, password, ready, needsLook, countdown, shuttingDown, stayedOn }
 
 /// What the big sign shows. `banner` puts it along the bottom of the screen instead of the middle;
 /// `show` is the show's name, as Lightkey lists it among its projects; `asking` is Lightkey's
@@ -3607,16 +3749,13 @@ struct SignCard: View {
         case .shuttingDown:
             return ("power", .indigo, "Shutting the booth down",
                     "Please don\u{2019}t touch the Mac. Stream Deck and Lightkey close, then the Mac shuts down.")
-        case .lightkeyOpen:
-            return ("questionmark.circle.fill", .blue, "Lightkey hasn\u{2019}t closed yet",
-                    "If it asks about saving the show, choose Save or Don\u{2019}t Save. Then the Mac shuts down.")
         case .stayedOn:
             return ("exclamationmark.triangle.fill", .orange, "The Mac stays on", model.note)
         }
     }
 
     /// Booth Check is at work, as opposed to saying how something went: the ring keeps pulsing.
-    private var busy: Bool { [.handsOff, .password, .countdown, .shuttingDown, .lightkeyOpen].contains(model.face) }
+    private var busy: Bool { [.handsOff, .password, .countdown, .shuttingDown].contains(model.face) }
     /// The step it's on, with a spinner. The countdown has its buttons instead.
     private var showsStep: Bool { busy && model.face != .countdown }
 

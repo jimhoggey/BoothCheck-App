@@ -8,11 +8,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# Same choice as build.sh: the first SDK this Swift compiler accepts.
+# Same choice as build.sh: the first SDK this Swift compiler builds a SwiftUI view with.
 pick_sdk() {
     local probe
     probe=$(mktemp -d)
-    printf 'import SwiftUI\n' > "$probe/p.swift"
+    printf 'import SwiftUI\nstruct P: View { @State var n = 0; var body: some View { Text("\\(n)") } }\n' > "$probe/p.swift"
     for sdk in "$(xcrun --show-sdk-path 2>/dev/null)" /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
         [ -d "$sdk" ] || continue
         if swiftc -sdk "$sdk" -typecheck "$probe/p.swift" 2>/dev/null; then echo "$sdk"; rm -rf "$probe"; return; fi
