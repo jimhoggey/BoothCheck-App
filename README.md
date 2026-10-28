@@ -21,7 +21,9 @@ its window once so whoever sits down sees what to fix.
      seconds so someone can get to the cable, and **Carry on without it** skips it
   2. Open any other apps, such as ProPresenter
   3. With a Stream Deck: open **Lightkey without the show**, wait for its MIDI input (the Stream
-     Deck plugin looks for it when it starts), switch App Nap off if it's on, open **Stream Deck in
+     Deck plugin looks for it when it starts), with the [deck lights helper](#the-deck-lights-helper)
+     also wait up to 20 seconds for its "Lightkey Feedback" port (logged; it carries on with a
+     warning if it isn't there), switch App Nap off if it's on, open **Stream Deck in
      the background**, and give its plugin 10 seconds to connect. Lightkey sends every cue's state
      once, at the moment the show opens, so the deck is listening by then and its Default key lights
      (tested with the DMX box and a Stream Deck XL, 9 Oct 2026: Lightkey 1.4 s, Stream Deck 2.4 s,
@@ -81,7 +83,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | On this Mac | What Booth Check does |
 |---|---|
 | **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks; switching Lightkey off switches those off too |
-| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready |
+| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check and start-up wait; it ticks itself the first time Booth Check finds the helper installed |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
@@ -109,7 +111,7 @@ the sheet.
 | Group | Checks |
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey connects without the password · Lightkey's MIDI input ready for the Stream Deck |
-| Stream Deck | Stream Deck plugged in · Stream Deck app running |
+| Stream Deck | Stream Deck plugged in · Stream Deck app running · deck lights helper running *(where it's ticked in This Mac)* |
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · the screen stays on · Low Power Mode off · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
 | Updates | macOS won't install updates by itself |
@@ -179,6 +181,33 @@ ports they hold. If the lights respond and this row disagrees, trust the lights.
 **Booth Check keeps itself awake** by opting out of App Nap (`NSAppSleepDisabled` plus a background
 activity), so its checks keep running behind full-screen Lightkey. It has no row of its own: nobody
 could fix anything there, and whether the Mac stays awake is what the Power & sleep checks are for.
+
+### The deck lights helper
+
+The Stream Deck's keys can take their lights from a small helper instead of straight from Lightkey:
+`deck_state_helper` listens to Lightkey's "Lightkey Output", keeps which cues are on, and repeats it
+every half second on its own MIDI port, "Lightkey Feedback", which the deck's keys use as MIDI In.
+Without it the key lights stop following Lightkey; presses still work (they go straight to "Lightkey
+Input"). It sends nothing to Lightkey. It's built and installed from the Lightkey-Skill repo, once per
+Mac, by a tech: `bash install_helper.sh` (also `--status` and `--remove`).
+
+**launchd runs it, not Booth Check**, as a per-user LaunchAgent (`com.c3b.deckstatehelper`): it
+starts at login and is restarted if it stops, so it keeps running while Booth Check is quit or
+updated. Booth Check only watches it. **Deck lights helper running** is green when
+`launchctl print gui/<uid>/com.c3b.deckstatehelper` says `state = running` and CoreMIDI lists a
+source named "Lightkey Feedback". Otherwise it's red, with:
+
+| What it finds | Button | What the button runs (shown first, then Run; no password) |
+|---|---|---|
+| set up in launchd, but not running, or its port missing | **Restart…** | `launchctl kickstart -k gui/<uid>/com.c3b.deckstatehelper` |
+| installed (the plist is in `~/Library/LaunchAgents`), not loaded | **Start…** | `launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.c3b.deckstatehelper.plist` (undo: `launchctl bootout gui/<uid>/com.c3b.deckstatehelper`) |
+| not installed | none: a tech runs `install_helper.sh` | |
+
+A helper started by hand (not through launchd) has the port but doesn't count: it wouldn't come
+back after a restart. Restarting the helper doesn't need Stream Deck restarted: the plugin picks the
+port up again by itself (rig, 28 Oct 2026). The check is under This Mac → Stream Deck → **Deck
+lights helper**; Booth Check ticks it the first time it finds the helper installed, and after that
+it's a plain setting, so a helper that goes missing shows red rather than vanishing.
 
 ## Get the show started
 

@@ -28,6 +28,8 @@ enum IDs {
     static let elgatoVendor = 0x0FD9          // USB vendor ID on every Stream Deck
     static let ftdiVendor = 0x0403            // the chip inside Enttec Open DMX USB and most USB-DMX cables
     static let lightkeyMIDIInput = "Lightkey Input"
+    static let deckHelper = "com.c3b.deckstatehelper"     // the deck lights helper's launchd label
+    static let deckFeedback = "Lightkey Feedback"         // the MIDI source it publishes for the deck's keys
     static let showKey = "showPath"
     static let autoStartKey = "startShowAtLogin"
     static let setupKey = "macSetup"
@@ -54,12 +56,17 @@ struct MacSetup: Codable, Equatable {
     var streamDeck = true       // a Stream Deck controls Lightkey here
     var alwaysOn = true         // stays on for services: power, sleep, updates, login
     var apps: [ExtraApp] = []   // other apps to keep open, such as ProPresenter
+    /// The deck's key lights come from the deck lights helper here. Nil until decided: Booth Check
+    /// switches it on the first time it finds the helper installed (see `deckLightsAutoOn`).
+    var deckLights: Bool? = nil
 
     /// Apps worth offering on a production Mac when they're installed.
     static let knownApps = [("com.renewedvision.propresenter", "ProPresenter")]
 
-    init(lightkey: Bool = true, dmx: Bool = true, streamDeck: Bool = true, alwaysOn: Bool = true, apps: [ExtraApp] = []) {
+    init(lightkey: Bool = true, dmx: Bool = true, streamDeck: Bool = true, alwaysOn: Bool = true, apps: [ExtraApp] = [],
+         deckLights: Bool? = nil) {
         (self.lightkey, self.dmx, self.streamDeck, self.alwaysOn, self.apps) = (lightkey, dmx, streamDeck, alwaysOn, apps)
+        self.deckLights = deckLights
     }
 
     // Setups saved before extra apps existed have no `apps`; offer the installed known apps then.
@@ -70,6 +77,7 @@ struct MacSetup: Codable, Equatable {
         streamDeck = try c.decodeIfPresent(Bool.self, forKey: .streamDeck) ?? true
         alwaysOn = try c.decodeIfPresent(Bool.self, forKey: .alwaysOn) ?? true
         apps = try c.decodeIfPresent([ExtraApp].self, forKey: .apps) ?? MacSetup.suggestedApps(on: false)
+        deckLights = try c.decodeIfPresent(Bool.self, forKey: .deckLights)
     }
 
     static var saved: MacSetup? {
@@ -99,7 +107,8 @@ struct MacSetup: Codable, Equatable {
     }
 
     var summary: String {
-        ([lightkey ? "Lightkey" : nil, lightkey && dmx ? "DMX interface" : nil, streamDeck ? "Stream Deck" : nil]
+        ([lightkey ? "Lightkey" : nil, lightkey && dmx ? "DMX interface" : nil, streamDeck ? "Stream Deck" : nil,
+          lightkey && streamDeck && deckLights == true ? "deck lights helper" : nil]
             + apps.filter(\.on).map(\.name)
             + [alwaysOn ? "stays on for services" : nil]).compactMap { $0 }.joined(separator: ", ")
     }
@@ -316,6 +325,16 @@ final class MIDIWatch {
             return n as String
         }
     }
+
+    /// MIDI sources: what apps send from, such as the deck lights helper's "Lightkey Feedback".
+    func sourceNames() -> [String] {
+        (0..<MIDIGetNumberOfSources()).compactMap { i in
+            var name: Unmanaged<CFString>?
+            guard MIDIObjectGetStringProperty(MIDIGetSource(i), kMIDIPropertyName, &name) == noErr,
+                  let n = name?.takeRetainedValue() else { return nil }
+            return n as String
+        }
+    }
 }
 
 /// Documents (file URLs) and titles of Lightkey's open windows, read through Accessibility.
@@ -491,17 +510,80 @@ func startUpReady(steps: [StepState], problems: Int, unknown: Int, checks: Int) 
 /// (the Stream Deck plugin looks for it when it starts), Stream Deck, and only then the show. Lightkey
 /// sends every cue's state once, the moment a show opens, and opening the show again sends nothing;
 /// a deck that wasn't listening yet showed Default off while it was on (rig-tested, 9 Oct 2026).
-func startUpOrder(lightkey: Bool, dmx: Bool, streamDeck: Bool, apps: [String], checkOnly: Bool) -> [String] {
+/// With the deck lights helper, its "Lightkey Feedback" port too before Stream Deck: the deck's keys
+/// read their lights from it, so it has to be up to hear the states the show sends.
+func startUpOrder(lightkey: Bool, dmx: Bool, streamDeck: Bool, apps: [String], checkOnly: Bool,
+                  deckLights: Bool = false) -> [String] {
     if checkOnly { return ["check"] }
     let deckFirst = lightkey && streamDeck
     var steps: [String] = []
     if lightkey && dmx { steps.append("dmxWait") }
     steps += apps
-    if deckFirst { steps += ["lightkeyApp", "midi", "deck"] }
+    if deckFirst { steps += ["lightkeyApp", "midi"] + (deckLights ? ["deckLights"] : []) + ["deck"] }
     if lightkey { steps.append("lightkey") }
     if lightkey && dmx { steps.append("dmxLink") }
     if streamDeck && !deckFirst { steps.append("deck") }
     return steps + ["check"]
+}
+
+// MARK: - The deck lights helper (pure parts)
+
+// A small command-line helper (Lightkey-Skill repo, tools/deck_state_helper.swift) listens to
+// "Lightkey Output", keeps which cues are on, and repeats it every 0.5 s on its own MIDI source,
+// "Lightkey Feedback", which the deck's keys use as MIDI In. Without it the key lights stop following
+// Lightkey; presses still work, they go straight to "Lightkey Input". launchd runs it for the
+// logged-in user (a tech installs it once with install_helper.sh); Booth Check only watches it and
+// offers Start or Restart, so the helper keeps running while Booth Check is quit or updated.
+
+var deckHelperDomain: String { "gui/\(getuid())" }
+var deckHelperService: String { "\(deckHelperDomain)/\(IDs.deckHelper)" }
+var deckHelperPlist: String { NSHomeDirectory() + "/Library/LaunchAgents/\(IDs.deckHelper).plist" }
+
+/// `launchctl` arguments behind the buttons. All for this user's own launchd: no password.
+/// Restart stops and starts it in one go; the deck picks its port up again by itself (rig, 28 Oct
+/// 2026), so Stream Deck needn't restart. Start loads the installed plist; Stop is Start's undo.
+func deckHelperRestartArgs() -> [String] { ["kickstart", "-k", deckHelperService] }
+func deckHelperStartArgs() -> [String] { ["bootstrap", deckHelperDomain, deckHelperPlist] }
+func deckHelperStopArgs() -> [String] { ["bootout", deckHelperService] }
+
+/// The job's own state ("running", "not running") from `launchctl print` output: the line one tab in.
+/// Deeper blocks have states of their own, and "job state" is something else.
+func launchdJobState(_ output: String) -> String? {
+    for line in output.split(separator: "\n") where line.hasPrefix("\tstate = ") {
+        return line.dropFirst("\tstate = ".count).trimmingCharacters(in: .whitespaces)
+    }
+    return nil
+}
+
+/// Whether to switch the This Mac setting on by itself: never decided here, and the helper's plist is
+/// there. From then on it's a plain setting, so a removed helper shows red instead of vanishing.
+func deckLightsAutoOn(setting: Bool?, installed: Bool, lightkey: Bool, streamDeck: Bool) -> Bool {
+    setting == nil && installed && lightkey && streamDeck
+}
+
+/// "Deck lights helper running": launchd runs it and its "Lightkey Feedback" port is there.
+func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort: Bool) -> Check {
+    let title = "Deck lights helper running"
+    let effect = "so the deck\u{2019}s key lights may not follow Lightkey. Presses still work."
+    if loaded && state == "running" && feedbackPort {
+        return Check(id: "deckLights", group: "Stream Deck", title: title, status: .ok,
+                     detail: "Its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port is there, so the deck\u{2019}s key lights follow Lightkey.")
+    }
+    if loaded {
+        return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
+                     detail: state == "running"
+                        ? "It\u{2019}s running, but its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port isn\u{2019}t there, \(effect)"
+                        : "It\u{2019}s set up but not running (launchd says \u{201C}\(state ?? "no state")\u{201D}), \(effect)",
+                     fix: "Restart it. Stream Deck picks it up again by itself.", action: .restartDeckHelper)
+    }
+    if installed {
+        return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
+                     detail: "It\u{2019}s installed but not started, \(effect)",
+                     fix: "Start it. From then on it starts by itself at every login.", action: .startDeckHelper)
+    }
+    return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
+                 detail: "It isn\u{2019}t installed on this Mac, \(effect)",
+                 fix: "For a tech: run bash install_helper.sh once, from the Summit show\u{2019}s helper folder. If this Mac doesn\u{2019}t use it, untick Deck lights helper in This Mac.")
 }
 
 /// Whether to open Stream Deck now, outside the start-up (the user, 9 Oct 2026: switched on in This
@@ -810,6 +892,7 @@ enum Status {
 
 enum Action {
     case fixAppNap, chooseShow, openShow, launchStreamDeck, lightkeyNoPassword
+    case startDeckHelper, restartDeckHelper
     case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
     case removeLoginItem(LoginItem)
     case removeShowLoginItems
@@ -826,6 +909,8 @@ enum Action {
         case .openShow: return "Open the show"
         case .launchStreamDeck: return "Open Stream Deck"
         case .lightkeyNoPassword: return "Switch it on\u{2026}"
+        case .startDeckHelper: return "Start\u{2026}"
+        case .restartDeckHelper: return "Restart\u{2026}"
         case .allowAccessibility, .allowAutomation: return "Allow access\u{2026}"
         case .makeLoginShow: return "Make it the login show\u{2026}"
         case .addStreamDeckToLogin, .addSelfToLogin: return "Add to login\u{2026}"
@@ -900,6 +985,10 @@ struct Snapshot {
     var hasBattery = false                  // a laptop, so starting from the charger applies
     var lightkeyNoPassword = false          // Lightkey's DontUnloadFTDIDrivers is on
     var screenKeptOn = false                // macOS lists Booth Check's keep-the-screen-on request
+    var deckHelperRead = false              // the deck lights helper was looked at this pass
+    var deckHelperInstalled = false         // its LaunchAgents plist is there
+    var deckHelperLoaded = false            // launchd has the job
+    var deckHelperState: String?            // launchd's state for it: "running", "not running"…
     var bootValue: String?                  // the firmware setting; nil = not set = factory setting
     var bootReadFailed = false
 }
@@ -1086,9 +1175,20 @@ final class Booth: ObservableObject {
         guard !busy else { return }
         busy = true
         let lightkeyPID = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
+        let deckHelperOn = setup.lightkey && setup.streamDeck && setup.deckLights != false
         DispatchQueue.global(qos: .userInitiated).async {
             let pass = Pass()
             var s = Snapshot()
+            // The deck lights helper: switched on here, or not decided yet (then it's looked for).
+            if deckHelperOn {
+                s.deckHelperRead = true
+                s.deckHelperInstalled = FileManager.default.fileExists(atPath: deckHelperPlist)
+                pass.api("Deck lights helper installed", "FileManager: is \(deckHelperPlist) there",
+                         s.deckHelperInstalled ? "Found." : "Not there.")
+                let job = pass.sh("Deck lights helper in launchd", "/bin/launchctl", ["print", deckHelperService])
+                s.deckHelperLoaded = job.code == 0
+                s.deckHelperState = s.deckHelperLoaded ? launchdJobState(job.out) : nil
+            }
             let batt = pass.sh("Power source", "/usr/bin/pmset", ["-g", "batt"]).out
             s.onAC = batt.contains("'AC Power'")
             s.hasBattery = batt.contains("InternalBattery")
@@ -1249,6 +1349,18 @@ final class Booth: ObservableObject {
                              detail: "The Stream Deck app isn\u{2019}t installed on this Mac.",
                              fix: "If this Mac doesn\u{2019}t use a Stream Deck, switch its checks off.",
                              action: .noStreamDeck))
+        }
+        if s.deckHelperRead {
+            if deckLightsAutoOn(setting: setup.deckLights, installed: s.deckHelperInstalled,
+                                lightkey: setup.lightkey, streamDeck: setup.streamDeck) {
+                setup.deckLights = true
+                logSetting("This Mac: deck lights helper found", "It\u{2019}s installed here, so Booth Check now checks it\u{2019}s running (This Mac \u{2192} Stream Deck \u{2192} Deck lights helper).")
+            }
+            let sources = MIDIWatch.shared.sourceNames()
+            pass.api("The deck lights helper's MIDI port", "CoreMIDI: list the MIDI sources",
+                     sources.isEmpty ? "(none)" : sources.joined(separator: "\n"))
+            out.append(deckHelperCheck(installed: s.deckHelperInstalled, loaded: s.deckHelperLoaded, state: s.deckHelperState,
+                                       feedbackPort: sources.contains { $0.localizedCaseInsensitiveContains(IDs.deckFeedback) }))
         }
         // Other apps this Mac keeps open, such as ProPresenter ---------------------------------------
         for app in setup.apps where app.on {
@@ -1554,6 +1666,23 @@ final class Booth: ObservableObject {
                 undo: commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: false)),
                 run: { shell("/usr/bin/defaults", args) })
             return
+        case .restartDeckHelper:
+            let args = deckHelperRestartArgs()
+            pending = PendingChange(
+                key: "deckHelper", title: "Restart the deck lights helper",
+                explanation: "Asks macOS\u{2019}s launchd to stop the deck lights helper and start it again straight away. Its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port comes back within a few seconds, and the Stream Deck picks it up by itself, so Stream Deck doesn\u{2019}t need restarting. The helper only listens to Lightkey; it sends nothing to it, so the lights don\u{2019}t change. No password needed.",
+                language: "Terminal", code: commandLine("/bin/launchctl", args),
+                run: { shell("/bin/launchctl", args) })
+            return
+        case .startDeckHelper:
+            let args = deckHelperStartArgs()
+            pending = PendingChange(
+                key: "deckHelper", title: "Start the deck lights helper",
+                explanation: "Hands the helper a tech installed to macOS\u{2019}s launchd for this account, which starts it now and at every login, and restarts it if it ever stops. It publishes the \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port the deck\u{2019}s key lights follow, and sends nothing to Lightkey. No password needed.",
+                language: "Terminal", code: commandLine("/bin/launchctl", args),
+                undo: commandLine("/bin/launchctl", deckHelperStopArgs()),
+                run: { shell("/bin/launchctl", args) })
+            return
         case .makeLoginShow:
             guard let showPath, let showName else { return }
             let script = makeLoginShowScript(showPath)
@@ -1745,6 +1874,7 @@ extension Booth {
         case "dmx", "dmxLive", "lkpass": return s.lightkey && s.dmx
         case "midi": return s.lightkey && s.streamDeck
         case "deck", "deckapp", "nap": return s.streamDeck
+        case "deckLights": return s.lightkey && s.streamDeck && s.deckLights == true
         case "ac", "sleep", "screen", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
         case "selfLogin": return s.alwaysOn || (autoStart && canStartShow)
         case "autoShow": return autoStart && canStartShow
@@ -1852,7 +1982,8 @@ extension Booth {
     func plannedSteps(checkOnly: Bool = false) -> [BootStep] {
         let apps = setup.apps.filter(\.on)
         let ids = startUpOrder(lightkey: setup.lightkey, dmx: setup.dmx, streamDeck: setup.streamDeck,
-                               apps: apps.map { "app:\($0.bundleID)" }, checkOnly: checkOnly)
+                               apps: apps.map { "app:\($0.bundleID)" }, checkOnly: checkOnly,
+                               deckLights: setup.deckLights == true)
         let show = showName.map { ($0 as NSString).deletingPathExtension }
         return ids.map { id in
             let title: String
@@ -1860,6 +1991,7 @@ extension Booth {
             case "dmxWait": title = "Wait for the DMX interface"
             case "lightkeyApp": title = "Open Lightkey"
             case "midi": title = "Wait for Lightkey to be ready for the Stream Deck"
+            case "deckLights": title = "Wait for the deck lights helper"
             case "deck": title = "Open Stream Deck in the background"
             case "lightkey": title = show.map { "Open \($0) in Lightkey" } ?? "Open Lightkey"
             case "dmxLink": title = "Lightkey connects to the DMX interface"
@@ -2039,6 +2171,26 @@ extension Booth {
             }) { ok in
                 self.setStep(i, ok ? .done : .warn,
                              ok ? "Lightkey\u{2019}s MIDI input is ready." : "Not ready after 45 seconds. Opening Stream Deck anyway.")
+                next()
+            }
+
+        case "deckLights":
+            // launchd starts the helper at login, so it's normally up long before this. It must be
+            // listening before the show opens and sends every cue's state, so wait a little, never for good.
+            let started = Date()
+            poll(every: 0.5, for: 20, {
+                MIDIWatch.shared.sourceNames().contains { $0.localizedCaseInsensitiveContains(IDs.deckFeedback) }
+            }) { ok in
+                let sources = MIDIWatch.shared.sourceNames()
+                self.changes.insert(LogEntry(title: "Start-up: the deck lights helper\u{2019}s MIDI port", language: "macOS API",
+                                             code: "CoreMIDI: list the MIDI sources, every 0.5 s, for up to 20 s",
+                                             output: (ok ? "\u{201C}\(IDs.deckFeedback)\u{201D} found after \(String(format: "%.1f", Date().timeIntervalSince(started))) s."
+                                                         : "\u{201C}\(IDs.deckFeedback)\u{201D} not there after 20 s.")
+                                                + "\nSources: " + (sources.isEmpty ? "(none)" : sources.joined(separator: ", ")),
+                                             status: ok ? 0 : 1), at: 0)
+                self.setStep(i, ok ? .done : .warn,
+                             ok ? "Its \u{201C}\(IDs.deckFeedback)\u{201D} port is there."
+                                : "Not there after 20 seconds, so the deck\u{2019}s key lights may not follow Lightkey (presses still work). Opening Stream Deck anyway.")
                 next()
             }
 
@@ -2792,7 +2944,9 @@ struct SetupSheet: View {
                                detail: booth.setup.lightkey
                                 ? "Controls Lightkey. Checks the deck, its app, and that Lightkey is listening for it."
                                 : "Checks the deck is plugged in and its app is open.",
-                               isOn: $booth.setup.streamDeck) { EmptyView() }
+                               isOn: $booth.setup.streamDeck) {
+                            if booth.setup.streamDeck && booth.setup.lightkey { deckOptions }
+                        }
                         ForEach($booth.setup.apps) { $app in
                             Divider().padding(.leading, indent)
                             AppRow(bundleID: app.bundleID, name: app.name, detail: "Checks it\u{2019}s open.",
@@ -2905,6 +3059,21 @@ struct SetupSheet: View {
                 .toggleStyle(.checkbox)
             }
         }
+        .padding(.leading, indent)
+    }
+
+    /// The deck lights helper: launchd runs it, Booth Check only checks it. Ticked by itself the first
+    /// time Booth Check finds it installed.
+    private var deckOptions: some View {
+        Toggle(isOn: Binding(get: { booth.setup.deckLights == true }, set: { booth.setup.deckLights = $0 })) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Deck lights helper").font(.system(size: 12))
+                Text("The deck\u{2019}s key lights follow Lightkey through a small helper a tech installs once (install_helper.sh). Checks it\u{2019}s running, and waits for it before Stream Deck opens.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .toggleStyle(.checkbox)
         .padding(.leading, indent)
     }
 
