@@ -22,8 +22,9 @@ its window once so whoever sits down sees what to fix.
   2. Open any other apps, such as ProPresenter
   3. With a Stream Deck: open **Lightkey without the show**, wait for its MIDI input (the Stream
      Deck plugin looks for it when it starts), with the [deck lights helper](#the-deck-lights-helper)
-     also wait up to 20 seconds for its "Lightkey Feedback" port (logged; it carries on with a
-     warning if it isn't there), switch App Nap off if it's on, open **Stream Deck in
+     also wait for its "Lightkey Feedback" port (launchd starts the helper at login; not there
+     within 3 seconds, Booth Check starts or restarts it through launchd at once, logged, and waits
+     up to 20 seconds in all, then carries on with a warning), switch App Nap off if it's on, open **Stream Deck in
      the background**, and give its plugin 10 seconds to connect. Lightkey sends every cue's state
      once, at the moment the show opens, so the deck is listening by then and its Default key lights
      (tested with the DMX box and a Stream Deck XL, 9 Oct 2026: Lightkey 1.4 s, Stream Deck 2.4 s,

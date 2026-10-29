@@ -2345,11 +2345,11 @@ extension Booth {
 
         case "deckLights":
             // launchd starts the helper at login, so it's normally up long before this. It must be
-            // listening before the show opens and sends every cue's state, so wait a little, never for good.
+            // listening before the show opens and sends every cue's state: not there within 3 s, Booth
+            // Check starts it through launchd at once, then waits up to 20 s in all, never for good.
             let started = Date()
-            poll(every: 0.5, for: 20, {
-                MIDIWatch.shared.sourceNames().contains { $0.localizedCaseInsensitiveContains(IDs.deckFeedback) }
-            }) { ok in
+            let found = { MIDIWatch.shared.sourceNames().contains { $0.localizedCaseInsensitiveContains(IDs.deckFeedback) } }
+            func finish(_ ok: Bool) {
                 let sources = MIDIWatch.shared.sourceNames()
                 self.changes.insert(LogEntry(title: "Start-up: the deck lights helper\u{2019}s MIDI port", language: "macOS API",
                                              code: "CoreMIDI: list the MIDI sources, every 0.5 s, for up to 20 s",
@@ -2361,6 +2361,12 @@ extension Booth {
                              ok ? "Its \u{201C}\(IDs.deckFeedback)\u{201D} port is there."
                                 : "Not there after 20 seconds, so the deck\u{2019}s key lights may not follow Lightkey (presses still work). Opening Stream Deck anyway.")
                 next()
+            }
+            poll(every: 0.5, for: 3, found) { ok in
+                if ok { return finish(true) }
+                self.kickDeckHelper("Start-up") {
+                    self.poll(every: 0.5, for: 17, found) { finish($0) }
+                }
             }
 
         case "dmxLink":
@@ -2586,21 +2592,30 @@ extension Booth {
             showWindow()
             return
         }
-        let args: [String]
-        switch check.action {
-        case .restartDeckHelper?: args = deckHelperRestartArgs()
-        case .startDeckHelper?: args = deckHelperStartArgs()
-        default: return                                  // not installed: that needs someone to approve it
-        }
+        if case .installDeckHelper? = check.action { return }          // not installed: that needs someone to approve it
         guard deckHelperAutoFix(failingFor: Date().timeIntervalSince(since), fixes: deckHelperFixesAgo) else { return }
+        kickDeckHelper("Deck lights helper stopped working") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
+        }
+    }
+
+    /// Starts the helper through launchd now: kickstart -k when launchd has it, bootstrap when it's
+    /// installed but not loaded, nothing when it isn't installed. Logged, and counted against
+    /// `deckHelperAutoFix`'s limits.
+    func kickDeckHelper(_ why: String, then done: @escaping () -> Void) {
         deckHelperFixes.append(Date())
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = shell("/bin/launchctl", args)
+            let loaded = shell("/bin/launchctl", ["print", deckHelperService]).code == 0
+            let installed = FileManager.default.fileExists(atPath: deckHelperPlist)
+            let args = loaded ? deckHelperRestartArgs() : deckHelperStartArgs()
+            let r = loaded || installed ? shell("/bin/launchctl", args) : nil
             DispatchQueue.main.async {
-                self.changes.insert(LogEntry(title: "Deck lights helper stopped working, so Booth Check \(args[0] == "bootstrap" ? "started" : "restarted") it",
-                                             language: "Terminal", code: commandLine("/bin/launchctl", args),
-                                             output: "\(check.detail)\n\(r.out.isEmpty ? "(no output)" : r.out)", status: r.code), at: 0)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
+                if let r {
+                    self.changes.insert(LogEntry(title: "\(why): Booth Check \(loaded ? "restarted" : "started") the deck lights helper",
+                                                 language: "Terminal", code: commandLine("/bin/launchctl", args),
+                                                 output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+                }
+                done()
             }
         }
     }
