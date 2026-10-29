@@ -1215,6 +1215,8 @@ final class Booth: ObservableObject {
     /// True until someone has confirmed the setup sheet once on this Mac.
     @Published var needsSetup = MacSetup.saved == nil
     @Published var showSetup = false
+    /// Run once This Mac has closed: a change it asked for, whose sheet can't open over it.
+    var afterSetup: (() -> Void)?
     /// Single checks switched off by hand, by check id.
     @Published var muted: Set<String> = Set(UserDefaults.standard.stringArray(forKey: IDs.mutedKey) ?? []) {
         didSet {
@@ -3284,8 +3286,9 @@ struct SetupSheet: View {
             .toggleStyle(.checkbox)
             HStack(spacing: 8) {
                 Button(booth.deckHelperSHA == nil ? "Install\u{2026}" : "Install / update\u{2026}") {
-                    booth.showSetup = false              // the install's own sheet can't open over this one
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { booth.perform(.installDeckHelper) }
+                    // The install's own sheet can't open over this one: it opens once this one has closed.
+                    booth.afterSetup = { booth.perform(.installDeckHelper) }
+                    booth.showSetup = false
                 }
                 .disabled(deckHelperBundled == nil)
                 Text(deckHelperVersions).font(.system(size: 11)).foregroundStyle(.secondary)
@@ -3677,7 +3680,11 @@ struct ContentView: View {
         .sheet(isPresented: $booth.showUpdate) {
             if let release = booth.latest { UpdateSheet(booth: booth, release: release) }
         }
-        .sheet(isPresented: $booth.showSetup) { SetupSheet(booth: booth) }
+        .sheet(isPresented: $booth.showSetup, onDismiss: {
+            let next = booth.afterSetup
+            booth.afterSetup = nil
+            next?()
+        }) { SetupSheet(booth: booth) }
         .onAppear { if booth.needsSetup { booth.showSetup = true } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if booth.pending == nil { booth.refresh() }
