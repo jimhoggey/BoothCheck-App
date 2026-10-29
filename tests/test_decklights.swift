@@ -45,8 +45,7 @@ expect("loaded, not running, says launchd's state", stopped.detail.contains("not
 let notLoaded = check(loaded: false, state: nil, port: false)
 expect("installed, not loaded: red, Start", notLoaded.status == .fail && notLoaded.action?.label == "Start\u{2026}", notLoaded.action?.label ?? "nil")
 let missing = check(installed: false, loaded: false, state: nil, port: false)
-expect("not installed: red, no button", missing.status == .fail && missing.action == nil)
-expect("not installed: tells the tech to run the installer", (missing.fix ?? "").contains("install_helper.sh"), missing.fix ?? "nil")
+expect("not installed: red, Install (1.27)", missing.status == .fail && missing.action?.label == "Install\u{2026}", missing.action?.label ?? "nil")
 expect("not installed but a stale port from somewhere: still red", check(installed: false, loaded: false, state: nil, port: true).status == .fail)
 
 // 3. The commands behind the buttons: user-level launchd, no password.

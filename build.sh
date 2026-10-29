@@ -35,6 +35,9 @@ for arch in arm64 x86_64; do
 done
 lipo -create build/BoothCheck-arm64 build/BoothCheck-x86_64 -output "$APP/Contents/MacOS/BoothCheck"
 cp Info.plist "$APP/Contents/Info.plist"
+# The deck lights helper Booth Check installs: built in the Lightkey-Skill repo (tools/deck_state_helper.swift)
+# and copied here as is; tests/test_deckinstall.swift checks it's that build.
+cp helper/deck_state_helper "$APP/Contents/Resources/deck_state_helper"
 
 swiftc -sdk "$SDK" make_icon.swift -o build/make_icon
 build/make_icon build/icon_1024.png

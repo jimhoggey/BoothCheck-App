@@ -83,7 +83,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | On this Mac | What Booth Check does |
 |---|---|
 | **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks; switching Lightkey off switches those off too |
-| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check and start-up wait; it ticks itself the first time Booth Check finds the helper installed |
+| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check, start-up wait and restarts. Until someone unticks it, it counts as on, so a Mac without the helper shows the row red with **Install…**. **Install / update…** under it installs the helper Booth Check carries |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
@@ -188,20 +188,39 @@ The Stream Deck's keys can take their lights from a small helper instead of stra
 `deck_state_helper` listens to Lightkey's "Lightkey Output", keeps which cues are on, and repeats it
 every half second on its own MIDI port, "Lightkey Feedback", which the deck's keys use as MIDI In.
 Without it the key lights stop following Lightkey; presses still work (they go straight to "Lightkey
-Input"). It sends nothing to Lightkey. It's built and installed from the Lightkey-Skill repo, once per
-Mac, by a tech: `bash install_helper.sh` (also `--status` and `--remove`).
+Input"). It sends nothing to Lightkey. It's built in the Lightkey-Skill repo
+(`tools/deck_state_helper.swift`) and **Booth Check carries a copy** (`helper/deck_state_helper`, put in
+the app by `build.sh`; the tests check it's the Summit show's build and that Booth Check starts it with
+the show's rules from `install_helper.sh`).
 
-**launchd runs it, not Booth Check**, as a per-user LaunchAgent (`com.c3b.deckstatehelper`): it
-starts at login and is restarted if it stops, so it keeps running while Booth Check is quit or
-updated. Booth Check only watches it. **Deck lights helper running** is green when
-`launchctl print gui/<uid>/com.c3b.deckstatehelper` says `state = running` and CoreMIDI lists a
-source named "Lightkey Feedback". Otherwise it's red, with:
+**Install it from Booth Check**: This Mac → Stream Deck → **Install / update…**, or **Install…** on the
+red row. The sheet shows the whole script before Run, no password: it stops any older copy (and one
+started by hand, which would hold the helper's lock), copies the helper to `~/Library/Application
+Support/DeckStateHelper/`, removes the quarantine flag, writes the LaunchAgent
+`~/Library/LaunchAgents/com.c3b.deckstatehelper.plist` (start at login, KeepAlive, restart within 2 s,
+log to `~/Library/Logs/DeckStateHelper.log`) and starts it. Then it watches the log for up to 6
+seconds: the install only counts when launchd says `running` and the log shows the helper started with
+all its `--alias` rules (an older helper ignores them without a word); otherwise the sheet says what
+went wrong. Booth Check then restarts Stream Deck, if it's open, so the keys connect to the new port.
+This Mac shows which version is installed and which one Booth Check carries.
 
-| What it finds | Button | What the button runs (shown first, then Run; no password) |
+**launchd runs it, not Booth Check**, so it keeps running while Booth Check is quit or updated.
+**Deck lights helper running** is green when `launchctl print gui/<uid>/com.c3b.deckstatehelper` says
+`state = running` and CoreMIDI lists a source named "Lightkey Feedback". Otherwise it's red, quoting the
+last line of the helper's log, with:
+
+| What it finds | Button | What runs (shown first, then Run; no password) |
 |---|---|---|
 | set up in launchd, but not running, or its port missing | **Restart…** | `launchctl kickstart -k gui/<uid>/com.c3b.deckstatehelper` |
 | installed (the plist is in `~/Library/LaunchAgents`), not loaded | **Start…** | `launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.c3b.deckstatehelper.plist` (undo: `launchctl bootout gui/<uid>/com.c3b.deckstatehelper`) |
-| not installed | none: a tech runs `install_helper.sh` | |
+| not installed | **Install…** | the install above |
+
+**Booth Check fixes it by itself.** When the row has been red for 10 seconds (launchd restarts a crash
+within 2 on its own), Booth Check runs the Restart or Start command itself and logs it. It does that at
+most once a minute and 3 times in 30 minutes, because every restart makes the deck's port again and
+many in a row lose the deck until Stream Deck restarts (rig, 28 Oct 2026). After the third, it stops,
+the row says what to do, and Booth Check opens its window once so someone sees it. It never installs
+by itself.
 
 A helper started by hand (not through launchd) has the port but doesn't count: it wouldn't come
 back after a restart. Restarting the helper doesn't need Stream Deck restarted: the plugin picks the
