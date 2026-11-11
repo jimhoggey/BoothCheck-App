@@ -395,3 +395,8 @@ open "build/Booth Check.app" --args --login
 It builds, checks the built app carries that version, pushes, and publishes release `v<version>`
 with the zip attached. Every copy of Booth Check offers it within six hours, or straight away from
 Check for updates.
+
+---
+
+Made by [Fynn Projects](https://www.fynnprojects.com.au), custom apps for church production teams,
+trades and small businesses.
