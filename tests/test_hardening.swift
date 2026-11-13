@@ -97,5 +97,12 @@ _ = iconPass(w, shown: false)
 r = iconPass(iconPass(w, shown: false).watch, shown: false)
 expect("gone again later: one more try", r.reinsert)
 
+// 1.31: SwiftUI writing the same isInserted back must not be stored (it looped the main thread).
+expect("same value: not stored", !menuIconWriteNeeded(true, current: true) && !menuIconWriteNeeded(false, current: false))
+expect("a real change: stored", menuIconWriteNeeded(false, current: true) && menuIconWriteNeeded(true, current: false))
+expect("first 30 s: just Checking…", checkingTitle(waited: 29, waitingFor: "/usr/sbin/ioreg") == "Checking\u{2026}")
+expect("after 30 s: says what it waits for", checkingTitle(waited: 31, waitingFor: "/usr/sbin/ioreg -p IOUSB") == "Still checking after 31 s: waiting for \u{201C}/usr/sbin/ioreg -p IOUSB\u{201D}",
+       checkingTitle(waited: 31, waitingFor: "/usr/sbin/ioreg -p IOUSB"))
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

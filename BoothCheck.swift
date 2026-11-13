@@ -60,6 +60,10 @@ struct MacSetup: Codable, Equatable {
     /// switches it on the first time it finds the helper installed (see `deckLightsAutoOn`) or installs
     /// it; until then it's checked as on, so a Mac without the helper shows it red with Install….
     var deckLights: Bool? = nil
+    /// Send diagnostics (events and the scrubbed log) to the developer through Aptabase (1.31; on by
+    /// default, the owner chose "everything, always"). Off: nothing is queued or sent; the log on disk
+    /// is still written.
+    var diagnostics = true
 
     /// Apps worth offering on a production Mac when they're installed.
     static let knownApps = [("com.renewedvision.propresenter", "ProPresenter")]
@@ -79,6 +83,7 @@ struct MacSetup: Codable, Equatable {
         alwaysOn = try c.decodeIfPresent(Bool.self, forKey: .alwaysOn) ?? true
         apps = try c.decodeIfPresent([ExtraApp].self, forKey: .apps) ?? MacSetup.suggestedApps(on: false)
         deckLights = try c.decodeIfPresent(Bool.self, forKey: .deckLights)
+        diagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnostics) ?? true
     }
 
     static var saved: MacSetup? {
@@ -181,11 +186,24 @@ struct LogEntry: Identifiable {
     let status: Int32?          // exit code; nil when nothing was executed as code
 }
 
+/// What the running check pass is reading right now, for a first pass that takes long (`checkingTitle`).
+final class PassProgress {
+    static let shared = PassProgress()
+    private let lock = NSLock()
+    private var current: String?
+    var now: String? {
+        get { lock.lock(); defer { lock.unlock() }; return current }
+        set { lock.lock(); current = newValue; lock.unlock() }
+    }
+}
+
 /// Collects what one check pass read, so the Log can show it.
 final class Pass {
     var entries: [LogEntry] = []
 
     func sh(_ title: String, _ path: String, _ args: [String]) -> (out: String, code: Int32) {
+        PassProgress.shared.now = commandLine(path, args)
+        defer { PassProgress.shared.now = nil }
         let r = shell(path, args)
         entries.append(LogEntry(title: title, language: "Terminal", code: commandLine(path, args),
                                 output: r.out, status: r.code))
@@ -498,6 +516,16 @@ func hiddenStatusItemKeys(_ defaults: [String: Any]) -> [String] {
 
 /// Whether Booth Check's own menu bar icon is showing: its status bar window exists, has a size, and
 /// sits on a screen.
+/// Whether SwiftUI's write to MenuBarExtra's isInserted should be stored: only when it changes. Storing
+/// every write republishes Booth and loops the main thread (see `BoothCheckApp.body`).
+func menuIconWriteNeeded(_ new: Bool, current: Bool) -> Bool { new != current }
+
+/// The header's words while the first pass hasn't finished: after 30 s it says what it's waiting for.
+func checkingTitle(waited: TimeInterval, waitingFor: String?) -> String {
+    guard waited >= 30 else { return "Checking\u{2026}" }
+    return "Still checking after \(Int(waited)) s" + (waitingFor.map { ": waiting for \u{201C}\($0)\u{201D}" } ?? "")
+}
+
 func menuIconShown(windowFound: Bool, frame: CGRect, screens: [CGRect]) -> Bool {
     windowFound && frame.width > 0 && frame.height > 0 && screens.contains { $0.intersects(frame) }
 }
@@ -721,23 +749,36 @@ struct DMXLadder: Equatable {
     var hupSent = false         // ever, for the summary
     var resetPressed = false
     var relaunches = 0
+    var unconfirmed = false     // stopped without restarting: no evidence olad missed the box
 }
 
-enum DMXRung: Equatable { case held, noLightkey, noBox, waitForPassword, hup(pid_t), skipHup, resetOutput, skipReset, relaunch, giveUp }
+enum DMXRung: Equatable { case held, noLightkey, noBox, waitForPassword, hup(pid_t), skipHup, resetOutput, skipReset, relaunch, giveUp, unconfirmed }
 
 /// The DMX link step's next move. Held: done. Box on neither USB plane: nothing to reconnect (that's
 /// the replug sign's job). Lightkey asking for the password: wait for the person. Otherwise, in
 /// order: SIGHUP to olad (it reloads its plugins and scans again), Lightkey's Reset DMX Output
 /// (Accessibility), restarting Lightkey, at most `maxRelaunches` times per start-up; then give up.
+/// The "held" check is experimental, so restarting Lightkey (the lights go dark) needs positive
+/// evidence that olad hasn't got the box (`dmxRelaunchJustified`); without it the ladder stops at
+/// `.unconfirmed` and nothing is restarted.
 func dmxLadderNext(boxPresent: Bool, held: Bool, lightkeyRunning: Bool, oladPID: pid_t?, asking: Bool,
-                   accessibility: Bool, ladder: DMXLadder, maxRelaunches: Int = 2) -> DMXRung {
+                   accessibility: Bool, ladder: DMXLadder, olaFound: Int?, suspect: Bool, maxRelaunches: Int = 2) -> DMXRung {
     if held { return .held }
     if !lightkeyRunning { return .noLightkey }
     if !boxPresent { return .noBox }
     if asking { return .waitForPassword }
     if !ladder.hupTried { return oladPID.map { .hup($0) } ?? .skipHup }
     if !ladder.resetTried { return accessibility ? .resetOutput : .skipReset }
+    guard dmxRelaunchJustified(olaFound: olaFound, oladRunning: oladPID != nil, suspect: suspect) else { return .unconfirmed }
     return ladder.relaunches < maxRelaunches ? .relaunch : .giveUp
+}
+
+/// Whether restarting Lightkey for the DMX link is backed by evidence, not just the experimental
+/// "is holding the interface" check: olad's log says "Found 0 FTDI devices", or olad isn't running,
+/// or the link was suspect (olad started before the box appeared, or macOS reopened Lightkey). An
+/// OLA log that found a device, or says nothing, isn't enough.
+func dmxRelaunchJustified(olaFound: Int?, oladRunning: Bool, suspect: Bool) -> Bool {
+    olaFound == 0 || !oladRunning || suspect
 }
 
 /// What the recovery did, in plain words, for the step's warning.
@@ -769,7 +810,7 @@ func dmxRowFix(oladPID: pid_t?, sinceReconnect: TimeInterval?) -> DMXRowFix {
 
 /// What Booth Check is fixing by itself, for the big sign (see `selfRepairWords`).
 enum SelfRepair: Equatable {
-    case dmxNotConnected, dmxAskingOlad, dmxResetOutput, dmxRestarting(Int), dmxConnected, dmxFailed, dmxReconnectFailed
+    case dmxNotConnected, dmxAskingOlad, dmxResetOutput, dmxRestarting(Int), dmxConnected, dmxFailed, dmxReconnectFailed, dmxUnconfirmed
     case deckReopening, deckReopened, deckRestarting, deckRestarted, deckFailed
     case helperRestarting, helperRestarted, helperFailed
 }
@@ -786,6 +827,7 @@ func selfRepairWords(_ r: SelfRepair) -> (title: String, detail: String) {
     case .dmxFailed: return ("Couldn\u{2019}t reconnect the lights", "Unplug the blue DMX box\u{2019}s USB cable and plug it back in.")
     case .dmxReconnectFailed:
         return ("The lights still aren\u{2019}t connected", "Open Booth Check and click Restart Lightkey\u{2026} (the lights go dark for about 20 seconds).")
+    case .dmxUnconfirmed: return ("Couldn\u{2019}t confirm the lights are connected", "If the lights respond, all is well.")
     case .deckReopening: return ("Stream Deck closed", "Opening it again\u{2026}")
     case .deckReopened: return ("Stream Deck is open again", "Its keys work again.")
     case .deckRestarting: return ("Restarting Stream Deck", "So its keys start clean.")
@@ -796,6 +838,8 @@ func selfRepairWords(_ r: SelfRepair) -> (title: String, detail: String) {
     case .helperFailed: return ("Couldn\u{2019}t restart the deck lights helper", "The keys still work. Open Booth Check to see what\u{2019}s wrong.")
     }
 }
+
+let olaLogPath = NSHomeDirectory() + "/Library/Logs/Lightkey OLA.log"
 
 /// The last "Found N FTDI devices" line in olad's log (`~/Library/Logs/Lightkey OLA.log`).
 func olaFoundDevices(_ log: String) -> (count: Int, line: String)? {
@@ -1600,11 +1644,28 @@ final class Booth: ObservableObject {
     @Published var loginItems: [LoginItem] = []
     @Published var loginRead: LoginRead = .items([])
     @Published var lastChecked: Date?
+    /// "Checking…" until the first pass is in; after 30 s it says what it's waiting for (`watchFirstPass`).
+    @Published var checkingNote = "Checking\u{2026}"
     @Published var message: String?
     @Published var showPath: String? = UserDefaults.standard.string(forKey: IDs.showKey)
     @Published var pending: PendingChange?
     @Published var lastPass: [LogEntry] = []
-    @Published var changes: [LogEntry] = []
+    /// Every change and start-up step, newest first: each new one also goes to the log on disk in
+    /// full (`logNewChanges`), and only the newest 500 stay in memory.
+    @Published var changes: [LogEntry] = [] {
+        didSet { logNewChanges(oldValue) }
+    }
+    /// Diagnostics (1.31): the last definite check results and since when each has been failing, the
+    /// checks whose incident went, the pass log's state, each start-up step's start, and more.
+    var diagBaseline: [Check]?
+    var diagFailingSince: [String: Date] = [:]
+    var diagIncidentSent: Set<String> = []
+    var lastPassSignature: String?
+    var lastFullPass: Date?
+    var stepStartedAt: [Int: Date] = [:]
+    var diagReplugShown = false
+    var diagStartupDone = false
+    var shutdownStartedAt: Date?
 
     @Published var latest: Release?
     @Published var updateStatus = ""
@@ -1651,6 +1712,9 @@ final class Booth: ObservableObject {
     var dmxFirstSeen: Date?
     var dmxSeenAtStart = false
     var dmxLadder = DMXLadder()
+    /// The current DMX link was suspect (see `dmxLinkSuspect`; or macOS reopened Lightkey), which
+    /// justifies restarting Lightkey without olad's log saying it found nothing (`dmxRelaunchJustified`).
+    var dmxSuspect = false
     var dmxReconnectAt: Date?
     var dmxRestartingByHand = false
     var lastDMXPresent: Bool?
@@ -2186,6 +2250,7 @@ final class Booth: ObservableObject {
         offForThisMac = out.count - relevantChecks.count
         mutedChecks = relevantChecks.filter { muted.contains($0.id) }
         checks = relevantChecks.filter { !muted.contains($0.id) }
+        diagPass(pass.entries, checks)
         lastPass = pass.entries
         lastChecked = Date()
         settleStartUp()
@@ -2462,6 +2527,7 @@ final class Booth: ObservableObject {
         let entry = LogEntry(title: change.title, language: change.language, code: change.code,
                              output: r.out.isEmpty ? "(no output)" : r.out, status: r.code)
         changes.insert(entry, at: 0)
+        diagEvent("change_run", ["key": .string(change.key), "code": .int(Int(r.code))])
         if change.key == "appnap", r.code == 0 { appNapSwitchedOffAt = Date() }
         if change.key == "dmxReconnect", r.code == 0 { watchDMXReconnect() }
         if change.key == "dmxRestart" { DispatchQueue.main.async { self.restartLightkeyForDMX() } }
@@ -2512,7 +2578,7 @@ extension Booth {
     /// Before the first pass, and when nothing applies (nothing switched on under This Mac, or
     /// everything muted), the window and the menu bar say so the same way rather than show a tick.
     private var idle: (symbol: String, title: String)? {
-        if lastChecked == nil { return ("hourglass", "Checking\u{2026}") }
+        if lastChecked == nil { return ("hourglass", checkingNote) }
         if checks.isEmpty { return ("circle.dashed", "Nothing to check on this Mac") }
         return nil
     }
@@ -2542,6 +2608,7 @@ extension Booth {
         guard timers.isEmpty else { return }
         keepScreenOn()
         refresh()
+        watchFirstPass()
         armShutdown()
         watchPower()
         watchLightkeyLaunches()
@@ -2552,6 +2619,28 @@ extension Booth {
         }
         for t in [checks, updates] { RunLoop.main.add(t, forMode: .common) }
         timers = [checks, updates]
+    }
+
+    /// Every 5 s until the first pass is in: past 30 s, the header says what it's waiting for, and the
+    /// Log says so once. (On the main thread: the pass's main-thread part, AppleScript included, can
+    /// only be named by what it read last.)
+    func watchFirstPass() {
+        let began = Date()
+        var logged = false
+        let t = Timer(timeInterval: 5, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            guard self.lastChecked == nil else { self.checkingNote = "Checking\u{2026}"; return timer.invalidate() }
+            let waited = Date().timeIntervalSince(began)
+            let what = PassProgress.shared.now ?? (self.busy ? "the checks that run on the main thread" : "the next check pass")
+            let note = checkingTitle(waited: waited, waitingFor: what)
+            if note != self.checkingNote { self.checkingNote = note }
+            if waited >= 30 && !logged {
+                logged = true
+                self.changes.insert(LogEntry(title: "The first check is taking long", language: "Booth Check", code: "Waiting for: \(what)",
+                                             output: note, status: 1), at: 0)
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
     }
 
     /// Someone who opens the window wants the screen, so the hands-off sign gives way.
@@ -2658,6 +2747,7 @@ extension Booth {
     /// Booth Check's own settings go in the Log too, so a silenced check can always be traced.
     func logSetting(_ title: String, _ output: String) {
         changes.insert(LogEntry(title: title, language: "Booth Check setting", code: title, output: output, status: nil), at: 0)
+        diagEvent("setting", ["key": .string(title), "value": .string(output)])
     }
 }
 
@@ -2681,6 +2771,7 @@ extension Booth {
         DispatchQueue.main.async {
             guard !self.menuIconInserted, !self.reinsertingIcon else { return }
             self.menuIconInserted = true
+            self.diagEvent("self_repair", ["what": .string("menu_icon"), "why": .string("taken out of the menu bar"), "result": .string("put back")])
             self.changes.insert(LogEntry(title: "Menu bar icon: put back", language: "macOS API",
                                          code: "MenuBarExtra isInserted false \u{2192} true",
                                          output: "The icon had been taken out of the menu bar, so Booth Check put it back.",
@@ -2707,6 +2798,7 @@ extension Booth {
             self.reinsertingIcon = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let (back, about) = self.menuIconState()
+                self.diagEvent("self_repair", ["what": .string("menu_icon"), "why": .string("missing two checks running"), "result": .string(back ? "shown" : "still missing")])
                 self.changes.insert(LogEntry(title: "Menu bar icon: re-inserted (missing two checks running)", language: "macOS API",
                                              code: "MenuBarExtra isInserted true \u{2192} false \u{2192} true",
                                              output: (back ? "Shown again. " : "Still not shown. ") + about, status: back ? 0 : 1), at: 0)
@@ -2785,6 +2877,7 @@ extension Booth {
         let info: [RunningAppInfo] = running.map { ($0.bundleIdentifier, $0.localizedName ?? $0.bundleIdentifier ?? "pid \($0.processIdentifier)", $0.activationPolicy == .regular) }
         let open = otherRegularApps(info, selfID: Bundle.main.bundleIdentifier, skip: ["com.apple.finder"]).map { info[$0].name }
         lightkeyReopenedByMacOS = isRunning(IDs.lightkey)
+        diagEvent("apps_open_at_login", ["apps": .string(open.joined(separator: ",")), "lightkey_reopened": .int(lightkeyReopenedByMacOS ? 1 : 0)])
         changes.insert(LogEntry(title: "Start-up: apps already open when the start-up began", language: "macOS API",
                                 code: "NSWorkspace: list the running apps with a Dock icon (not Finder, not Booth Check)",
                                 output: (open.isEmpty ? "None." : "Already open when the start-up began: " + open.joined(separator: ", ") + ".")
@@ -2814,6 +2907,9 @@ extension Booth {
         dmxFirstSeen = nil
         dmxSeenAtStart = false
         dmxLadder = DMXLadder()
+        dmxSuspect = false
+        stepStartedAt = [:]
+        diagReplugShown = false
         frontAttempts = 0
         lastFront = nil
         SignOverlay.shared.setAsking(false)
@@ -2849,10 +2945,17 @@ extension Booth {
         if let detail { bootSteps[i].detail = detail }
         let at = bootStartedAt.map { String(format: "+%6.1f s", Date().timeIntervalSince($0)) } ?? "?"
         bootTimeline.append("\(at)  \(i + 1). \(bootSteps[i].title): \(state)" + (detail.map { " \u{2014} \($0)" } ?? ""))
-        if state != .running {
+        if state == .running {
+            if stepStartedAt[i] == nil { stepStartedAt[i] = Date() }
+        } else {
             changes.insert(LogEntry(title: "Start-up \(i + 1): \(bootSteps[i].title)", language: "Start-up",
                                     code: bootSteps[i].title, output: bootSteps[i].detail ?? "Done.",
                                     status: state == .done ? 0 : 1), at: 0)
+            let began = stepStartedAt.removeValue(forKey: i) ?? Date()
+            diagEvent("startup_step", ["step": .string(bootSteps[i].id),
+                                       "result": .string(state == .done ? "done" : state == .warn ? "warn" : "failed"),
+                                       "seconds": .double((Date().timeIntervalSince(began) * 10).rounded() / 10),
+                                       "detail": .string(bootSteps[i].detail ?? "")])
         }
     }
 
@@ -2904,6 +3007,7 @@ extension Booth {
                       self.bootSteps[i].state == .running else { return }
                 self.setStep(i, .running, "Not found yet: unplug the DMX box\u{2019}s USB cable and plug it back in.")
                 ReplugOverlay.shared.show { skipped = true }
+                self.diagReplugShown = true
                 self.updateSign()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: ask)
@@ -3199,6 +3303,7 @@ extension Booth {
                 self.showWorkingSign(.deckRestarting)
                 self.restartStreamDeck(during: "Lightkey started") { result in
                     let ok = result.state == .done
+                    self.diagEvent("self_repair", ["what": .string("streamdeck_restart"), "why": .string("Lightkey started"), "result": .string(ok ? "ok" : "failed")])
                     self.endWorkingSign(ok ? .deckRestarted : .deckFailed, ok: ok)
                 }
             }
@@ -3219,6 +3324,7 @@ extension Booth {
         // Give it a moment to come up before the sign says it's back.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             let ok = result.opened && self.isRunning(IDs.streamDeck)
+            self.diagEvent("self_repair", ["what": .string("streamdeck_open"), "why": .string("not running"), "result": .string(ok ? "ok" : "failed")])
             self.endWorkingSign(ok ? .deckReopened : .deckFailed, ok: ok)
         }
     }
@@ -3239,6 +3345,9 @@ extension Booth {
             guard !deckHelperAlerted else { return }
             deckHelperAlerted = true
             logSetting("Deck lights helper still not working", "Booth Check restarted it 3 times in 30 minutes and stopped trying, so it opened its window to show the red row.")
+            diag.incident("helper_gave_up", checkIncidentText(check, since: since, entries: lastPass)
+                          + changes.filter { $0.title.localizedCaseInsensitiveContains("deck lights helper") }.prefix(20).reversed().map(diskLogText).joined())
+            diagFlushIfAllowed()
             showWindow()
             return
         }
@@ -3246,6 +3355,7 @@ extension Booth {
         guard deckHelperAutoFix(failingFor: Date().timeIntervalSince(since), fixes: deckHelperFixesAgo) else { return }
         showWorkingSign(.helperRestarting)
         kickDeckHelper("Deck lights helper stopped working") { ok in
+            self.diagEvent("self_repair", ["what": .string("helper_restart"), "why": .string(check.detail), "result": .string(ok ? "ok" : "failed")])
             self.endWorkingSign(ok ? .helperRestarted : .helperFailed, ok: ok)
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
         }
@@ -3296,6 +3406,17 @@ extension Booth {
         starting = false
         bootFinished = true
         if setup.lightkey && setup.dmx { dmxSnapshot("startup-end") }
+        let linked = bootSteps.first { $0.id == "dmxLink" }.map { $0.state == .done } ?? true
+        diagEvent("startup_done", ["ready": .int(bootReady ? 1 : 0), "problems": .int(problemCount),
+                                   "total_s": .int(Int(Date().timeIntervalSince(bootStartedAt ?? Date()))),
+                                   "replug_shown": .int(diagReplugShown ? 1 : 0),
+                                   "dmx_recovery": .string(dmxRecoverySummary(dmxLadder, linked: linked))])
+        if bootSteps.contains(where: { $0.state == .warn || $0.state == .failed }), let began = bootStartedAt {
+            diag.incident("startup", logText(since: began))
+        }
+        diagStartupDone = true
+        // The snapshot above logs a moment later; give it time to queue, then send.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.diagFlushIfAllowed() }
         if dmxRestartingByHand {
             // Restart Lightkey… from the row: the sign said "Restarting Lightkey"; now say how it went.
             dmxRestartingByHand = false
@@ -3398,6 +3519,7 @@ extension Booth {
                 let why = afterRelaunch ? nil
                     : dmxLinkSuspect(lightkeyRunningAtStart: self.lightkeyRunningAtStart, boxSeenAtStart: self.dmxSeenAtStart,
                                      oladStarted: st.olad?.started, boxFirstSeen: self.dmxFirstSeen)
+                self.dmxSuspect = !afterRelaunch && (why != nil || self.lightkeyReopenedByMacOS)
                 if let why {
                     self.changes.insert(LogEntry(title: "Start-up: the DMX link is suspect, so Booth Check reconnects straight away",
                                                  language: "Terminal", code: commandLine("/bin/ps", psDMXArgs),
@@ -3416,7 +3538,10 @@ extension Booth {
     private func dmxLinked(_ i: Int, next: @escaping () -> Void) {
         signDMXLinked = true        // it has the interface, so it's past its password
         setStep(i, .done, dmxLadder.started ? "Lightkey has the interface open. " + dmxLadderTriedText(dmxLadder) : "Lightkey has the interface open.")
-        if dmxLadder.started { endWorkingSign(.dmxConnected, ok: true) }
+        if dmxLadder.started {
+            diagDMXRecovery("held", "connected")
+            endWorkingSign(.dmxConnected, ok: true)
+        }
         next()
     }
 
@@ -3435,9 +3560,11 @@ extension Booth {
         let asking = ax && (lk.map(asksToAuthenticate) ?? false)
         DispatchQueue.global(qos: .userInitiated).async {
             let st = readDMXState(lightkeyPID: lk)
+            let found = (FileManager.default.contents(atPath: olaLogPath)).flatMap { olaFoundDevices(String(decoding: $0, as: UTF8.self)) }
             DispatchQueue.main.async {
                 let rung = dmxLadderNext(boxPresent: st.planes.present, held: st.held, lightkeyRunning: lk != nil,
-                                         oladPID: st.olad?.pid, asking: asking, accessibility: ax, ladder: self.dmxLadder)
+                                         oladPID: st.olad?.pid, asking: asking, accessibility: ax, ladder: self.dmxLadder,
+                                         olaFound: found?.count, suspect: self.dmxSuspect)
                 let elapsed = Date().timeIntervalSince(since)
                 let climb = { self.climbDMXLadder(i, since: since, next: next) }
                 let again = { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { climb() } }
@@ -3483,6 +3610,7 @@ extension Booth {
                         let r = shell("/bin/kill", args)
                         DispatchQueue.main.async {
                             self.dmxLadder.hupSent = self.dmxLadder.hupSent || r.code == 0
+                            self.diagDMXRecovery("sighup", r.code == 0 ? "sent" : "failed")
                             self.changes.insert(LogEntry(title: "DMX recovery: asked olad (pid \(pid)) to look for the interface again", language: "Terminal",
                                                          code: commandLine("/bin/kill", args),
                                                          output: (r.out.isEmpty ? "(no output)" : r.out) + "\nolad reloads its plugins on SIGHUP and scans USB again. Checking for 12 seconds.",
@@ -3500,6 +3628,7 @@ extension Booth {
                     self.setStep(i, .running, "Pressing Lightkey\u{2019}s Reset DMX Output\u{2026}")
                     let r: (pressed: Bool, path: String?) = lk.map { pressMenuItem(pid: $0, matching: isResetDMXOutputTitle) } ?? (pressed: false, path: nil)
                     self.dmxLadder.resetPressed = self.dmxLadder.resetPressed || r.pressed
+                    self.diagDMXRecovery("reset", r.pressed ? "pressed" : r.path == nil ? "not_found" : "not_pressable")
                     self.changes.insert(LogEntry(title: "DMX recovery: Lightkey\u{2019}s Reset DMX Output", language: "macOS API",
                                                  code: "Accessibility: Lightkey\u{2019}s menu bar \u{2192} the item titled \u{201C}Reset DMX Output\u{201D} \u{2192} AXPress",
                                                  output: r.path == nil ? "Not found in Lightkey\u{2019}s menus, so skipped."
@@ -3513,7 +3642,21 @@ extension Booth {
                 case .relaunch:
                     self.relaunchForDMX(i, next: next)
                 case .giveUp:
+                    self.diagDMXRecovery("giveup", "failed")
                     self.failDMXLink(i, "Lightkey didn\u{2019}t take the DMX interface. \(tried) Replug the DMX USB cable, then quit and reopen Lightkey. (This check is experimental: if the lights respond, all is well.)", next: next)
+                case .unconfirmed:
+                    // Task 0 (14 Nov 2026): the "held" check may just be wrong, and olad's log doesn't say
+                    // it missed the box, so Lightkey isn't restarted (the lights would go dark for nothing).
+                    let why = found.map { "olad\u{2019}s log says it found \($0.count) FTDI device\($0.count == 1 ? "" : "s") (\u{201C}\($0.line)\u{201D})" }
+                        ?? "olad\u{2019}s log doesn\u{2019}t say how many FTDI devices it found"
+                    self.logDMX("Booth Check couldn\u{2019}t confirm Lightkey holds the DMX interface, but \(why), and the link wasn\u{2019}t suspect, so it doesn\u{2019}t restart Lightkey.",
+                                code: "Restart Lightkey (not done: no evidence olad missed the interface)", status: 1)
+                    self.dmxLadder.unconfirmed = true
+                    self.diagDMXRecovery("relaunch", "skipped_unconfirmed")
+                    self.setStep(i, .warn, "Couldn\u{2019}t confirm Lightkey has the DMX interface. \(tried) Nothing was restarted, because Lightkey\u{2019}s DMX server says it found the interface. If the lights respond, all is well.")
+                    self.dmxSnapshot("dmxLink-unconfirmed")
+                    self.endWorkingSign(.dmxUnconfirmed, ok: false)
+                    next()
                 }
             }
         }
@@ -3529,6 +3672,7 @@ extension Booth {
     private func relaunchForDMX(_ i: Int, next: @escaping () -> Void) {
         dmxLadder.relaunches += 1
         let n = dmxLadder.relaunches
+        diagDMXRecovery("relaunch\(n)", "started")
         showWorkingSign(.dmxRestarting(n))
         setStep(i, .running, "Restarting Lightkey (try \(n) of 2): it hadn\u{2019}t picked the interface up.")
         dmxSnapshot("before-relaunch-\(n)")     // reads olad's log first: the new Lightkey overwrites it
@@ -3674,6 +3818,12 @@ extension Booth {
                 saved = "Couldn\u{2019}t save it to \(path): \(error.localizedDescription)"
             }
             DispatchQueue.main.async {
+                self.diagEvent("dmx_snapshot", ["reason": .string(reason), "present": .int(st.planes.present ? 1 : 0),
+                                                "planes": .string(st.planes.text), "held": .int(st.held ? 1 : 0),
+                                                "olad_age_s": .int(st.olad?.started.map { Int(now.timeIntervalSince($0)) } ?? -1),
+                                                "ola_found": .int(found?.count ?? -1), "file": .string((path as NSString).lastPathComponent)])
+                let failure = ["failed", "timeout", "skipped", "unconfirmed", "relaunch"].contains { reason.contains($0) }
+                if self.dmxLadder.started || failure { self.diag.incident("dmx_\(reason)", text) }
                 self.changes.insert(LogEntry(title: "DMX snapshot (\(reason))", language: "Terminal",
                                              code: ["ioreg -p IOUSB -l -w0", "ioreg -r -c IOUSBHostDevice -l -w0", "ls -l /dev/cu.usbserial*",
                                                     "ps -axo pid,ppid,lstart,etime,args", "cat ~/Library/Logs/Lightkey OLA.log",
@@ -3753,6 +3903,7 @@ extension Booth {
     /// warning, stop.
     func checkPower() {
         let onAC = onACPower()
+        if powerWasAC != onAC { diagEvent("power_change", ["on_ac": .int(onAC ? 1 : 0)]) }
         if powerWasAC && !onAC {
             powerOutage = true
             logShutdown("the power went off", shutdownOnPowerOff
@@ -3787,6 +3938,7 @@ extension Booth {
         guard !shuttingDown, !starting else { return }
         shuttingDown = true
         shutdownReason = reason
+        shutdownStartedAt = Date()
         let warning = shutdownWarning(reason)
         logShutdown(reason == .button ? "someone clicked Shut down the booth" : reason == .timed ? "the set time came" : "the power is off",
                     "A \(countdownText(warning)) warning, with Not yet.", status: nil)
@@ -3834,7 +3986,12 @@ extension Booth {
         let name = { (a: NSRunningApplication) in a.localizedName ?? a.bundleIdentifier ?? "pid \(a.processIdentifier)" }
         guard !apps.isEmpty else {
             logShutdown("quit the other apps", "No other apps were open.", status: nil)
+            diagEvent("apps_quit_at_shutdown", ["apps": .string(""), "stayed": .string("")])
             return done()
+        }
+        let report = { (left: [NSRunningApplication]) in
+            self.diagEvent("apps_quit_at_shutdown", ["apps": .string(apps.map(name).joined(separator: ",")),
+                                                     "stayed": .string(left.map(name).joined(separator: ","))])
         }
         SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing the other apps\u{2026}")
         for a in apps {
@@ -3848,9 +4005,11 @@ extension Booth {
             let left = apps.filter { !$0.isTerminated }
             if left.isEmpty {
                 logShutdown("quit the other apps", "All \(apps.count) closed after \(String(format: "%.1f", Date().timeIntervalSince(started))) s.", status: 0)
+                report(left)
                 return done()
             }
             if Date().timeIntervalSince(started) >= 8 {
+                report(left)
                 logShutdown("quit the other apps",
                             "Still open after 8 seconds: \(left.map(name).joined(separator: ", ")). Carrying on; one asking to save can hold up macOS\u{2019}s shut down.",
                             status: 1)
@@ -3870,19 +4029,32 @@ extension Booth {
                     return self.stayOn("Lightkey didn\u{2019}t close, even when made to quit, so Booth Check stopped there. Shut down from the Apple menu.")
                 }
                 SignOverlay.shared.present(.shuttingDown, banner: false, step: "Shutting down the Mac\u{2026}")
-                let script = "tell application \"System Events\" to shut down"
-                let r = runAppleScript(script)
-                self.changes.insert(LogEntry(title: "Shut down: asked macOS to shut down", language: "AppleScript", code: script,
-                                             output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
-                guard r.code == 0 else {
-                    return self.stayOn("macOS didn\u{2019}t let Booth Check shut it down (\(r.out)). Shut down from the Apple menu.")
+                // Diagnostics: one last send (at most 4 seconds), and the clean-exit marker goes.
+                var went = false
+                let shutDownNow = {
+                    guard !went else { return }
+                    went = true
+                    self.diag.markCleanExit("the booth shuts down")
+                    self.askMacOSToShutDown()
                 }
-                // Booth Check quits with everything else. Still here after a minute: another app said no.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
-                    if self.shuttingDown {
-                        self.stayOn("macOS didn\u{2019}t finish shutting down: another app may be asking something. Shut down from the Apple menu.")
-                    }
-                }
+                if self.setup.diagnostics { self.diag.flush(maxTime: 4) { shutDownNow() } }
+                DispatchQueue.main.asyncAfter(deadline: .now() + (self.setup.diagnostics ? 4.5 : 0)) { shutDownNow() }
+            }
+        }
+    }
+
+    private func askMacOSToShutDown() {
+        let script = "tell application \"System Events\" to shut down"
+        let r = runAppleScript(script)
+        changes.insert(LogEntry(title: "Shut down: asked macOS to shut down", language: "AppleScript", code: script,
+                                output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
+        guard r.code == 0 else {
+            return stayOn("macOS didn\u{2019}t let Booth Check shut it down (\(r.out)). Shut down from the Apple menu.")
+        }
+        // Booth Check quits with everything else. Still here after a minute: another app said no.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+            if self.shuttingDown {
+                self.stayOn("macOS didn\u{2019}t finish shutting down: another app may be asking something. Shut down from the Apple menu.")
             }
         }
     }
@@ -3942,10 +4114,16 @@ extension Booth {
         shuttingDown = false
         SignOverlay.shared.stayedOn(note)
         logShutdown("the Mac stays on", note, status: 1)
+        diag.writeMarker(version: currentVersion)       // still running after all: the marker goes back
+        diag.incident("shutdown_stayed_on", logText(since: shutdownStartedAt ?? Date().addingTimeInterval(-600)))
+        diag.flush()
     }
 
     private func logShutdown(_ what: String, _ output: String, status: Int32?, prefix: String = "Shut down") {
         changes.insert(LogEntry(title: "\(prefix): \(what)", language: prefix, code: what, output: output, status: status), at: 0)
+        if prefix == "Shut down" {
+            diagEvent("shutdown", ["reason": .string("\(shutdownReason)"), "step": .string(what), "detail": .string(output)])
+        }
     }
 
     /// Quits Lightkey the shutdown's way, with no one needed (see `close`), for the DMX recovery.
@@ -4026,11 +4204,17 @@ extension Booth {
             func step(_ s: String) { DispatchQueue.main.async { self.updateSteps.append(s) } }
             func log(_ title: String, _ language: String, _ code: String, _ output: String, _ status: Int32) {
                 let e = LogEntry(title: title, language: language, code: code, output: output, status: status)
-                DispatchQueue.main.async { self.changes.insert(e, at: 0) }
+                DispatchQueue.main.async {
+                    self.changes.insert(e, at: 0)
+                    self.diagEvent("update", ["from": .string(self.currentVersion), "to": .string(r.version),
+                                              "step": .string(title), "result": .string(status == 0 ? "ok" : "failed")])
+                }
             }
             func fail(_ s: String) {
                 try? fm.removeItem(at: work)
                 DispatchQueue.main.async {
+                    self.diagEvent("update", ["from": .string(self.currentVersion), "to": .string(r.version),
+                                              "step": .string("stopped"), "result": .string(s)])
                     self.updateError = s
                     self.updating = false
                 }
@@ -4128,7 +4312,841 @@ extension Booth {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                     self.showUpdate = false
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { exit(0) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                        self.diag.markCleanExit("update to \(r.version) (quit refused, exit)")
+                        exit(0)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - The log on disk and diagnostics (pure parts, tested in tests/test_diagnostics.swift)
+
+/// Where the log, the queue and the clean-exit marker live. Tests point it at a temporary folder.
+struct DiagFiles {
+    var logDir: String
+    var supportDir: String
+    var log: String { logDir + "/BoothCheck.log" }
+    var queue: String { supportDir + "/aptabase-queue.jsonl" }
+    var marker: String { supportDir + "/running.json" }
+    var lastVersion: String { supportDir + "/last-version.txt" }
+    static let standard = DiagFiles(logDir: NSHomeDirectory() + "/Library/Logs/Booth Check",
+                                    supportDir: NSHomeDirectory() + "/Library/Application Support/Booth Check")
+}
+
+func diskTime(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return f.string(from: d)
+}
+
+func indentLines(_ text: String, _ prefix: String) -> String {
+    text.split(separator: "\n", omittingEmptySubsequences: false).map { prefix + $0 }.joined(separator: "\n") + "\n"
+}
+
+/// One Log entry, in full, as it goes into BoothCheck.log.
+func diskLogText(_ e: LogEntry) -> String {
+    "\(diskTime(e.time))  [\(e.language)] \(e.title)" + (e.status.map { "  (status \($0))" } ?? "") + "\n"
+        + indentLines(e.code, "    $ ") + indentLines(e.output, "    > ")
+}
+
+/// Whether a 15-second pass goes into the log in full: the first one, during a start-up, when any
+/// check's status changed, and once an hour. Otherwise it gets one line (`passLogLine`).
+func passLogIsFull(first: Bool, starting: Bool, changed: Bool, sinceLastFull: TimeInterval) -> Bool {
+    first || starting || changed || sinceLastFull >= 3600
+}
+
+func passSignature(_ checks: [Check]) -> String { checks.map { "\($0.id)=\(statusWord($0.status))" }.joined(separator: ",") }
+
+func passLogLine(_ time: Date, problems: Int) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "HH:mm:ss"
+    return "pass \(f.string(from: time)), \(problems) problem\(problems == 1 ? "" : "s"), unchanged\n"
+}
+
+func statusWord(_ s: Status) -> String {
+    switch s { case .ok: return "ok"; case .warn: return "warn"; case .fail: return "fail"; case .unknown: return "unknown"; case .manual: return "manual" }
+}
+
+/// Rotate before writing when the log would pass `limit` (5 MB).
+func logNeedsRotation(size: UInt64, adding: Int, limit: UInt64 = 5_000_000) -> Bool {
+    size > 0 && size + UInt64(adding) > limit
+}
+
+/// Keeping `keep` files in all (the log and .1 to .keep-1): the one to delete, then the renames, in order.
+func logRotationMoves(_ base: String, keep: Int = 5) -> (remove: String, moves: [(from: String, to: String)]) {
+    let name = { (n: Int) in n == 0 ? base : "\(base).\(n)" }
+    return (name(keep - 1), stride(from: keep - 2, through: 0, by: -1).map { (name($0), name($0 + 1)) })
+}
+
+// Scrubbing ------------------------------------------------------------------------------------------
+
+/// What gets taken out of anything sent or saved as diagnostics.
+struct ScrubContext {
+    var home: String
+    var users: [String]         // NSUserName, NSFullUserName
+    var macs: [String]          // the computer name, the host name
+    static func current() -> ScrubContext {
+        let host = ProcessInfo.processInfo.hostName
+        let short = host.hasSuffix(".local") ? String(host.dropLast(6)) : host
+        let name = Host.current().localizedName ?? ""
+        return ScrubContext(home: NSHomeDirectory(), users: [NSFullUserName(), NSUserName()],
+                            macs: [name, host, short, name.replacingOccurrences(of: " ", with: "-")])
+    }
+}
+
+func shortHash(_ s: String) -> String { String(SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined().prefix(6)) }
+
+/// Replaces each match of `pattern`; `f` gets the match and its groups.
+func regexReplace(_ s: String, _ pattern: String, _ f: ([String]) -> String) -> String {
+    guard let re = try? NSRegularExpression(pattern: pattern) else { return s }
+    let ns = s as NSString
+    var out = s as NSString
+    for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)).reversed() {
+        let groups = (0..<m.numberOfRanges).map { m.range(at: $0).location == NSNotFound ? "" : ns.substring(with: m.range(at: $0)) }
+        out = out.replacingCharacters(in: m.range, with: f(groups)) as NSString
+    }
+    return out as String
+}
+
+/// The home folder becomes ~, the user's names <user>, the computer's name <mac>, USB serial numbers
+/// sn: plus the first 6 hex digits of their SHA-256, emails <email>, IPv4 addresses <ip>; lines with
+/// the Mac's own serial number or UUID go.
+func scrub(_ text: String, _ c: ScrubContext) -> String {
+    var s = text.split(separator: "\n", omittingEmptySubsequences: false)
+        .filter { !$0.contains("IOPlatformSerialNumber") && !$0.contains("IOPlatformUUID") }.joined(separator: "\n")
+    if c.home.count > 1 { s = s.replacingOccurrences(of: c.home, with: "~") }
+    s = regexReplace(s, "\"(USB Serial Number|kUSBSerialNumberString|Serial Number)\" = \"(?!sn:)([^\"]*)\"") { "\"\($0[1])\" = \"sn:\(shortHash($0[2]))\"" }
+    s = regexReplace(s, "(usbserial|usbmodem)-(?!sn:)([A-Za-z0-9]+)") { "\($0[1])-sn:\(shortHash($0[2]))" }
+    s = regexReplace(s, "([Ss]erial:? )(?!sn:)([A-Za-z0-9]*[0-9][A-Za-z0-9]*)") { "\($0[1])sn:\(shortHash($0[2]))" }
+    s = regexReplace(s, "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}") { _ in "<email>" }
+    for u in c.users.filter({ $0.count >= 3 }).sorted(by: { $0.count > $1.count }) { s = s.replacingOccurrences(of: u, with: "<user>") }
+    for m in c.macs.filter({ $0.count >= 3 }).sorted(by: { $0.count > $1.count }) { s = s.replacingOccurrences(of: m, with: "<mac>") }
+    s = regexReplace(s, "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b") { _ in "<ip>" }
+    return s
+}
+
+// Aptabase events ------------------------------------------------------------------------------------
+
+/// A prop or system prop value: Aptabase takes strings and numbers in props (isDebug is a bool).
+enum DiagValue: Codable, Equatable {
+    case string(String), int(Int), double(Double), bool(Bool)
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let s): try c.encode(s)
+        case .int(let i): try c.encode(i)
+        case .double(let d): try c.encode(d)
+        case .bool(let b): try c.encode(b)
+        }
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) { self = .string(s) }
+        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
+        else if let i = try? c.decode(Int.self) { self = .int(i) }
+        else { self = .double(try c.decode(Double.self)) }
+    }
+    var text: String {
+        switch self { case .string(let s): return s; case .int(let i): return "\(i)"; case .double(let d): return "\(d)"; case .bool(let b): return "\(b)" }
+    }
+}
+
+/// One event as queued: `id` is only for taking it off the queue; `time` is when it happened.
+struct DiagEvent: Codable, Equatable {
+    var id: String
+    var time: Double
+    var name: String
+    var session: String
+    var system: [String: DiagValue]
+    var props: [String: DiagValue]
+}
+
+/// Cut to at most `max` UTF-16 units, never inside a character.
+func truncateUTF16(_ s: String, _ max: Int) -> String {
+    guard s.utf16.count > max else { return s }
+    var out = "", n = 0
+    for ch in s {
+        let u = String(ch).utf16.count
+        if n + u > max { break }
+        out.append(ch); n += u
+    }
+    return out
+}
+
+/// The event made to pass the server's rules (name ≤ 60, keys 1-40, strings ≤ 170 UTF-16 units of
+/// our 180, values strings or numbers), by truncating, so one bad event never spoils a batch.
+func validDiagEvent(_ e: DiagEvent) -> DiagEvent {
+    var e = e
+    e.name = truncateUTF16(e.name.isEmpty ? "unnamed" : e.name, 60)
+    func fix(_ d: [String: DiagValue], bools: Bool) -> [String: DiagValue] {
+        var out: [String: DiagValue] = [:]
+        for (k, v) in d {
+            let key = truncateUTF16(k.trimmingCharacters(in: .whitespacesAndNewlines), 40)
+            guard !key.isEmpty else { continue }
+            switch v {
+            case .string(let s): out[key] = .string(truncateUTF16(s, 170))
+            case .bool(let b): out[key] = bools ? v : .int(b ? 1 : 0)
+            case .double(let d): out[key] = d.isFinite ? v : .string("\(d)")
+            case .int: out[key] = v
+            }
+        }
+        return out
+    }
+    e.props = fix(e.props, bools: false)
+    e.system = fix(e.system, bools: true)
+    // The server answers 400 for the whole batch when a system prop is too long (live test, 14 Nov 2026:
+    // "Locale must be a string with a maximum length of 10").
+    if case .string(let l)? = e.system["locale"] { e.system["locale"] = .string(aptabaseLocale(l)) }
+    return e
+}
+
+/// "en_US@rg=auzzzz" → "en-US": no @ options, a dash, at most 10 characters.
+func aptabaseLocale(_ identifier: String) -> String {
+    String((identifier.split(separator: "@").first.map(String.init) ?? identifier).replacingOccurrences(of: "_", with: "-").prefix(10))
+}
+
+func aptabaseTimestamp(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "UTC")
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    return f.string(from: d)
+}
+
+/// The timestamp an event is sent with. The server rejects events over a day old (the booth Mac is off
+/// for a week between services), so anything older than 20 hours goes as now, with its own time in
+/// `at` and `late_h`; a clock that was ahead is sent as now too.
+func sendStamp(eventTime: Date, now: Date) -> (timestamp: String, extra: [String: DiagValue]) {
+    let age = now.timeIntervalSince(eventTime)
+    if age > 20 * 3600 { return (aptabaseTimestamp(now), ["at": .string(aptabaseTimestamp(eventTime)), "late_h": .int(Int(age / 3600))]) }
+    if age < -600 { return (aptabaseTimestamp(now), ["at": .string(aptabaseTimestamp(eventTime))]) }
+    return (aptabaseTimestamp(eventTime), [:])
+}
+
+/// The POST body: a JSON array of at most 25 events in Aptabase's shape.
+func aptabaseBatchBody(_ events: [DiagEvent], now: Date) -> Data {
+    struct Wire: Encodable { let timestamp, sessionId, eventName: String; let systemProps, props: [String: DiagValue] }
+    let wire = events.prefix(25).map { e -> Wire in
+        let stamp = sendStamp(eventTime: Date(timeIntervalSince1970: e.time), now: now)
+        let v = validDiagEvent(DiagEvent(id: e.id, time: e.time, name: e.name, session: e.session, system: e.system,
+                                         props: e.props.merging(stamp.extra) { _, new in new }))
+        return Wire(timestamp: stamp.timestamp, sessionId: v.session, eventName: v.name, systemProps: v.system, props: v.props)
+    }
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return (try? enc.encode(wire)) ?? Data("[]".utf8)
+}
+
+/// Text cut into pieces of at most `maxUnits` UTF-16 units, at line ends where a line fits. Joined
+/// back together they give the text exactly.
+func logChunkPieces(_ text: String, maxUnits: Int = 170) -> [String] {
+    var pieces: [String] = [], cur = "", curUnits = 0
+    func flush() { if !cur.isEmpty { pieces.append(cur); cur = ""; curUnits = 0 } }
+    var lines = text.components(separatedBy: "\n")
+    for i in 0..<(lines.count - 1) { lines[i] += "\n" }
+    for line in lines where !line.isEmpty {
+        let u = line.utf16.count
+        if curUnits + u <= maxUnits { cur += line; curUnits += u; continue }
+        flush()
+        if u <= maxUnits { cur = line; curUnits = u; continue }
+        for ch in line {
+            let cu = String(ch).utf16.count
+            if curUnits + cu > maxUnits { flush() }
+            cur.append(ch); curUnits += cu
+        }
+    }
+    flush()
+    return pieces
+}
+
+/// An incident's text as log_chunk props: incident, part, parts and t00…t19. At most ~30 KB.
+func logChunkProps(_ text: String, incident: String, maxBytes: Int = 30_000) -> [[String: DiagValue]] {
+    let pieces = logChunkPieces(capText(text, maxBytes: maxBytes))
+    let groups = stride(from: 0, to: pieces.count, by: 20).map { Array(pieces[$0..<min($0 + 20, pieces.count)]) }
+    return groups.enumerated().map { n, g in
+        var p: [String: DiagValue] = ["incident": .string(incident), "part": .int(n + 1), "parts": .int(groups.count)]
+        for (i, piece) in g.enumerated() { p[String(format: "t%02d", i)] = .string(piece) }
+        return p
+    }
+}
+
+/// The text back from log_chunk props (for checking, and for reading an export).
+func joinLogChunks(_ parts: [[String: DiagValue]]) -> String {
+    parts.sorted { ($0["part"].map { Int($0.text) ?? 0 } ?? 0) < ($1["part"].map { Int($0.text) ?? 0 } ?? 0) }
+        .map { p in (0..<20).compactMap { p[String(format: "t%02d", $0)]?.text }.joined() }.joined()
+}
+
+/// Which events go first when the queue is over its cap: log_chunk, then the rest, and app_start,
+/// startup_*, shutdown and check_* last.
+func diagPriority(_ name: String) -> Int {
+    if name == "log_chunk" { return 0 }
+    if name == "app_start" || name.hasPrefix("startup_") || name == "shutdown" || name.hasPrefix("check_") { return 2 }
+    return 1
+}
+
+/// Indexes of the queued events to keep (oldest first in, oldest dropped first within a priority).
+func trimDiagQueue(_ items: [(name: String, bytes: Int)], maxCount: Int = 3000, maxBytes: Int = 3_000_000) -> [Int] {
+    var drop = Set<Int>(), count = items.count, bytes = items.reduce(0) { $0 + $1.bytes }
+    for prio in 0...2 {
+        for (i, it) in items.enumerated() where diagPriority(it.name) == prio {
+            if count <= maxCount && bytes <= maxBytes { break }
+            drop.insert(i); count -= 1; bytes -= it.bytes
+        }
+    }
+    return items.indices.filter { !drop.contains($0) }
+}
+
+enum FlushOutcome: Equatable { case sent, retry, drop }
+
+/// What a send's answer means. The server says 200 `{}` even when it drops invalid events (so they're
+/// checked here first), and 200 with "error" in the body for a bad or locked key: keep those. 400:
+/// the batch itself is bad, drop it. Network errors, 429, 5xx and anything else: keep, back off.
+func aptabaseOutcome(status: Int?, body: String) -> FlushOutcome {
+    guard let status else { return .retry }
+    if (200..<300).contains(status) { return body.contains("\"error\"") ? .retry : .sent }
+    return status == 400 ? .drop : .retry
+}
+
+/// How the previous run ended: `running.json` left behind means it never got to quit; a crash report
+/// newer than its start says it crashed (otherwise power loss or a force quit).
+func previousExit(markerPresent: Bool, crashReportSinceStart: Bool, lastVersion: String?, currentVersion: String) -> String {
+    if markerPresent { return crashReportSinceStart ? "crash" : "unclean" }
+    guard let lastVersion else { return "first" }
+    return lastVersion == currentVersion ? "clean" : "update"
+}
+
+func isBoothCheckCrashReport(_ name: String) -> Bool {
+    (name.hasPrefix("Booth Check") || name.hasPrefix("BoothCheck")) && name.hasSuffix(".ips")
+}
+
+/// A check going bad or coming good, from the diff of two passes.
+struct CheckTransition: Equatable { let failed: Bool; let id, title, status, detail: String }
+
+/// Compares the last definite results (`old`) with a new pass. A check is reported failing when it's
+/// fail or warn and wasn't that before, recovered when it's ok after fail or warn. Unknown or manual
+/// results carry the old one forward, so bad → unknown → ok still counts as recovered.
+func checkTransitions(old: [Check], new: [Check]) -> (changes: [CheckTransition], baseline: [Check]) {
+    let before = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    var baseline: [Check] = [], out: [CheckTransition] = []
+    func bad(_ s: Status) -> Bool { s == .fail || s == .warn }
+    for c in new {
+        let was = before[c.id]
+        if c.status == .unknown || c.status == .manual { baseline.append(was ?? c); continue }
+        baseline.append(c)
+        if bad(c.status) && was?.status != c.status {
+            out.append(CheckTransition(failed: true, id: c.id, title: c.title, status: statusWord(c.status), detail: c.detail))
+        } else if c.status == .ok, let was, bad(was.status) {
+            out.append(CheckTransition(failed: false, id: c.id, title: c.title, status: "ok", detail: c.detail))
+        }
+    }
+    return (out, baseline)
+}
+
+/// The pass entries behind a check, for its incident.
+func passTitlesForCheck(_ id: String) -> [String] {
+    switch id {
+    case "dmx": return ["USB devices", "USB devices (IOService plane)", "DMX interface: the two USB planes disagree"]
+    case "dmxLive": return ["Lightkey's DMX server, olad (experimental)", "Lightkey's USB connections (experimental)", "Lightkey's open serial ports (experimental)", "Running apps"]
+    case "show": return ["The show file", "Which show Lightkey has open", "Running apps"]
+    case "lkpass": return ["Lightkey connects without the password"]
+    case "midi": return ["Lightkey's MIDI input", "Running apps"]
+    case "deck": return ["USB devices"]
+    case "deckLights": return ["Deck lights helper installed", "Deck lights helper in launchd", "Deck lights helper's copy and log", "The deck lights helper's MIDI port"]
+    case "ac": return ["Power source"]
+    case "sleep", "lpm": return ["Sleep settings"]
+    case "screen": return ["What keeps the screen on"]
+    case "nap": return ["App Nap setting"]
+    case "autoboot": return ["Starts from the charger"]
+    case "upd": return ["Automatic macOS updates"]
+    case "reopen": return ["Old apps reopen at start-up"]
+    default: return ["Running apps"]
+    }
+}
+
+/// A check's incident: the row itself, then the commands behind it with their output (each capped).
+func checkIncidentText(_ c: Check, since: Date, entries: [LogEntry]) -> String {
+    let titles = Set(passTitlesForCheck(c.id))
+    return "Check \(c.id): \(c.title)\nStatus: \(statusWord(c.status)), failing since \(diskTime(since))\nDetail: \(c.detail)\n"
+        + (c.fix.map { "Fix: \($0)\n" } ?? "")
+        + entries.filter { titles.contains($0.title) }.map { e in
+            diskLogText(LogEntry(title: e.title, language: e.language, code: e.code, output: capText(e.output, maxBytes: 8000), status: e.status))
+        }.joined()
+}
+
+/// "lk,dmx,deck,helper,on,apps1" for app_start.
+func setupTag(_ s: MacSetup) -> String {
+    let apps = s.apps.filter(\.on).count
+    return [s.lightkey ? "lk" : nil, s.lightkey && s.dmx ? "dmx" : nil, s.streamDeck ? "deck" : nil,
+            s.deckLights == true ? "helper" : nil, s.alwaysOn ? "on" : nil, apps > 0 ? "apps\(apps)" : nil]
+        .compactMap { $0 }.joined(separator: ",")
+}
+
+/// What the start-up's DMX recovery came to: none, sighup, reset, relaunch1/2, unconfirmed or failed.
+func dmxRecoverySummary(_ l: DMXLadder, linked: Bool) -> String {
+    if !l.started { return "none" }
+    if l.unconfirmed { return "unconfirmed" }
+    if !linked { return "failed" }
+    if l.relaunches > 0 { return "relaunch\(l.relaunches)" }
+    if l.resetPressed { return "reset" }
+    return l.hupSent ? "sighup" : "none"
+}
+
+// MARK: - The log on disk and diagnostics (files and network; one serial queue, never the main thread)
+
+/// Sends a request and calls back with the HTTP status (nil on a network error) and the body. Tests
+/// inject their own; the app's is an ephemeral URLSession.
+typealias DiagTransport = (URLRequest, @escaping (Int?, Data?, Error?) -> Void) -> Void
+
+let aptabaseURL = URL(string: "https://us.aptabase.com/api/v0/events")!
+
+final class Diagnostics {
+    static let shared = Diagnostics(files: .standard,
+                                    appKey: (Bundle.main.object(forInfoDictionaryKey: "AptabaseAppKey") as? String).flatMap { $0.isEmpty ? nil : $0 },
+                                    transport: Diagnostics.urlSessionTransport)
+
+    static let urlSessionTransport: DiagTransport = { request, done in
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 10
+        config.waitsForConnectivity = false
+        URLSession(configuration: config).dataTask(with: request) { data, response, error in
+            done(error == nil ? (response as? HTTPURLResponse)?.statusCode : nil, data, error)
+        }.resume()
+    }
+
+    let files: DiagFiles
+    let appKey: String?
+    let transport: DiagTransport
+    let queue = DispatchQueue(label: "app.boothcheck.diagnostics", qos: .utility)
+    let session = UUID().uuidString.lowercased()
+    let launchedAt = Date()
+    lazy var scrubContext = ScrubContext.current()
+    var systemProps: [String: DiagValue] = [:]
+    /// Read and set on `queue` (set it with `setEnabled`).
+    private(set) var enabled = true
+    private var seq = 0
+    private var appendsSinceTrim = 0
+    private var backoff: TimeInterval = 0
+    private var backoffUntil: Date?
+    private var lastRequest = Date.distantPast
+    /// On the main thread: incidents sent this launch (at most 6), and where the Network Log entries go.
+    var incidents = 0
+    var onLog: ((LogEntry) -> Void)?
+
+    init(files: DiagFiles, appKey: String?, transport: @escaping DiagTransport) {
+        self.files = files
+        self.appKey = appKey
+        self.transport = transport
+    }
+
+    func setEnabled(_ on: Bool) { queue.async { self.enabled = on } }
+
+    // The log on disk -----------------------------------------------------------------------------
+
+    /// Appends text to BoothCheck.log (rotating at 5 MB, 5 files kept), off the main thread.
+    func write(_ text: String) { queue.async { self.appendToLog(text) } }
+
+    func appendToLog(_ text: String) {
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: files.logDir, withIntermediateDirectories: true)
+        let data = Data(text.utf8)
+        let size = ((try? fm.attributesOfItem(atPath: files.log))?[.size] as? NSNumber)?.uint64Value ?? 0
+        if logNeedsRotation(size: size, adding: data.count) {
+            let plan = logRotationMoves(files.log)
+            try? fm.removeItem(atPath: plan.remove)
+            for m in plan.moves where fm.fileExists(atPath: m.from) { try? fm.moveItem(atPath: m.from, toPath: m.to) }
+        }
+        if !fm.fileExists(atPath: files.log) { fm.createFile(atPath: files.log, contents: nil) }
+        guard let h = FileHandle(forWritingAtPath: files.log) else { return }
+        defer { try? h.close() }
+        _ = try? h.seekToEnd()
+        try? h.write(contentsOf: data)
+    }
+
+    /// The end of the log as it stands (the previous run's tail, read before this run's header).
+    func logTail(maxBytes: Int) -> String {
+        guard let h = FileHandle(forReadingAtPath: files.log) else { return "" }
+        defer { try? h.close() }
+        let end = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0)
+        return String(decoding: (try? h.readToEnd()) ?? Data(), as: UTF8.self)
+    }
+
+    // The clean-exit marker ---------------------------------------------------------------------------
+
+    func writeMarker(version: String) {
+        try? FileManager.default.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
+        let json = "{\"pid\":\(ProcessInfo.processInfo.processIdentifier),\"version\":\"\(version)\",\"started\":\"\(aptabaseTimestamp(launchedAt))\",\"start\":\(launchedAt.timeIntervalSince1970)}\n"
+        FileManager.default.createFile(atPath: files.marker, contents: Data(json.utf8))
+    }
+
+    /// Booth Check is about to end on purpose (quit, update, shutdown): the marker goes, at once, on
+    /// the calling thread, so nothing can come between.
+    func markCleanExit(_ why: String) {
+        try? FileManager.default.removeItem(atPath: files.marker)
+        write("\(diskTime(Date()))  ==== Booth Check ends: \(why) (clean-exit marker removed)\n")
+    }
+
+    /// At launch, before anything else is written: how the previous run ended, and its log's tail.
+    func readPreviousRun(currentVersion: String) -> (exit: String, tail: String, detail: String) {
+        let fm = FileManager.default
+        let marker = fm.contents(atPath: files.marker).map { String(decoding: $0, as: UTF8.self) }
+        var crash: String?
+        if let marker {
+            let start = regexReplace(marker, "^.*\"start\":([0-9.]+).*$") { $0[1] }
+            let since = Date(timeIntervalSince1970: Double(start.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0)
+            let dir = NSHomeDirectory() + "/Library/Logs/DiagnosticReports"
+            crash = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter(isBoothCheckCrashReport).first { name in
+                ((try? fm.attributesOfItem(atPath: dir + "/" + name))?[.modificationDate] as? Date).map { $0 > since } ?? false
+            }
+        }
+        let last = fm.contents(atPath: files.lastVersion).map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let exit = previousExit(markerPresent: marker != nil, crashReportSinceStart: crash != nil, lastVersion: last, currentVersion: currentVersion)
+        let detail = "Previous run: \(exit)" + (marker.map { ". running.json was left: \($0.trimmingCharacters(in: .whitespacesAndNewlines))" } ?? "")
+            + (crash.map { ". Crash report: \($0)" } ?? "") + (last.map { ". Last version: \($0)" } ?? "")
+        try? fm.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
+        fm.createFile(atPath: files.lastVersion, contents: Data((currentVersion + "\n").utf8))
+        return (exit, marker != nil ? logTail(maxBytes: 30_000) : "", detail)
+    }
+
+    // Events and the queue ------------------------------------------------------------------------------
+
+    /// Queues one event (scrubbed, validated, with seq and launch). Nothing when switched off or keyless.
+    func event(_ name: String, _ props: [String: DiagValue] = [:], time: Date = Date()) {
+        queue.async { self.enqueue(name, props, time: time) }
+    }
+
+    func enqueue(_ name: String, _ props: [String: DiagValue], time: Date) {
+        guard enabled, appKey != nil else { return }
+        seq += 1
+        // log_chunk text is scrubbed whole before it's cut up (see `incident`).
+        var p = name == "log_chunk" ? props
+            : props.mapValues { v -> DiagValue in if case .string(let s) = v { return .string(scrub(s, scrubContext)) }; return v }
+        p["seq"] = .int(seq)
+        p["launch"] = .string(session)
+        let e = validDiagEvent(DiagEvent(id: UUID().uuidString, time: time.timeIntervalSince1970, name: name, session: session,
+                                         system: systemProps, props: p))
+        guard var line = try? JSONEncoder().encode(e) else { return }
+        line.append(0x0A)
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: files.queue) { fm.createFile(atPath: files.queue, contents: nil) }
+        if let h = FileHandle(forWritingAtPath: files.queue) {
+            _ = try? h.seekToEnd()
+            try? h.write(contentsOf: line)
+            try? h.close()
+        }
+        appendsSinceTrim += 1
+        let size = ((try? fm.attributesOfItem(atPath: files.queue))?[.size] as? NSNumber)?.intValue ?? 0
+        if appendsSinceTrim >= 100 || size > 3_000_000 { trimQueue() }
+    }
+
+    func loadQueue() -> [DiagEvent] {
+        guard let data = FileManager.default.contents(atPath: files.queue) else { return [] }
+        return data.split(separator: 0x0A).compactMap { try? JSONDecoder().decode(DiagEvent.self, from: Data($0)) }
+    }
+
+    func saveQueue(_ events: [DiagEvent]) {
+        let enc = JSONEncoder()
+        var data = Data()
+        for e in events { if let l = try? enc.encode(e) { data.append(l); data.append(0x0A) } }
+        try? data.write(to: URL(fileURLWithPath: files.queue), options: .atomic)
+    }
+
+    func trimQueue() {
+        appendsSinceTrim = 0
+        let events = loadQueue()
+        let enc = JSONEncoder()
+        let keep = trimDiagQueue(events.map { ($0.name, ((try? enc.encode($0))?.count ?? 0) + 1) })
+        if keep.count < events.count {
+            saveQueue(keep.map { events[$0] })
+            appendToLog("\(diskTime(Date()))  Diagnostics queue over its cap: dropped \(events.count - keep.count) of \(events.count) events (log_chunk first)\n")
+        }
+    }
+
+    func clearQueue() { queue.async { try? FileManager.default.removeItem(atPath: self.files.queue) } }
+
+    // Sending -----------------------------------------------------------------------------------------
+
+    /// Sends the queue in batches of 25, one request a second at most, until it's empty, a send fails
+    /// (then it backs off: 1 minute, doubling to 30) or `deadline` passes. Returns the Network Log
+    /// entries. Runs on the calling thread: `flush` puts it on the queue.
+    func flushSync(deadline: Date? = nil, ignoreBackoff: Bool = false) -> [LogEntry] {
+        guard enabled else { return [] }
+        guard let key = appKey else {
+            return [LogEntry(title: "Diagnostics: nothing sent", language: "Network", code: "POST \(aptabaseURL.absoluteString)",
+                             output: "This build has no Aptabase key (aptabase.key wasn\u{2019}t there when it was built), so Booth Check sends nothing.", status: nil)]
+        }
+        if !ignoreBackoff, let until = backoffUntil, until > Date() { return [] }
+        var logs: [LogEntry] = []
+        while true {
+            let all = loadQueue()
+            guard !all.isEmpty else { break }
+            let wait = lastRequest.addingTimeInterval(1).timeIntervalSinceNow
+            if let deadline, Date().addingTimeInterval(max(wait, 0) + 0.5) > deadline { break }
+            if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
+            let batch = Array(all.prefix(25))
+            let body = aptabaseBatchBody(batch, now: Date())
+            var request = URLRequest(url: aptabaseURL, timeoutInterval: min(10, deadline.map { max($0.timeIntervalSinceNow, 1) } ?? 10))
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(key, forHTTPHeaderField: "App-Key")
+            request.httpBody = body
+            lastRequest = Date()
+            let sem = DispatchSemaphore(value: 0)
+            var status: Int?, reply = "", failure: String?
+            transport(request) { s, d, e in
+                status = s
+                reply = d.map { String(decoding: $0, as: UTF8.self) } ?? ""
+                failure = e?.localizedDescription
+                sem.signal()
+            }
+            if sem.wait(timeout: .now() + 11) == .timedOut { failure = "No answer in 11 seconds." }
+            let outcome = aptabaseOutcome(status: failure == nil ? status : nil, body: reply)
+            let ids = Set(batch.map(\.id))
+            let left = outcome == .retry ? all.count : all.count - batch.count
+            if outcome != .retry { saveQueue(all.filter { !ids.contains($0.id) }) }
+            if outcome == .sent { backoff = 0; backoffUntil = nil }
+            if outcome == .retry {
+                backoff = backoff == 0 ? 60 : min(backoff * 2, 1800)
+                backoffUntil = Date().addingTimeInterval(backoff)
+            }
+            var names: [String: Int] = [:]
+            batch.forEach { names[$0.name, default: 0] += 1 }
+            let what = names.sorted { $0.key < $1.key }.map { "\($0.key) \u{00D7}\($0.value)" }.joined(separator: ", ")
+            logs.append(LogEntry(title: "Diagnostics: " + (outcome == .sent ? "sent \(batch.count) events" : outcome == .drop ? "the server refused \(batch.count) events (dropped)" : "couldn\u{2019}t send \(batch.count) events (kept)"),
+                                 language: "Network",
+                                 code: "POST \(aptabaseURL.absoluteString)\n\(batch.count) events, \(body.count) bytes: \(what)",
+                                 output: (failure.map { "Network error: \($0)" } ?? "HTTP \(status ?? 0): \(reply.isEmpty ? "(empty)" : capText(reply, maxBytes: 2000))")
+                                    + "\nLeft in the queue: \(left)" + (outcome == .retry ? ". Trying again in \(Int(backoff / 60)) min or with Send now." : ""),
+                                 status: outcome == .sent ? 0 : 1))
+            if body.count <= 16_000 { appendToLog("\(diskTime(Date()))  Diagnostics body sent:\n" + indentLines(String(decoding: body, as: UTF8.self), "    ")) }
+            if outcome == .retry { break }
+        }
+        return logs
+    }
+
+    /// `flushSync` on the queue; the Log entries and `done` come back on the main thread.
+    func flush(maxTime: TimeInterval? = nil, ignoreBackoff: Bool = false, done: (() -> Void)? = nil) {
+        let deadline = maxTime.map { Date().addingTimeInterval($0) }
+        queue.async {
+            let logs = self.flushSync(deadline: deadline, ignoreBackoff: ignoreBackoff)
+            DispatchQueue.main.async {
+                logs.forEach { self.onLog?($0) }
+                done?()
+            }
+        }
+    }
+
+    /// Sends an incident's scrubbed text as log_chunk events (at most 6 incidents a launch). Main thread.
+    func incident(_ name: String, _ text: String) {
+        guard incidents < 6, !text.isEmpty else { return }
+        incidents += 1
+        queue.async {
+            guard self.enabled, self.appKey != nil else { return }
+            for p in logChunkProps(scrub(text, self.scrubContext), incident: name) { self.enqueue("log_chunk", p, time: Date()) }
+        }
+    }
+
+    func queueCount(_ done: @escaping (Int, Int) -> Void) {
+        queue.async {
+            let size = ((try? FileManager.default.attributesOfItem(atPath: self.files.queue))?[.size] as? NSNumber)?.intValue ?? 0
+            let n = self.loadQueue().count
+            DispatchQueue.main.async { done(n, size) }
+        }
+    }
+}
+
+/// sysctl hw.model ("MacBookPro16,1").
+func hardwareModel() -> String {
+    var size = 0
+    sysctlbyname("hw.model", nil, &size, nil, 0)
+    var buf = [CChar](repeating: 0, count: max(size, 1))
+    sysctlbyname("hw.model", &buf, &size, nil, 0)
+    return String(cString: buf)
+}
+
+#if arch(arm64)
+let runArch = "arm64"
+#else
+let runArch = "x86_64"
+#endif
+
+extension Booth {
+    var diag: Diagnostics { Diagnostics.shared }
+    var buildNumber: String { Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0" }
+
+    /// `changes` grew: the new entries (at the front) go to the log on disk, oldest first; then the
+    /// list is cut to 500.
+    func logNewChanges(_ old: [LogEntry]) {
+        let firstOld = old.first?.id
+        let fresh = changes.prefix { $0.id != firstOld }
+        if !fresh.isEmpty { diag.write(fresh.reversed().map(diskLogText).joined()) }
+        if changes.count > 500 { changes.removeLast(changes.count - 500) }
+    }
+
+    func diagEvent(_ name: String, _ props: [String: DiagValue] = [:]) { diag.event(name, props) }
+
+    func diagDMXRecovery(_ rung: String, _ result: String) {
+        diagEvent("dmx_recovery", ["rung": .string(rung), "result": .string(result)])
+    }
+
+    /// At launch: the header in the log, how the last run ended, the clean-exit marker, app_start, and
+    /// an incident with the previous run's tail when it didn't end cleanly. Then the 5-minute flushes.
+    func diagLaunch(atLogin: Bool) {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let macos = "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        let inApplications = Bundle.main.bundlePath.hasPrefix("/Applications/")
+        diag.systemProps = ["isDebug": .bool(!inApplications), "osName": .string("macOS"), "osVersion": .string(macos),
+                            "locale": .string(aptabaseLocale(Locale.current.identifier)),
+                            "appVersion": .string(currentVersion), "appBuildNumber": .string(buildNumber),
+                            "sdkVersion": .string("boothcheck@1"), "deviceModel": .string(hardwareModel())]
+        diag.setEnabled(setup.diagnostics)
+        diag.onLog = { [weak self] e in self?.changes.insert(e, at: 0) }
+        let uptime = Int(ProcessInfo.processInfo.systemUptime)
+        let version = currentVersion, build = buildNumber, tag = setupTag(setup), diagOn = setup.diagnostics
+        let keyed = diag.appKey != nil
+        diag.queue.async {
+            let prev = self.diag.readPreviousRun(currentVersion: version)
+            self.diag.appendToLog("\n\(diskTime(Date()))  ==== Booth Check \(version) (build \(build)) \u{00B7} \(runArch) \u{00B7} macOS \(macos) \u{00B7} \(hardwareModel()) \u{00B7} up \(uptime) s \u{00B7} at login: \(atLogin ? "yes" : "no") \u{00B7} pid \(ProcessInfo.processInfo.processIdentifier)\n"
+                + "    \(prev.detail)\n    Setup: \(tag). Diagnostics: " + (!diagOn ? "off" : keyed ? "on (session \(self.diag.session))" : "on, but this build has no key, so nothing is sent") + "\n")
+            self.diag.writeMarker(version: version)
+            DispatchQueue.main.async {
+                self.diagEvent("app_start", ["version": .string(version), "build": .string(build), "arch": .string(runArch),
+                                             "macos": .string(macos), "uptime_s": .int(uptime), "at_login": .int(atLogin ? 1 : 0),
+                                             "setup": .string(tag), "prev_exit": .string(prev.exit)])
+                if prev.exit == "unclean" || prev.exit == "crash" { self.diag.incident("prev_\(prev.exit)", prev.tail) }
+                if !keyed {
+                    self.changes.insert(LogEntry(title: "Diagnostics: this build sends nothing", language: "Booth Check", code: "Info.plist AptabaseAppKey",
+                                                 output: "No Aptabase key was built in (aptabase.key wasn\u{2019}t there), so nothing is queued or sent. The log on disk is still written.",
+                                                 status: nil), at: 0)
+                }
+            }
+        }
+        // The first flush comes after the start-up (or 2 minutes in), then every 5 minutes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 121) { self.diagFlushIfAllowed() }
+        let t = Timer(timeInterval: 300, repeats: true) { [weak self] _ in self?.diagFlushIfAllowed() }
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    /// Never during a start-up; before the first start-up is done, only from 2 minutes after launch.
+    func diagFlushIfAllowed() {
+        guard setup.diagnostics, !starting, !shuttingDown,
+              diagStartupDone || Date().timeIntervalSince(diag.launchedAt) >= 120 else { return }
+        diag.flush()
+    }
+
+    /// The switch in This Mac. Off: nothing more is queued or sent, and what's queued is deleted.
+    func setDiagnostics(_ on: Bool) {
+        guard setup.diagnostics != on else { return }
+        if !on { diag.clearQueue() }
+        setup.diagnostics = on
+        diag.setEnabled(on)
+        logSetting(on ? "This Mac: send diagnostics to the developer" : "This Mac: don\u{2019}t send diagnostics",
+                   on ? "Step timings, check results and the scrubbed log go to Aptabase (us.aptabase.com). Never passwords; the user name is removed."
+                      : "Nothing more is queued or sent, and the queue was deleted. The log on disk is still written.")
+    }
+
+    /// Send now, from This Mac: ignores the back-off, and says what's left.
+    func sendDiagnosticsNow() {
+        diag.flush(ignoreBackoff: true) {
+            self.diag.queueCount { n, size in
+                self.logSetting("Diagnostics: Send now", "\(n) event\(n == 1 ? "" : "s") left in the queue (\(size) bytes).")
+            }
+        }
+    }
+
+    /// Each pass, with the new results: the log on disk (full or one line), check_failed and
+    /// check_recovered (not while a start-up runs: its end is diffed against what came before), and
+    /// an incident for a check failing more than 60 seconds.
+    func diagPass(_ entries: [LogEntry], _ new: [Check]) {
+        let now = Date()
+        let sig = passSignature(new)
+        let changed = lastPassSignature != nil && sig != lastPassSignature
+        let full = passLogIsFull(first: lastPassSignature == nil, starting: starting, changed: changed,
+                                 sinceLastFull: now.timeIntervalSince(lastFullPass ?? .distantPast))
+        let reason = changed ? "a check changed" : starting ? "start-up" : lastFullPass == nil ? "first" : "hourly"
+        lastPassSignature = sig
+        let problems = new.filter { $0.status == .fail || $0.status == .warn }.count
+        if full {
+            lastFullPass = now
+            let head = "\(diskTime(now))  ==== pass (full: \(reason)), \(problems) problem\(problems == 1 ? "" : "s")\n"
+                + new.map { "    \(statusWord($0.status).padding(toLength: 8, withPad: " ", startingAt: 0)) \($0.id): \($0.title) \u{2014} \($0.detail)\n" }.joined()
+            diag.queue.async { self.diag.appendToLog(head + entries.map(diskLogText).joined()) }
+        } else {
+            diag.write(passLogLine(now, problems: problems))
+        }
+        guard !starting else { return }
+        let t = checkTransitions(old: diagBaseline ?? [], new: new)
+        diagBaseline = t.baseline
+        for c in t.changes {
+            if c.failed {
+                if diagFailingSince[c.id] == nil { diagFailingSince[c.id] = now }
+                diagEvent("check_failed", ["check": .string(c.id), "title": .string(c.title), "status": .string(c.status), "detail": .string(c.detail)])
+            } else {
+                let since = diagFailingSince.removeValue(forKey: c.id)
+                diagIncidentSent.remove(c.id)
+                diagEvent("check_recovered", ["check": .string(c.id), "title": .string(c.title), "status": .string(c.status), "detail": .string(c.detail),
+                                              "for_s": .int(Int(now.timeIntervalSince(since ?? now)))])
+            }
+        }
+        for c in t.baseline where (c.status == .fail || c.status == .warn) && !diagIncidentSent.contains(c.id) {
+            guard let since = diagFailingSince[c.id], now.timeIntervalSince(since) > 60 else { continue }
+            diagIncidentSent.insert(c.id)
+            diag.incident("check_\(c.id)", checkIncidentText(c, since: since, entries: entries))
+            diagFlushIfAllowed()
+        }
+    }
+
+    /// The Log's entries since `start`, oldest first, as the log on disk has them.
+    func logText(since start: Date) -> String {
+        changes.filter { $0.time >= start }.reversed().map(diskLogText).joined()
+    }
+
+    /// Save diagnostics…: the scrubbed logs, the DMX snapshots, the queue and a short summary, zipped
+    /// in a temporary folder, then the share menu (AirDrop). Logged.
+    func saveDiagnostics(from view: NSView?) {
+        let summary = "Booth Check \(currentVersion) (build \(buildNumber)), \(runArch), \(hardwareModel()), macOS \(ProcessInfo.processInfo.operatingSystemVersionString)\n"
+            + "Saved \(diskTime(Date())). Setup: \(setupTag(setup)). Diagnostics: \(setup.diagnostics ? "on" : "off").\n"
+            + "Problems now: \(problemCount)\n" + checks.map { "  \(statusWord($0.status)) \($0.id): \($0.title) \u{2014} \($0.detail)\n" }.joined()
+        let files = diag.files, ctx = diag.scrubContext
+        diag.queue.async {
+            let fm = FileManager.default
+            let stamp = dmxSnapshotFileName(Date(), reason: "x").dropFirst(4).dropLast(6)
+            let dir = fm.temporaryDirectory.appendingPathComponent("BoothCheck-diagnostics-\(stamp)")
+            try? fm.removeItem(at: dir)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let names = ((try? fm.contentsOfDirectory(atPath: files.logDir)) ?? []).filter { $0.hasPrefix("BoothCheck.log") || ($0.hasPrefix("dmx-") && $0.hasSuffix(".txt")) }
+            var copied: [String] = []
+            for n in names.sorted() {
+                guard let d = fm.contents(atPath: files.logDir + "/" + n) else { continue }
+                let out = n.hasSuffix(".txt") || n.hasSuffix(".log") ? n : n + ".txt"
+                try? Data(scrub(String(decoding: d, as: UTF8.self), ctx).utf8).write(to: dir.appendingPathComponent(out))
+                copied.append(out)
+            }
+            if let q = fm.contents(atPath: files.queue) {
+                try? q.write(to: dir.appendingPathComponent("aptabase-queue.jsonl"))
+                copied.append("aptabase-queue.jsonl")
+            }
+            try? Data(scrub(summary, ctx).utf8).write(to: dir.appendingPathComponent("summary.txt"))
+            let zip = dir.path + ".zip"
+            try? fm.removeItem(atPath: zip)
+            let args = ["-c", "-k", "--keepParent", dir.path, zip]
+            let r = shell("/usr/bin/ditto", args)
+            DispatchQueue.main.async {
+                self.changes.insert(LogEntry(title: "Save diagnostics", language: "Terminal", code: commandLine("/usr/bin/ditto", args),
+                                             output: (r.out.isEmpty ? "" : r.out + "\n") + "Scrubbed copies of: summary.txt, " + copied.joined(separator: ", ") + "\nZip: \(zip)",
+                                             status: r.code), at: 0)
+                guard r.code == 0 else { return }
+                let url = URL(fileURLWithPath: zip)
+                if let view {
+                    NSSharingServicePicker(items: [url]).show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+                } else {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
                 }
             }
         }
@@ -4307,6 +5325,25 @@ struct SetupSheet: View {
                             .padding(.leading, indent)
                             .padding(.vertical, 10)
                         }
+                    }
+
+                    group("Booth Check") {
+                        HStack(alignment: .firstTextBaseline) {
+                            Toggle(isOn: Binding(get: { booth.setup.diagnostics }, set: { booth.setDiagnostics($0) })) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("Send diagnostics to the developer").font(.system(size: 12))
+                                    Text("Step timings, check results and the scrubbed log. Never passwords; the user name is removed.")
+                                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            .toggleStyle(.checkbox)
+                            Spacer()
+                            Button("Send now") { booth.sendDiagnosticsNow() }
+                                .controlSize(.small)
+                                .disabled(!booth.setup.diagnostics)
+                        }
+                        .padding(.vertical, 10)
                     }
 
                     if !booth.mutedChecks.isEmpty {
@@ -4619,6 +5656,18 @@ struct LogSheet: View {
             HStack {
                 Text("Log").font(.system(size: 17, weight: .bold))
                 Spacer()
+                // 1.31: the log is kept on disk too; diagnostics can be zipped and AirDropped.
+                Button("Show in Finder") {
+                    let log = Diagnostics.shared.files.log
+                    if FileManager.default.fileExists(atPath: log) {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: log)])
+                    } else {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: Diagnostics.shared.files.logDir))
+                    }
+                }
+                .controlSize(.small)
+                Button("Save diagnostics\u{2026}") { booth.saveDiagnostics(from: NSApp.keyWindow?.contentView) }
+                    .controlSize(.small)
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             .padding(16)
@@ -5622,6 +6671,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                             reason: "Booth Check watches the booth in the background")
         let booth = Booth.shared
         let atLogin = launchedAsLoginItem()
+        booth.diagLaunch(atLogin: atLogin)
         booth.logMenuIconLaunch()
         if atLogin { booth.logAppsOpenAtLogin() }
         booth.start()
@@ -5642,6 +6692,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quitting on purpose (Quit, an update, the Mac shutting down): the clean-exit marker goes.
+    func applicationWillTerminate(_ notification: Notification) {
+        Diagnostics.shared.markCleanExit("quit")
+        // Let the last lines reach the disk, but never wait more than a second (a send may be under way).
+        let written = DispatchSemaphore(value: 0)
+        Diagnostics.shared.queue.async { written.signal() }
+        _ = written.wait(timeout: .now() + 1)
+    }
 }
 
 @main
@@ -5657,7 +6716,12 @@ struct BoothCheckApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra(isInserted: $booth.menuIconInserted) {
+        // SwiftUI writes isInserted back on every update. Passed straight through ($booth.menuIconInserted,
+        // 1891082), each write of the same `true` republished Booth and asked for another update: the main
+        // thread spun at 100% (beachball, no rows, "Checking…" forever; found 14 Nov 2026). Only a real
+        // change is stored (`menuIconWriteNeeded`).
+        MenuBarExtra(isInserted: Binding(get: { booth.menuIconInserted },
+                                         set: { if menuIconWriteNeeded($0, current: booth.menuIconInserted) { booth.menuIconInserted = $0 } })) {
             MenuPanel(booth: booth)
         } label: {
             StatusLabel(booth: booth)

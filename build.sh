@@ -35,6 +35,15 @@ for arch in arm64 x86_64; do
 done
 lipo -create build/BoothCheck-arm64 build/BoothCheck-x86_64 -output "$APP/Contents/MacOS/BoothCheck"
 cp Info.plist "$APP/Contents/Info.plist"
+# Diagnostics (1.31): the Aptabase app key lives in the git-ignored aptabase.key, never in git. It goes
+# into the built copy's Info.plist before signing. Without the file the app builds and sends nothing.
+if [ -s aptabase.key ]; then
+    KEY=$(tr -d '[:space:]' < aptabase.key)
+    /usr/libexec/PlistBuddy -c "Add :AptabaseAppKey string $KEY" "$APP/Contents/Info.plist"
+    echo "Aptabase key: built in"
+else
+    echo "Aptabase key: none (no aptabase.key), so this build sends no diagnostics"
+fi
 # The deck lights helper Booth Check installs: built in the Lightkey-Skill repo (tools/deck_state_helper.swift)
 # and copied here as is; tests/test_deckinstall.swift checks it's that build.
 cp helper/deck_state_helper "$APP/Contents/Resources/deck_state_helper"

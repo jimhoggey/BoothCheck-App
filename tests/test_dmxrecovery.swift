@@ -113,8 +113,11 @@ expect("olad after the box: not suspect",
 
 // --- The ladder ------------------------------------------------------------------------------------------
 
-func next(_ l: DMXLadder, box: Bool = true, held: Bool = false, lk: Bool = true, olad: pid_t? = 812, asking: Bool = false, ax: Bool = true) -> DMXRung {
-    dmxLadderNext(boxPresent: box, held: held, lightkeyRunning: lk, oladPID: olad, asking: asking, accessibility: ax, ladder: l)
+// `found` is olad's log's "Found N FTDI devices"; 0 (it missed the box) unless a test says otherwise.
+func next(_ l: DMXLadder, box: Bool = true, held: Bool = false, lk: Bool = true, olad: pid_t? = 812, asking: Bool = false, ax: Bool = true,
+          found: Int? = 0, suspect: Bool = false) -> DMXRung {
+    dmxLadderNext(boxPresent: box, held: held, lightkeyRunning: lk, oladPID: olad, asking: asking, accessibility: ax, ladder: l,
+                  olaFound: found, suspect: suspect)
 }
 var l = DMXLadder()
 expect("held: done", next(l, held: true) == .held)
@@ -135,6 +138,24 @@ expect("a second relaunch is allowed", next(l) == .relaunch)
 l.relaunches = 2
 expect("at most two relaunches, then give up", next(l) == .giveUp)
 expect("held still wins after giving up", next(l, held: true) == .held)
+
+// Task 0: restarting Lightkey needs evidence olad doesn't have the box, not just the experimental check.
+var u = DMXLadder(); u.hupTried = true; u.resetTried = true
+expect("OLA log found 1 device, not suspect: stop, couldn't confirm", next(u, found: 1) == .unconfirmed)
+expect("OLA log found 2 devices: stop too", next(u, found: 2) == .unconfirmed)
+expect("OLA log says nothing, olad running, not suspect: stop", next(u, found: nil) == .unconfirmed)
+expect("OLA log found 0: restart", next(u, found: 0) == .relaunch)
+expect("olad not running: restart even with a found line", next(u, olad: nil, found: 1) == .relaunch)
+expect("suspect link: restart even with a found line", next(u, found: 1, suspect: true) == .relaunch)
+expect("found 1: the SIGHUP and Reset rungs still run first", next(DMXLadder(), found: 1) == .hup(812))
+var u2 = u; u2.relaunches = 2
+expect("found 0 after two relaunches: give up", next(u2, found: 0) == .giveUp)
+expect("found 1 after two relaunches: unconfirmed, not give up", next(u2, found: 1) == .unconfirmed)
+expect("justified: found 0", dmxRelaunchJustified(olaFound: 0, oladRunning: true, suspect: false))
+expect("not justified: found 1", !dmxRelaunchJustified(olaFound: 1, oladRunning: true, suspect: false))
+expect("not justified: no line", !dmxRelaunchJustified(olaFound: nil, oladRunning: true, suspect: false))
+expect("justified: no olad", dmxRelaunchJustified(olaFound: nil, oladRunning: false, suspect: false))
+expect("justified: suspect", dmxRelaunchJustified(olaFound: 3, oladRunning: true, suspect: true))
 
 var tried = DMXLadder()
 expect("nothing tried", dmxLadderTriedText(tried) == "Booth Check couldn\u{2019}t try anything.", dmxLadderTriedText(tried))
@@ -191,7 +212,7 @@ expect("restarting says the lights go dark", selfRepairWords(.dmxRestarting(1)).
 expect("the second restart says so", selfRepairWords(.dmxRestarting(2)).detail.contains("Second try"))
 expect("connected", selfRepairWords(.dmxConnected).title == "The lights are connected")
 expect("failed says to replug the blue box", selfRepairWords(.dmxFailed).detail.contains("blue DMX box") && selfRepairWords(.dmxFailed).title.hasPrefix("Couldn\u{2019}t reconnect"))
-let all: [SelfRepair] = [.dmxNotConnected, .dmxAskingOlad, .dmxResetOutput, .dmxRestarting(1), .dmxConnected, .dmxFailed, .dmxReconnectFailed,
+let all: [SelfRepair] = [.dmxNotConnected, .dmxAskingOlad, .dmxResetOutput, .dmxRestarting(1), .dmxConnected, .dmxFailed, .dmxReconnectFailed, .dmxUnconfirmed,
                          .deckReopening, .deckReopened, .deckRestarting, .deckRestarted, .deckFailed,
                          .helperRestarting, .helperRestarted, .helperFailed]
 expect("every self-repair has a title and a line", all.allSatisfy { !selfRepairWords($0).title.isEmpty && !selfRepairWords($0).detail.isEmpty })

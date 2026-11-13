@@ -4,3 +4,5 @@ build/
 graphify-out/
 CLAUDE.md
 HANDOFF.md
+# The Aptabase app key: build.sh writes it into the built app's Info.plist (AptabaseAppKey).
+aptabase.key

@@ -326,6 +326,31 @@ exception is **Shut down the booth**, which closes the open apps and shuts the M
 once its countdown runs out (**Not yet** stops it). Its timed version only runs if it's switched on
 in This Mac. Both keep every step in the Log.
 
+## The log on disk and diagnostics
+
+- **The Log is kept on disk** in `~/Library/Logs/Booth Check/BoothCheck.log` (plain text, a header
+  per launch, every change and start-up step in full; the 15-second checks in full at the first pass,
+  during a start-up, when a check changes and once an hour, otherwise one line). It rotates at 5 MB,
+  5 files kept, next to the DMX snapshots. In memory the Log keeps the newest 500 entries. A file
+  `~/Library/Application Support/Booth Check/running.json` is there while Booth Check runs; left
+  behind at the next launch, the last run ended uncleanly (power cut, force quit, or a crash when
+  macOS wrote a crash report).
+- **Diagnostics go to the developer** through Aptabase (`us.aptabase.com`): when Booth Check starts,
+  each start-up step and how long it took, checks failing and recovering, DMX snapshots and
+  recovery, self-repairs, power changes, shutdown and update steps, settings, and, when something
+  goes wrong (a start-up warning, a check failing over a minute, the DMX recovery, a shutdown that
+  stayed on, an unclean exit), the relevant part of the log. Everything is scrubbed first: the home
+  folder becomes `~`, the user's and the Mac's names are removed, USB serial numbers are hashed,
+  emails and IP addresses removed; passwords are never in it. Events wait in
+  `aptabase-queue.jsonl` (sent after the start-up, then every 5 minutes, and before a shutdown);
+  each send is in the Log with the server's answer.
+- **Switch it off** in This Mac → Booth Check → **Send diagnostics to the developer** (that also
+  deletes the queue; the log on disk is still written). **Send now** sends the queue straight away.
+- **Save diagnostics…** in the Log window zips scrubbed copies of the logs, the DMX snapshots, the
+  queue and a short summary, and offers AirDrop. **Show in Finder** shows the log.
+- The Aptabase key isn't in git: `build.sh` reads `aptabase.key` (git-ignored) into the app's
+  Info.plist. Built without it, Booth Check sends nothing and says so in the Log.
+
 ## Putting it on the booth Mac
 
 It needs nothing installed. It's one universal app for Apple silicon and Intel, macOS 13 or later.
