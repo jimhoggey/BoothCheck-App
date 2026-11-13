@@ -64,6 +64,9 @@ struct MacSetup: Codable, Equatable {
     /// default, the owner chose "everything, always"). Off: nothing is queued or sent; the log on disk
     /// is still written.
     var diagnostics = true
+    /// The Stream Deck profile that goes with the show (1.32), picked once by a tech in This Mac. Nil:
+    /// "Don't check". Booth Check puts Stream Deck on it at the start-up and checks it stays there.
+    var deckProfile: DeckProfileChoice? = nil
 
     /// Apps worth offering on a production Mac when they're installed.
     static let knownApps = [("com.renewedvision.propresenter", "ProPresenter")]
@@ -84,6 +87,7 @@ struct MacSetup: Codable, Equatable {
         apps = try c.decodeIfPresent([ExtraApp].self, forKey: .apps) ?? MacSetup.suggestedApps(on: false)
         deckLights = try c.decodeIfPresent(Bool.self, forKey: .deckLights)
         diagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnostics) ?? true
+        deckProfile = try? c.decodeIfPresent(DeckProfileChoice.self, forKey: .deckProfile)
     }
 
     static var saved: MacSetup? {
@@ -813,6 +817,7 @@ enum SelfRepair: Equatable {
     case dmxNotConnected, dmxAskingOlad, dmxResetOutput, dmxRestarting(Int), dmxConnected, dmxFailed, dmxReconnectFailed, dmxUnconfirmed
     case deckReopening, deckReopened, deckRestarting, deckRestarted, deckFailed
     case helperRestarting, helperRestarted, helperFailed
+    case deckProfileSwitching(String), deckProfileSwitched(String), deckProfileFailed(String)
 }
 
 /// The sign's words for each self-repair: a title and one plain line.
@@ -836,6 +841,9 @@ func selfRepairWords(_ r: SelfRepair) -> (title: String, detail: String) {
     case .helperRestarting: return ("The deck\u{2019}s key lights stopped", "Restarting the deck lights helper\u{2026}")
     case .helperRestarted: return ("The deck\u{2019}s key lights are back", "The deck lights helper is running again.")
     case .helperFailed: return ("Couldn\u{2019}t restart the deck lights helper", "The keys still work. Open Booth Check to see what\u{2019}s wrong.")
+    case .deckProfileSwitching(let name): return ("Putting Stream Deck on the \u{201C}\(name)\u{201D} profile", "Its keys go dark for a few seconds.")
+    case .deckProfileSwitched(let name): return ("Stream Deck is on \u{201C}\(name)\u{201D}", "Its keys work again.")
+    case .deckProfileFailed(let name): return ("Couldn\u{2019}t switch Stream Deck\u{2019}s profile", "In Stream Deck, choose \u{201C}\(name)\u{201D} at the top of its window.")
     }
 }
 
@@ -1011,9 +1019,10 @@ func fileSHA256(_ path: String) -> String? {
 }
 
 /// The LaunchAgent: start at login, restart within 2 s whenever it stops, log to ~/Library/Logs.
-func deckHelperPlistXML() -> String {
+/// `args`: the show's rules (the built-in Summit ones, or a `.deck.json`'s: see `parseDeckShowFile`).
+func deckHelperPlistXML(args: [String] = deckHelperArgs) -> String {
     let esc = { (s: String) in s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;") }
-    let program = ([deckHelperBinary] + deckHelperArgs).map { "<string>\(esc($0))</string>" }.joined()
+    let program = ([deckHelperBinary] + args).map { "<string>\(esc($0))</string>" }.joined()
     return """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1034,7 +1043,7 @@ func deckHelperPlistXML() -> String {
 
 /// Install or update, as the script the sheet shows and runs: stop the old copy (and any started by
 /// hand, which would hold the helper's lock), copy the new one in, write the LaunchAgent, start it.
-func deckHelperInstallScript(from source: String) -> String {
+func deckHelperInstallScript(from source: String, args: [String] = deckHelperArgs) -> String {
     let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     let home = NSHomeDirectory()
     return """
@@ -1047,7 +1056,7 @@ func deckHelperInstallScript(from source: String) -> String {
     chmod 755 \(q(deckHelperBinary))
     xattr -d com.apple.quarantine \(q(deckHelperBinary)) 2>/dev/null || true
     cat > \(q(deckHelperPlist)) <<'EOF'
-    \(deckHelperPlistXML())
+    \(deckHelperPlistXML(args: args))
     EOF
     plutil -lint \(q(deckHelperPlist))
     launchctl bootstrap \(deckHelperDomain) \(q(deckHelperPlist))
@@ -1057,15 +1066,16 @@ func deckHelperInstallScript(from source: String) -> String {
 /// What the helper's log says about a copy just started, from the lines written since: nil while it's
 /// still starting, unless `final`. Fine once it's up with one alias line per --alias pair (an older
 /// helper ignores --alias without a word).
-func deckHelperStartVerdict(_ log: String, final: Bool) -> (ok: Bool, text: String)? {
+func deckHelperStartVerdict(_ log: String, final: Bool, args: [String] = deckHelperArgs) -> (ok: Bool, text: String)? {
     let lines = log.split(separator: "\n").map(String.init)
     if let bad = lines.last(where: { $0.contains("could not") || $0.contains("WATCHDOG") || $0.contains("bad --") }) {
         return (false, "Its log says: \(bad)")
     }
     let up = lines.contains { $0.contains("deck_state_helper up") }
-    let aliases = deckHelperArgs.last?.split(separator: ",").count ?? 0
+    let aliases = args.firstIndex(of: "--alias").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }?
+        .split(separator: ",").count ?? 0
     if up && lines.filter({ $0.contains("alias: deck key") }).count >= aliases {
-        return (true, "It started and its log shows all \(aliases) --alias rules.")
+        return (true, aliases == 0 ? "It started." : "It started and its log shows all \(aliases) --alias rules.")
     }
     guard final else { return nil }
     if lines.contains(where: { $0.contains("waiting for it to stop") }) {
@@ -1076,7 +1086,7 @@ func deckHelperStartVerdict(_ log: String, final: Bool) -> (ok: Bool, text: Stri
 }
 
 /// Runs the install script, then watches the log and launchd for up to 6 s to see the new copy start.
-func runDeckHelperInstall(_ script: String) -> (out: String, code: Int32) {
+func runDeckHelperInstall(_ script: String, args: [String] = deckHelperArgs) -> (out: String, code: Int32) {
     let logSize = { (try? FileManager.default.attributesOfItem(atPath: deckHelperLog)[.size] as? Int) ?? 0 }
     let from = logSize()
     let r = shell("/bin/bash", ["-c", script])
@@ -1085,7 +1095,7 @@ func runDeckHelperInstall(_ script: String) -> (out: String, code: Int32) {
     for i in 1...24 where verdict == nil {
         Thread.sleep(forTimeInterval: 0.25)
         let data = FileManager.default.contents(atPath: deckHelperLog) ?? Data()
-        verdict = deckHelperStartVerdict(String(decoding: data.dropFirst(data.count < from ? 0 : from), as: UTF8.self), final: i == 24)
+        verdict = deckHelperStartVerdict(String(decoding: data.dropFirst(data.count < from ? 0 : from), as: UTF8.self), final: i == 24, args: args)
     }
     let state = launchdJobState(shell("/bin/launchctl", ["print", deckHelperService]).out)
     let ok = verdict?.ok == true && state == "running"
@@ -1128,8 +1138,15 @@ func deckLightsAutoOn(setting: Bool?, installed: Bool, lightkey: Bool, streamDec
 /// the installed copy is the one Booth Check carries (nil: unknown). `lastLog`: the log's last line,
 /// shown when it fails. `gaveUp`: Booth Check's own restarts didn't fix it (see `deckHelperAutoFix`).
 func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort: Bool,
-                     current: Bool? = nil, lastLog: String? = nil, gaveUp: Bool = false) -> Check {
+                     current: Bool? = nil, lastLog: String? = nil, gaveUp: Bool = false, argsCurrent: Bool? = nil) -> Check {
     let title = "Deck lights helper running"
+    // Running, but its LaunchAgent starts it with other rules than Booth Check would install for this
+    // show (see `deckHelperArgsCurrent`): the key lights may follow the wrong cues. Presses still work.
+    if loaded && state == "running" && feedbackPort && argsCurrent == false {
+        return Check(id: "deckLights", group: "Stream Deck", title: title, status: .warn,
+                     detail: "It\u{2019}s running, but installed with old settings: its rules aren\u{2019}t the ones Booth Check would install for this show, so some key lights may not follow Lightkey. Presses still work.",
+                     fix: "Install / update puts the right ones in (no password).", action: .installDeckHelper)
+    }
     let effect = "so the deck\u{2019}s key lights may not follow Lightkey. Presses still work."
     let log = lastLog.map { " Its log: \u{201C}\($0)\u{201D}" } ?? ""
     let selfFix = gaveUp
@@ -1156,6 +1173,461 @@ func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort
                  detail: "It isn\u{2019}t installed on this Mac, \(effect)",
                  fix: "Install it (no password). If this Mac doesn\u{2019}t use it, untick Deck lights helper in This Mac.",
                  action: .installDeckHelper)
+}
+
+/// The ProgramArguments in the installed LaunchAgent plist (nil: no plist, or not one Booth Check can read).
+func installedHelperArgs(_ plist: Data?) -> [String]? {
+    guard let plist, let d = (try? PropertyListSerialization.propertyList(from: plist, format: nil)) as? [String: Any] else { return nil }
+    return d["ProgramArguments"] as? [String]
+}
+
+/// Whether the installed LaunchAgent starts the helper exactly as Booth Check would install it: the
+/// installed copy, then this show's rules in the same order. nil: couldn't read it.
+func deckHelperArgsCurrent(installed: [String]?, binary: String = deckHelperBinary, expected: [String]) -> Bool? {
+    installed.map { $0 == [binary] + expected }
+}
+
+// MARK: - The show's deck file (1.32)
+
+// A show may carry `<show name>.deck.json` next to it, saying how its deck is meant to work:
+//   {"helper": {"channels": "2", "mask": "2:3-6", "while": "2:38-39", "alias": "2:22=2:40"} | null,
+//    "profile": "Lightkey XL Service"}
+// `helper`: the deck lights helper's rules for this show (null: this show doesn't use the helper);
+// `profile`: the Stream Deck profile name suggested in This Mac. No file: the built-in Summit rules.
+
+struct DeckShowFile: Equatable {
+    /// The helper's arguments; nil when the file says `"helper": null` (the helper rows don't apply).
+    var helperArgs: [String]? = deckHelperArgs
+    /// The arguments came from the file (false: the built-in Summit ones).
+    var helperFromFile = false
+    var profile: String? = nil
+}
+
+/// "<show folder>/<show name>.deck.json" for a show file.
+func deckShowFilePath(forShow show: String) -> String {
+    ((show as NSString).deletingPathExtension) + ".deck.json"
+}
+
+/// A list of channel:note or channel:first-last, as the helper's --mask and --while take it.
+private func helperKeyList(_ s: String, channels: ClosedRange<Int>) -> Bool {
+    let items = s.split(separator: ",", omittingEmptySubsequences: false)
+    return !items.isEmpty && items.allSatisfy { item in
+        let p = item.split(separator: ":", omittingEmptySubsequences: false)
+        guard p.count == 2, let ch = Int(p[0]), channels.contains(ch) else { return false }
+        let n = p[1].split(separator: "-", omittingEmptySubsequences: false).map { Int($0) }
+        guard (1...2).contains(n.count), n.allSatisfy({ $0.map { (0...127).contains($0) } == true }) else { return false }
+        return n.count == 1 || n[0]! <= n[1]!
+    }
+}
+
+/// Reads a `.deck.json` strictly: unknown keys are ignored; a bad value means the built-in rules are
+/// used, with a warning for the Log. Never throws.
+func parseDeckShowFile(_ data: Data) -> (file: DeckShowFile, warnings: [String]) {
+    var file = DeckShowFile(), warnings: [String] = []
+    guard let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        return (file, ["It isn\u{2019}t a JSON object, so the built-in deck lights helper rules are used."])
+    }
+    if let p = d["profile"] {
+        if let name = p as? String, !name.trimmingCharacters(in: .whitespaces).isEmpty { file.profile = name }
+        else if !(p is NSNull) { warnings.append("\u{201C}profile\u{201D} isn\u{2019}t a name, so it\u{2019}s ignored.") }
+    }
+    guard let h = d["helper"] else { return (file, warnings) }
+    if h is NSNull {
+        file.helperArgs = nil
+        return (file, warnings)
+    }
+    guard let helper = h as? [String: Any] else {
+        return (file, warnings + ["\u{201C}helper\u{201D} isn\u{2019}t an object or null, so the built-in rules are used."])
+    }
+    var values: [String: String] = [:]
+    for key in ["channels", "mask", "while", "alias"] {
+        guard let v = helper[key], !(v is NSNull) else { continue }
+        guard let s = v as? String else {
+            return (file, warnings + ["helper.\(key) isn\u{2019}t text, so the built-in rules are used."])
+        }
+        let t = s.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { values[key] = t }
+    }
+    func bad(_ why: String) -> (file: DeckShowFile, warnings: [String]) {
+        (file, warnings + [why + ", so the built-in rules are used."])
+    }
+    var channels = 5...13                                          // the helper's own default
+    if let c = values["channels"] {
+        let n = c.split(separator: "-", omittingEmptySubsequences: false).map { Int($0) }
+        guard (1...2).contains(n.count), n.allSatisfy({ $0.map { (1...16).contains($0) } == true }), n.first!! <= n.last!! else {
+            return bad("helper.channels \u{201C}\(c)\u{201D} isn\u{2019}t a channel or a range of channels 1\u{2013}16 (like 2 or 5-13)")
+        }
+        channels = n.first!!...n.last!!
+    }
+    for key in ["mask", "while"] {
+        if let v = values[key], !helperKeyList(v, channels: channels) {
+            return bad("helper.\(key) \u{201C}\(v)\u{201D} isn\u{2019}t a list like 5:3-6,6:7 inside the helper\u{2019}s channels")
+        }
+    }
+    if (values["mask"] == nil) != (values["while"] == nil) { return bad("helper.mask and helper.while go together") }
+    if let a = values["alias"] {
+        let ok = a.split(separator: ",", omittingEmptySubsequences: false).allSatisfy { pair in
+            let sides = pair.split(separator: "=", omittingEmptySubsequences: false)
+            return sides.count == 2 && sides.allSatisfy { !$0.contains("-") && helperKeyList(String($0), channels: channels) }
+        }
+        if !ok { return bad("helper.alias \u{201C}\(a)\u{201D} isn\u{2019}t a list like 5:22=5:40 inside the helper\u{2019}s channels") }
+    }
+    file.helperArgs = ["channels", "mask", "while", "alias"].flatMap { k in values[k].map { ["--\(k)", $0] } ?? [] }
+    file.helperFromFile = true
+    return (file, warnings)
+}
+
+/// Stream Deck's Devices preference, read through cfprefsd (synchronised first, so it's what Stream
+/// Deck itself last wrote). Read only.
+func readStreamDeckDevices() -> Any? {
+    CFPreferencesAppSynchronize(IDs.streamDeck as CFString)
+    return CFPreferencesCopyAppValue("Devices" as CFString, IDs.streamDeck as CFString)
+}
+
+/// Writes the whole Devices value back through cfprefsd (never the plist file itself). Only ever
+/// called with Stream Deck closed, with a value from `deckDevicesSetting` (see `setPreferredProfile`).
+func writeStreamDeckDevices(_ devices: [String: Any]) -> Bool {
+    CFPreferencesSetAppValue("Devices" as CFString, devices as CFDictionary, IDs.streamDeck as CFString)
+    return CFPreferencesAppSynchronize(IDs.streamDeck as CFString)
+}
+
+/// The steps the profile switch's sheet shows (and its undo, with the old UUID).
+func deckProfileSwitchSteps(device: String, to uuid: String) -> String {
+    """
+    1. Quit Stream Deck (NSRunningApplication.terminate; made to quit after 5 s)
+    2. With Stream Deck closed, change one value in its settings:
+       CFPreferencesCopyAppValue("Devices", "\(IDs.streamDeck)")
+       Devices \u{2192} "\(device)" \u{2192} ESDProfilesInfo \u{2192} ESDProfilesPreferred = "\(uuid)"
+       CFPreferencesSetAppValue("Devices", <the same Devices, that one value changed>, "\(IDs.streamDeck)")
+       CFPreferencesAppSynchronize("\(IDs.streamDeck)")
+    3. Open Stream Deck in the background
+    4. 10 s after it opens, read ESDProfilesPreferred back
+    """
+}
+
+/// The show's deck file, if there is one: nil when there's no file next to the show.
+func loadDeckShowFile(forShow show: String?) -> (file: DeckShowFile, warnings: [String], path: String)? {
+    guard let show else { return nil }
+    let path = deckShowFilePath(forShow: show)
+    guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    let r = parseDeckShowFile(data)
+    return (r.file, r.warnings, path)
+}
+
+/// What the deck file means, in one plain paragraph for the Log.
+func deckShowFileText(_ r: (file: DeckShowFile, warnings: [String], path: String)?) -> String {
+    guard let r else { return "No .deck.json next to the show: the built-in deck lights helper rules (" + deckHelperArgs.joined(separator: " ") + ")." }
+    let helper = r.file.helperArgs == nil ? "This show doesn\u{2019}t use the deck lights helper, so its rows don\u{2019}t apply."
+        : r.file.helperFromFile ? "Deck lights helper rules: " + (r.file.helperArgs!.isEmpty ? "(none: the helper\u{2019}s defaults)" : r.file.helperArgs!.joined(separator: " ")) + "."
+        : "Deck lights helper rules: the built-in ones (" + deckHelperArgs.joined(separator: " ") + ")."
+    return "\(r.path)\n\(helper)" + (r.file.profile.map { "\nSuggested Stream Deck profile: \u{201C}\($0)\u{201D}." } ?? "")
+        + r.warnings.map { "\nWarning: \($0)" }.joined()
+}
+
+// MARK: - Stream Deck profiles (1.32)
+
+// Stream Deck keeps each profile in ~/Library/Application Support/com.elgato.StreamDeck/ProfilesV3/
+// <UUID>.sdProfile: manifest.json (Name, Device, Pages) and Profiles/<PAGE>/manifest.json, whose
+// Controllers[].Actions["col,row"] are the keys. The keys that drive Lightkey are the Trevliga Spel
+// MIDI plugin's (settings g02 mode, g47 channel 0-based, g45 note, smo out port, smi in port). Which
+// profile each deck shows is in its preferences: Devices → "@(1)[vendor/product/serial]" →
+// ESDProfilesInfo → ESDProfilesPreferred (the folder's UUID, lowercased). Elgato's private format: read
+// strictly, and anything unexpected is "can't tell", never a failure.
+
+let trevligaPlugin = "se.trevligaspel.midi"
+var streamDeckSupportDir: String { NSHomeDirectory() + "/Library/Application Support/com.elgato.StreamDeck" }
+
+/// One MIDI key as Lightkey sees it. The set of these over a profile is its signature: names and
+/// UUIDs don't identify a version (an import makes a new UUID; versions share a name).
+struct DeckMIDIKey: Hashable, Comparable {
+    let channel: Int        // 1-based, as Lightkey shows it
+    let note: Int
+    let mode: String        // Latch, Toggle, Hold, Push
+    let inPort: String      // smi: where its light comes from
+    let outPort: String     // smo: where its press goes
+    var text: String { "\(channel):\(note):\(mode):\(inPort)>\(outPort)" }
+    static func < (a: DeckMIDIKey, b: DeckMIDIKey) -> Bool {
+        (a.channel, a.note, a.mode, a.inPort, a.outPort) < (b.channel, b.note, b.mode, b.inPort, b.outPort)
+    }
+}
+
+struct DeckProfile: Equatable, Identifiable {
+    let uuid: String                // the folder's UUID, lowercased, as the preferences write it
+    let name: String
+    let device: String              // "@(1)[4057/143/<serial>]"
+    let model: String
+    let pages: Int
+    let keys: [DeckMIDIKey]         // every MIDI key with a channel and a note
+    let pluginVersions: [String]    // every MIDI plugin version its keys were made with, sorted
+    var id: String { uuid }
+    var signatureKeys: [DeckMIDIKey] { Array(Set(keys)).sorted() }
+    var signature: String { signatureKeys.map(\.text).joined(separator: ";") }
+    var sigHash: String { String(SHA256.hash(data: Data(signature.utf8)).map { String(format: "%02x", $0) }.joined().prefix(10)) }
+    var channels: [Int] { Array(Set(keys.map(\.channel))).sorted() }
+    var inPorts: [String] { Array(Set(keys.map(\.inPort))).sorted() }
+    var outPorts: [String] { Array(Set(keys.map(\.outPort))).sorted() }
+}
+
+private func settingInt(_ v: Any?) -> Int? {
+    if let s = v as? String { return Int(s.trimmingCharacters(in: .whitespaces)) }
+    if let n = v as? NSNumber, !(v is Bool) { return n.intValue }
+    return nil
+}
+
+/// A key's MIDI side, or nil when it isn't a MIDI plugin key with a channel and a note. `version`:
+/// the plugin version it was made with, for any MIDI plugin key.
+func deckMIDIKey(_ action: [String: Any]) -> (key: DeckMIDIKey?, version: String?)? {
+    let plugin = action["Plugin"] as? [String: Any]
+    let isMIDI = plugin?["UUID"] as? String == trevligaPlugin || (action["UUID"] as? String)?.hasPrefix(trevligaPlugin + ".") == true
+    guard isMIDI else { return nil }
+    let version = plugin?["Version"] as? String
+    guard let s = action["Settings"] as? [String: Any], let ch = settingInt(s["g47"]), let note = settingInt(s["g45"]) else {
+        return (nil, version)
+    }
+    return (DeckMIDIKey(channel: ch + 1, note: note, mode: s["g02"] as? String ?? "?",
+                        inPort: s["smi"] as? String ?? "", outPort: s["smo"] as? String ?? ""), version)
+}
+
+/// One profile from its manifest and its pages' manifests; nil when they aren't the shape above.
+func parseDeckProfile(uuid: String, manifest: Data, pages: [Data]) -> DeckProfile? {
+    guard let m = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
+          let name = m["Name"] as? String,
+          let device = m["Device"] as? [String: Any], let deviceID = device["UUID"] as? String else { return nil }
+    var keys: [DeckMIDIKey] = [], versions = Set<String>()
+    for page in pages {
+        guard let p = (try? JSONSerialization.jsonObject(with: page)) as? [String: Any] else { return nil }
+        guard let controllers = p["Controllers"] else { return nil }
+        if controllers is NSNull { continue }                       // an empty page
+        guard let list = controllers as? [[String: Any]] else { return nil }
+        for c in list {
+            guard let actions = c["Actions"], !(actions is NSNull) else { continue }
+            guard let byPos = actions as? [String: Any] else { return nil }
+            for pos in byPos.keys.sorted() {
+                guard let a = byPos[pos] as? [String: Any], let midi = deckMIDIKey(a) else { continue }
+                if let v = midi.version { versions.insert(v) }
+                if let k = midi.key { keys.append(k) }
+            }
+        }
+    }
+    return DeckProfile(uuid: uuid.lowercased(), name: name, device: deviceID, model: device["Model"] as? String ?? "",
+                       pages: pages.count, keys: keys, pluginVersions: versions.sorted())
+}
+
+struct DeckProfilesRead: Equatable {
+    var profiles: [DeckProfile] = []
+    var folder: String?             // ProfilesV3 (or ProfilesV2) that was read
+    var unreadable: [String] = []   // profile folders that weren't the expected shape
+    var problem: String?            // nothing could be read: the row says "can't tell"
+}
+
+/// Every profile in Stream Deck's support folder: ProfilesV3, or ProfilesV2 for an older Stream Deck
+/// (read only if its files have the same shape; otherwise that's "can't read", not a failure).
+func readDeckProfiles(supportDir: String = streamDeckSupportDir) -> DeckProfilesRead {
+    let fm = FileManager.default
+    var r = DeckProfilesRead()
+    guard let folder = ["ProfilesV3", "ProfilesV2"].map({ supportDir + "/" + $0 }).first(where: { fm.fileExists(atPath: $0) }) else {
+        r.problem = "Stream Deck has no profiles folder here (ProfilesV3 or ProfilesV2)."
+        return r
+    }
+    r.folder = folder
+    let names = ((try? fm.contentsOfDirectory(atPath: folder)) ?? []).filter { $0.hasSuffix(".sdProfile") }.sorted()
+    for n in names {
+        let dir = folder + "/" + n
+        let pagesDir = dir + "/Profiles"
+        let pages = ((try? fm.contentsOfDirectory(atPath: pagesDir)) ?? []).sorted()
+            .compactMap { fm.contents(atPath: pagesDir + "/" + $0 + "/manifest.json") }
+        guard let manifest = fm.contents(atPath: dir + "/manifest.json"),
+              let p = parseDeckProfile(uuid: String(n.dropLast(".sdProfile".count)), manifest: manifest, pages: pages) else {
+            r.unreadable.append(n)
+            continue
+        }
+        r.profiles.append(p)
+    }
+    if r.profiles.isEmpty && !r.unreadable.isEmpty {
+        r.problem = "Can\u{2019}t read this Stream Deck version\u{2019}s profiles (\((folder as NSString).lastPathComponent))."
+    }
+    return r
+}
+
+/// The profile folder for a UUID, whatever its case (folders are upper case, preferences lower).
+func deckProfileFolder(uuid: String, in folder: String?) -> String? {
+    guard let folder else { return nil }
+    let want = uuid.lowercased() + ".sdprofile"
+    return ((try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? [])
+        .first { $0.lowercased() == want }.map { folder + "/" + $0 }
+}
+
+/// For the log: one line per profile.
+func deckProfilesText(_ r: DeckProfilesRead) -> String {
+    if let p = r.problem { return p }
+    return r.profiles.map { p in
+        "\u{201C}\(p.name)\u{201D} \(p.uuid): \(p.keys.count) MIDI keys, " + channelsText(p.channels)
+            + ", in \(p.inPorts.joined(separator: "/")), out \(p.outPorts.joined(separator: "/")), plugin \(p.pluginVersions.joined(separator: "/")), keys \(p.sigHash), deck \(p.device)"
+    }.joined(separator: "\n") + (r.unreadable.isEmpty ? "" : "\nCouldn\u{2019}t read: " + r.unreadable.joined(separator: ", "))
+}
+
+/// "channel 2", "channels 5–13", "channels 2, 5, 9", "no channels".
+func channelsText(_ ch: [Int]) -> String {
+    guard let first = ch.first, let last = ch.last else { return "no MIDI channels" }
+    if ch.count == 1 { return "channel \(first)" }
+    return ch == Array(first...last) ? "channels \(first)\u{2013}\(last)" : "channels " + ch.map(String.init).joined(separator: ", ")
+}
+
+/// The picker's hint for a profile: "Lightkey XL Service · 44 keys · channel 2". Two profiles that
+/// share a name and a hint also get their keys' hash, or their UUID when even that's the same.
+func deckProfileHint(_ p: DeckProfile, among all: [DeckProfile]) -> String {
+    let base = { (q: DeckProfile) in "\(q.name) \u{00B7} \(q.keys.count) keys \u{00B7} \(channelsText(q.channels))" }
+    let twins = all.filter { $0.uuid != p.uuid && base($0) == base(p) }
+    if twins.isEmpty { return base(p) }
+    return base(p) + (twins.contains { $0.sigHash == p.sigHash } ? " \u{00B7} id \(p.uuid.prefix(8))" : " \u{00B7} keys \(p.sigHash.prefix(6))")
+}
+
+/// The profile the tech chose in This Mac. Name, UUID and the keys' hash, so it's still found after a
+/// re-import under a new UUID (see `matchDeckProfile`).
+struct DeckProfileChoice: Codable, Equatable {
+    var name: String
+    var uuid: String
+    var sigHash: String
+    init(_ p: DeckProfile) { (name, uuid, sigHash) = (p.name, p.uuid, p.sigHash) }
+    init(name: String, uuid: String, sigHash: String) { (self.name, self.uuid, self.sigHash) = (name, uuid, sigHash) }
+}
+
+enum DeckProfileMatch: Equatable {
+    case found(DeckProfile, by: String)     // "uuid", "keys" or "name"
+    case missing
+    case ambiguous([DeckProfile])
+}
+
+/// Which installed profile is the chosen one: the same UUID; else the one with the same keys (the same
+/// name breaks a tie); else the one with the same name. More than one left: can't tell.
+func matchDeckProfile(_ c: DeckProfileChoice, in profiles: [DeckProfile]) -> DeckProfileMatch {
+    if let p = profiles.first(where: { $0.uuid == c.uuid.lowercased() }) { return .found(p, by: "uuid") }
+    let sameKeys = profiles.filter { $0.sigHash == c.sigHash }
+    if sameKeys.count == 1 { return .found(sameKeys[0], by: "keys") }
+    if sameKeys.count > 1 {
+        let named = sameKeys.filter { $0.name == c.name }
+        return named.count == 1 ? .found(named[0], by: "keys") : .ambiguous(named.isEmpty ? sameKeys : named)
+    }
+    let sameName = profiles.filter { $0.name == c.name }
+    if sameName.count == 1 { return .found(sameName[0], by: "name") }
+    return sameName.isEmpty ? .missing : .ambiguous(sameName)
+}
+
+/// Each deck's preferred profile from the preferences' Devices value (device ID → lowercased UUID).
+/// Entries that aren't a deck dictionary (PreferredDevice is a string) are skipped.
+func deckPreferredProfiles(_ devices: Any?) -> (preferred: [String: String], problem: String?) {
+    guard let devices else { return ([:], "Stream Deck\u{2019}s settings have no Devices list yet.") }
+    guard let d = devices as? [String: Any] else { return ([:], "Stream Deck\u{2019}s Devices setting isn\u{2019}t the shape Booth Check knows.") }
+    var out: [String: String] = [:]
+    for (k, v) in d {
+        guard let dev = v as? [String: Any], let info = dev["ESDProfilesInfo"] as? [String: Any],
+              let pref = info["ESDProfilesPreferred"] as? String else { continue }
+        out[k] = pref.lowercased()
+    }
+    return (out, nil)
+}
+
+/// Whether Booth Check may write `target` as `device`'s preferred profile: only when the format is
+/// exactly as expected (Devices → device → ESDProfilesInfo → ESDProfilesPreferred is a string), the
+/// target is a UUID and its profile folder exists. `current`: the value there now.
+func deckPrefsWriteGuard(devices: Any?, device: String, target: String, targetFolderExists: Bool) -> (ok: Bool, current: String?, why: String) {
+    guard let d = devices as? [String: Any] else { return (false, nil, "Stream Deck\u{2019}s Devices setting is missing or not a dictionary.") }
+    guard let dev = d[device] as? [String: Any] else { return (false, nil, "Stream Deck\u{2019}s settings have no entry for the deck \(device).") }
+    guard let info = dev["ESDProfilesInfo"] as? [String: Any] else { return (false, nil, "The deck\u{2019}s entry has no ESDProfilesInfo dictionary.") }
+    guard let current = info["ESDProfilesPreferred"] as? String else { return (false, nil, "ESDProfilesPreferred is missing or not text.") }
+    guard UUID(uuidString: target) != nil else { return (false, current, "\u{201C}\(target)\u{201D} isn\u{2019}t a profile UUID.") }
+    guard targetFolderExists else { return (false, current, "The profile \(target) isn\u{2019}t in Stream Deck\u{2019}s profiles folder.") }
+    return (true, current, "The format is as expected.")
+}
+
+/// The Devices value with only `device`'s ESDProfilesPreferred changed; every other key kept as it
+/// was. nil when the shape isn't the expected one.
+func deckDevicesSetting(_ devices: [String: Any], device: String, preferred: String) -> [String: Any]? {
+    guard var dev = devices[device] as? [String: Any], var info = dev["ESDProfilesInfo"] as? [String: Any],
+          info["ESDProfilesPreferred"] is String else { return nil }
+    info["ESDProfilesPreferred"] = preferred.lowercased()
+    dev["ESDProfilesInfo"] = info
+    var out = devices
+    out[device] = dev
+    return out
+}
+
+/// 4.3.0.1 >= 4.3: compares numerically, part by part.
+func pluginVersionAtLeast(_ v: String, _ min: [Int]) -> Bool {
+    let parts = v.split(separator: ".").map { Int($0) ?? 0 }
+    for (i, m) in min.enumerated() {
+        let p = i < parts.count ? parts[i] : 0
+        if p != m { return p > m }
+    }
+    return true
+}
+
+/// The extra warnings for a profile, on the same row: keys that don't send to Lightkey, and mixed or
+/// old MIDI plugin versions.
+func deckProfileWarnings(_ p: DeckProfile) -> [String] {
+    var w: [String] = []
+    let stray = p.keys.filter { $0.outPort != IDs.lightkeyMIDIInput }
+    if !stray.isEmpty {
+        w.append("\(stray.count) of its \(p.keys.count) MIDI keys don\u{2019}t send to \u{201C}\(IDs.lightkeyMIDIInput)\u{201D} ("
+                 + Array(Set(stray.map { $0.outPort.isEmpty ? "no port" : $0.outPort })).sorted().joined(separator: ", ") + "), so Lightkey won\u{2019}t hear them.")
+    }
+    if p.pluginVersions.count > 1 {
+        w.append("Its keys were made with different MIDI plugin versions (\(p.pluginVersions.joined(separator: ", "))).")
+    }
+    let old = p.pluginVersions.filter { !pluginVersionAtLeast($0, [4, 3]) }
+    if !old.isEmpty { w.append("Some keys were made with MIDI plugin \(old.joined(separator: ", ")), older than 4.3.") }
+    return w
+}
+
+/// "Stream Deck is on the right profile". `writeFailed`: Booth Check's switch didn't stick, so the row
+/// says how to choose it by hand instead of offering the switch again.
+func deckProfileCheck(choice: DeckProfileChoice, read: DeckProfilesRead, preferred: [String: String], prefsProblem: String?,
+                      writeFailed: Bool = false) -> Check {
+    let title = "Stream Deck is on the right profile"
+    let want = "\u{201C}\(choice.name)\u{201D}"
+    func row(_ status: Status, _ detail: String, fix: String? = nil, action: Action? = nil) -> Check {
+        Check(id: "deckProfile", group: "Stream Deck", title: title, status: status, detail: detail, fix: fix, action: action)
+    }
+    if let problem = read.problem {
+        return row(.unknown, "Can\u{2019}t tell which profile it\u{2019}s on: \(problem)", fix: "Check Stream Deck shows \(want) at the top of its window.")
+    }
+    let target: DeckProfile
+    switch matchDeckProfile(choice, in: read.profiles) {
+    case .missing:
+        return row(.fail, "The service needs \(want), but it isn\u{2019}t in Stream Deck any more.",
+                   fix: "Import it again in Stream Deck (double-click its .streamDeckProfile file), or pick the profile for the service in This Mac.",
+                   action: .openSetup)
+    case .ambiguous(let list):
+        return row(.unknown, "\(list.count) profiles could be \(want) (" + list.map { deckProfileHint($0, among: read.profiles) }.joined(separator: "; ") + "), so Booth Check can\u{2019}t tell which one the service needs.",
+                   fix: "Pick it again in This Mac.", action: .openSetup)
+    case .found(let p, _):
+        target = p
+    }
+    var extras = deckProfileWarnings(target)
+    let edited = target.sigHash != choice.sigHash
+    if edited { extras.insert("Its keys changed since it was chosen (it was edited, or another version was imported).", at: 0) }
+    let extraText = extras.isEmpty ? "" : " " + extras.joined(separator: " ")
+    guard prefsProblem == nil, let current = preferred[target.device] else {
+        return row(.unknown, "Can\u{2019}t tell which profile Stream Deck is on: " + (prefsProblem ?? "its settings don\u{2019}t list the deck this profile is for.") + extraText,
+                   fix: "Check Stream Deck shows \(want) at the top of its window.")
+    }
+    let onIt = current == target.uuid
+    let copy = onIt ? nil : read.profiles.first(where: { $0.uuid == current && $0.sigHash == target.sigHash })
+    if onIt || copy != nil {
+        let detail = "It\u{2019}s on \(want)" + (copy != nil ? " (a copy with the same keys)" : "") + ", \(target.keys.count) MIDI keys, \(channelsText(target.channels))." + extraText
+        if edited {
+            return row(.warn, detail, fix: "If the change was meant, keep it as it is now; otherwise import the right version in Stream Deck.",
+                       action: .acceptDeckProfile)
+        }
+        return row(extras.isEmpty ? .ok : .warn, detail)
+    }
+    let currentName = read.profiles.first { $0.uuid == current }.map { "\u{201C}\($0.name)\u{201D}" } ?? "a profile Booth Check can\u{2019}t find"
+    let detail = "Stream Deck is on \(currentName), the service needs \(want), so the keys may not match the show." + extraText
+    if writeFailed {
+        return row(.fail, detail, fix: "In Stream Deck, choose \(want) at the top of its window.")
+    }
+    return row(.fail, detail, fix: "Booth Check can switch it: Stream Deck closes for a few seconds and its keys go dark meanwhile.",
+               action: .switchDeckProfile(device: target.device, to: target.uuid, from: current, name: target.name))
 }
 
 /// Whether to open Stream Deck now, outside the start-up (the user, 9 Oct 2026: switched on in This
@@ -1471,6 +1943,8 @@ enum Action {
     case removeShowLoginItems
     case enableAutoBoot(String?)
     case noStreamDeck
+    case switchDeckProfile(device: String, to: String, from: String, name: String)
+    case acceptDeckProfile
     case openApp(String, String)        // bundle ID, name
     case openSetup
     case open(URL, String)
@@ -1494,6 +1968,8 @@ enum Action {
         case .removeLoginItem, .removeShowLoginItems: return "Remove\u{2026}"
         case .enableAutoBoot: return "Turn on\u{2026}"
         case .noStreamDeck: return "No Stream Deck on this Mac"
+        case .switchDeckProfile: return "Switch Stream Deck to it\u{2026}"
+        case .acceptDeckProfile: return "Use it as it is now"
         case .openApp(_, let name): return "Open \(name)"
         case .openSetup: return "This Mac\u{2026}"
         case .open(_, let label): return label
@@ -1572,7 +2048,12 @@ struct Snapshot {
     var deckHelperState: String?            // launchd's state for it: "running", "not running"…
     var deckHelperSHA: String?              // the installed binary's
     var deckHelperLastLog: String?          // the last line of its log
-    var bootValue: String?                  // the firmware setting; nil = not set = factory setting
+    var deckHelperProgramArgs: [String]?    // what its installed LaunchAgent starts it with
+    var deckShow: (file: DeckShowFile, warnings: [String], path: String)?   // the show's .deck.json, if any
+    var deckProfiles: DeckProfilesRead?     // Stream Deck's profiles (nil: Stream Deck is off here)
+    var deckPreferred: [String: String] = [:]   // each deck's preferred profile, from its preferences
+    var deckPrefsProblem: String?
+    var bootValue: String?                 // the firmware setting; nil = not set = factory setting
     var bootReadFailed = false
 }
 
@@ -1698,6 +2179,19 @@ final class Booth: ObservableObject {
     private var deckHelperFixes: [Date] = []
     private var deckHelperAlerted = false
     var deckHelperFixesAgo: [TimeInterval] { deckHelperFixes.map { Date().timeIntervalSince($0) } }
+    /// The show's .deck.json (1.32, see `parseDeckShowFile`): nil = no file, the built-in Summit rules.
+    @Published var deckShow: DeckShowFile? = loadDeckShowFile(forShow: UserDefaults.standard.string(forKey: IDs.showKey))?.file
+    var deckShowText: String?
+    var deckShowTextLogged = false
+    /// The helper's arguments for this show, and whether this show uses the helper at all.
+    var helperArgsInUse: [String] { deckShow?.helperArgs ?? deckHelperArgs }
+    var showUsesHelper: Bool { deckShow.map { $0.helperArgs != nil } ?? true }
+    /// Stream Deck's profiles as last read (for This Mac's picker); whether Booth Check's switch of
+    /// the profile didn't stick (then the row says how to choose it by hand); the last deck_profile event.
+    @Published var deckProfiles = DeckProfilesRead()
+    var deckProfileWriteFailed = false
+    var lastDeckProfileDiag: String?
+    var deckProfileSwitching = false
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
@@ -1736,6 +2230,7 @@ final class Booth: ObservableObject {
     @Published var setup: MacSetup = MacSetup.saved ?? MacSetup.detected() {
         didSet {
             setup.save()
+            if setup.deckProfile != oldValue.deckProfile { deckProfileWriteFailed = false }
             refresh()
             if setup.streamDeck && !oldValue.streamDeck { keepStreamDeckOpen() }    // switched on just now
         }
@@ -1833,10 +2328,33 @@ final class Booth: ObservableObject {
         guard !busy else { return }
         busy = true
         let lightkeyPID = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
-        let deckHelperOn = setup.lightkey && setup.streamDeck && setup.deckLights != false
+        let deckHelperSwitchedOn = setup.lightkey && setup.streamDeck && setup.deckLights != false
+        let deckOn = setup.streamDeck
+        let show = showPath
         DispatchQueue.global(qos: .userInitiated).async {
             let pass = Pass()
             var s = Snapshot()
+            // The show's .deck.json (1.32): the helper's rules and the suggested profile. None: built-in.
+            s.deckShow = loadDeckShowFile(forShow: show)
+            if show != nil {
+                pass.api("The show's deck file", "FileManager: read \(show.map(deckShowFilePath) ?? "")", deckShowFileText(s.deckShow))
+            }
+            let helperArgs = s.deckShow?.file.helperArgs ?? deckHelperArgs
+            let deckHelperOn = deckHelperSwitchedOn && (s.deckShow.map { $0.file.helperArgs != nil } ?? true)
+            // Stream Deck's profiles and which one each deck is on (1.32). Read only.
+            if deckOn {
+                let read = readDeckProfiles()
+                s.deckProfiles = read
+                pass.api("Stream Deck profiles", "FileManager: read \(read.folder ?? streamDeckSupportDir)/*.sdProfile/manifest.json and Profiles/*/manifest.json",
+                         deckProfilesText(read))
+                let prefs = deckPreferredProfiles(readStreamDeckDevices())
+                s.deckPreferred = prefs.preferred
+                s.deckPrefsProblem = prefs.problem
+                pass.api("Stream Deck's profile per deck", "CFPreferencesCopyAppValue(\"Devices\", \"\(IDs.streamDeck)\") \u{2192} each deck \u{2192} ESDProfilesInfo \u{2192} ESDProfilesPreferred",
+                         prefs.problem ?? (prefs.preferred.isEmpty ? "(no decks listed)" : prefs.preferred.sorted { $0.key < $1.key }.map { k, v in
+                            "\(k): \(v)" + (read.profiles.first { $0.uuid == v }.map { " (\u{201C}\($0.name)\u{201D})" } ?? "")
+                         }.joined(separator: "\n")))
+            }
             // The deck lights helper: switched on here, or not decided yet (then it's looked for).
             if deckHelperOn {
                 s.deckHelperRead = true
@@ -1856,6 +2374,13 @@ final class Booth: ObservableObject {
                 s.deckHelperLastLog = tail.flatMap { String(decoding: $0, as: UTF8.self).split(separator: "\n").last.map(String.init) }
                 pass.api("Deck lights helper's copy and log", "SHA-256 of \(deckHelperBinary); the last line of \(deckHelperLog)",
                          "Installed: \(s.deckHelperSHA ?? "none"). Booth Check carries: \(deckHelperBundledSHA ?? "none").\nLast log line: \(s.deckHelperLastLog ?? "(no log)")")
+                s.deckHelperProgramArgs = installedHelperArgs(FileManager.default.contents(atPath: deckHelperPlist))
+                if s.deckHelperInstalled {
+                    let same = deckHelperArgsCurrent(installed: s.deckHelperProgramArgs, expected: helperArgs)
+                    pass.api("Deck lights helper's settings", "Read ProgramArguments from \(deckHelperPlist)",
+                             "Installed: \(s.deckHelperProgramArgs?.dropFirst().joined(separator: " ") ?? "(couldn\u{2019}t read)")\nBooth Check would install: \(helperArgs.joined(separator: " "))\n"
+                                + (same == true ? "The same." : same == false ? "Different: installed with old settings." : "Can\u{2019}t tell."))
+                }
             }
             let batt = pass.sh("Power source", "/usr/bin/pmset", ["-g", "batt"]).out
             s.onAC = batt.contains("'AC Power'")
@@ -1939,6 +2464,16 @@ final class Booth: ObservableObject {
     // Accessibility, NSWorkspace, CoreMIDI and AppleScript all run here on the main thread.
     private func finish(_ s: Snapshot, _ pass: Pass) {
         var out: [Check] = []
+        // The show's .deck.json: noted in the Log whenever what it says changes (and at the first pass).
+        let showText = deckShowFileText(s.deckShow)
+        if showText != deckShowText {
+            deckShowText = showText
+            if s.deckShow?.file != deckShow { deckShow = s.deckShow?.file }
+            if s.deckShow != nil || deckShowTextLogged {
+                logSetting("The show\u{2019}s deck file", showText)
+            }
+            deckShowTextLogged = true
+        }
         let running = NSWorkspace.shared.runningApplications
         let lightkey = running.first { $0.bundleIdentifier == IDs.lightkey }
         let deckApp = running.first { $0.bundleIdentifier == IDs.streamDeck }
@@ -2060,9 +2595,19 @@ final class Booth: ObservableObject {
             let check = deckHelperCheck(installed: s.deckHelperInstalled, loaded: s.deckHelperLoaded, state: s.deckHelperState,
                                         feedbackPort: sources.contains { $0.localizedCaseInsensitiveContains(IDs.deckFeedback) },
                                         current: s.deckHelperSHA.flatMap { sha in deckHelperBundledSHA.map { $0 == sha } },
-                                        lastLog: s.deckHelperLastLog, gaveUp: deckHelperGaveUp(fixes: deckHelperFixesAgo))
+                                        lastLog: s.deckHelperLastLog, gaveUp: deckHelperGaveUp(fixes: deckHelperFixesAgo),
+                                        argsCurrent: s.deckHelperInstalled ? deckHelperArgsCurrent(installed: s.deckHelperProgramArgs, expected: helperArgsInUse) : nil)
             out.append(check)
             keepDeckHelperRunning(check)
+        }
+        if let read = s.deckProfiles {
+            if read != deckProfiles { deckProfiles = read }
+            if let choice = setup.deckProfile {
+                let check = deckProfileCheck(choice: choice, read: read, preferred: s.deckPreferred, prefsProblem: s.deckPrefsProblem,
+                                             writeFailed: deckProfileWriteFailed)
+                out.append(check)
+                diagDeckProfile(choice: choice, read: read, preferred: s.deckPreferred, check: check)
+            }
         }
         // Other apps this Mac keeps open, such as ProPresenter ---------------------------------------
         for app in setup.apps where app.on {
@@ -2414,13 +2959,16 @@ final class Booth: ObservableObject {
                 message = "This copy of Booth Check doesn\u{2019}t carry the deck lights helper."
                 return
             }
-            let script = deckHelperInstallScript(from: source)
+            let args = helperArgsInUse
+            let script = deckHelperInstallScript(from: source, args: args)
             pending = PendingChange(
                 key: "deckInstall", title: "Install the deck lights helper",
-                explanation: "Copies the helper Booth Check carries (version \(sha.prefix(8))) to this Mac and hands it to macOS\u{2019}s launchd for this account, which starts it now and at every login, and restarts it within 2 seconds whenever it stops. Any older copy is stopped and replaced. It publishes the \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port the deck\u{2019}s key lights follow, and sends nothing to Lightkey. Then Booth Check watches it start (a few seconds), and restarts Stream Deck if it\u{2019}s open, so the keys pick the new port up. No password needed.",
+                explanation: "Copies the helper Booth Check carries (version \(sha.prefix(8))) to this Mac and hands it to macOS\u{2019}s launchd for this account, which starts it now and at every login, and restarts it within 2 seconds whenever it stops. Any older copy is stopped and replaced. It publishes the \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port the deck\u{2019}s key lights follow, and sends nothing to Lightkey. Then Booth Check watches it start (a few seconds), and restarts Stream Deck if it\u{2019}s open, so the keys pick the new port up. No password needed. Its rules for this show: "
+                    + (args.isEmpty ? "none (the helper\u{2019}s defaults)" : args.joined(separator: " "))
+                    + (deckShow?.helperFromFile == true ? ", from the show\u{2019}s .deck.json." : ", the built-in ones."),
                 language: "Terminal", code: script,
                 undo: commandLine("/bin/launchctl", deckHelperStopArgs()) + "; rm " + commandLine(deckHelperPlist, []),
-                run: { runDeckHelperInstall(script) })
+                run: { runDeckHelperInstall(script, args: args) })
             return
         case .startDeckHelper:
             let args = deckHelperStartArgs()
@@ -2457,6 +3005,23 @@ final class Booth: ObservableObject {
                 explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
             return
+        case .switchDeckProfile(let device, let target, let from, let name):
+            let fromName = deckProfiles.profiles.first { $0.uuid == from }.map { "\u{201C}\($0.name)\u{201D}" } ?? "the profile it\u{2019}s on now"
+            pending = PendingChange(
+                key: "deckProfile", title: "Put Stream Deck on \u{201C}\(name)\u{201D}",
+                explanation: "Stream Deck closes for a few seconds and its keys go dark meanwhile; then it opens again in the background on \u{201C}\(name)\u{201D} instead of \(fromName). Booth Check changes the one setting Stream Deck reads at start for which profile this deck shows, only while Stream Deck is closed, and leaves everything else in its settings as it is. About 10 seconds after Stream Deck opens, Booth Check reads it back: if Stream Deck put its old choice back, the row says how to choose the profile in Stream Deck instead. No password needed. Each step goes in the Log.",
+                language: "Booth Check steps", code: deckProfileSwitchSteps(device: device, to: target),
+                undo: deckProfileSwitchSteps(device: device, to: from),
+                run: {
+                    DispatchQueue.main.async { self.switchDeckProfile(device: device, to: target, name: name, during: "Switch the profile") { _ in } }
+                    return ("Switching now. Each step goes in the Log.", 0)
+                })
+            return
+        case .acceptDeckProfile:
+            guard let choice = setup.deckProfile, case .found(let p, _) = matchDeckProfile(choice, in: deckProfiles.profiles) else { return }
+            setup.deckProfile = DeckProfileChoice(p)
+            logSetting("This Mac: \u{201C}\(p.name)\u{201D} kept as it is now",
+                       "Its keys changed since it was chosen (keys \(choice.sigHash) \u{2192} \(p.sigHash)); Booth Check now expects them as they are.")
         case .noStreamDeck:
             setup.streamDeck = false
             logSetting("This Mac has no Stream Deck", "Stream Deck checks switched off; Get the show started no longer opens it.")
@@ -2659,7 +3224,9 @@ extension Booth {
         case "midi": return s.lightkey && s.streamDeck
         case "deck", "deckapp", "nap": return s.streamDeck
         // Undecided counts too (1.27): a Mac that hasn't got the helper yet shows the row red with Install…
-        case "deckLights": return s.lightkey && s.streamDeck && s.deckLights != false
+        // A show whose .deck.json says "helper": null doesn't use it (1.32).
+        case "deckLights": return s.lightkey && s.streamDeck && s.deckLights != false && showUsesHelper
+        case "deckProfile": return s.streamDeck && s.deckProfile != nil
         case "ac", "sleep", "screen", "lpm", "autoboot", "upd", "lock", "reopen": return s.alwaysOn
         case "selfLogin": return s.alwaysOn || (autoStart && canStartShow)
         case "autoShow": return autoStart && canStartShow
@@ -2742,6 +3309,21 @@ extension Booth {
         showSetup = false
         logSetting("This Mac: \(setup.summary.isEmpty ? "nothing switched on" : setup.summary)",
                    "\(offForThisMac) check\(offForThisMac == 1 ? "" : "s") off for this Mac.")
+    }
+
+    /// This Mac's "Profile for the service" picker: a profile's UUID, or "" for Don't check.
+    func chooseDeckProfile(_ tag: String) {
+        if tag == "missing" { return }
+        if tag.isEmpty {
+            guard setup.deckProfile != nil else { return }
+            setup.deckProfile = nil
+            logSetting("This Mac: Stream Deck profile not checked", "Booth Check no longer checks which profile Stream Deck is on, or switches it at the start-up.")
+            return
+        }
+        guard let p = deckProfiles.profiles.first(where: { $0.uuid == tag }), setup.deckProfile != DeckProfileChoice(p) else { return }
+        setup.deckProfile = DeckProfileChoice(p)
+        logSetting("This Mac: Stream Deck profile for the service: \u{201C}\(p.name)\u{201D}",
+                   "\(deckProfileHint(p, among: deckProfiles.profiles)); keys \(p.sigHash), profile \(p.uuid), deck \(p.device). Booth Check checks Stream Deck is on it, and puts it on it at the start-up while Stream Deck is closed.")
     }
 
     /// Booth Check's own settings go in the Log too, so a silenced check can always be traced.
@@ -2851,7 +3433,7 @@ extension Booth {
         let apps = setup.apps.filter(\.on)
         let ids = startUpOrder(lightkey: setup.lightkey, dmx: setup.dmx, streamDeck: setup.streamDeck,
                                apps: apps.map { "app:\($0.bundleID)" }, checkOnly: checkOnly,
-                               deckLights: setup.deckLights == true)
+                               deckLights: setup.deckLights == true && showUsesHelper)
         let show = showName.map { ($0 as NSString).deletingPathExtension }
         return ids.map { id in
             let title: String
@@ -2902,6 +3484,7 @@ extension Booth {
         signLightkeyOpened = isRunning(IDs.lightkey)       // reopened by macOS, it may be asking already
         signDMXLinked = false
         bootStartedAt = Date()
+        lastDeckProfileDiag = nil           // deck_profile goes once per start-up (and on change)
         bootTimeline = []
         lightkeyRunningAtStart = isRunning(IDs.lightkey)
         dmxFirstSeen = nil
@@ -3155,7 +3738,31 @@ extension Booth {
             }
 
         case "deck":
-            let finish: ((state: StepState, detail: String, opened: Bool)) -> Void = { result in
+            // 1.32: the profile that goes with the show, switched in the gap while Stream Deck is closed.
+            let profileFix = deckProfileFixNeeded()
+            var wrote: (ok: Bool, text: String)?
+            let write = {
+                guard let f = profileFix else { return }
+                wrote = self.setPreferredProfile(device: f.device, to: f.target, name: f.name, during: "Start-up")
+            }
+            if let f = profileFix { showWorkingSign(.deckProfileSwitching(f.name)) }
+            let finish: ((state: StepState, detail: String, opened: Bool)) -> Void = { incoming in
+                var result = incoming
+                if let f = profileFix {
+                    let ok = wrote?.ok == true
+                    result.detail += ok ? " Put it on the \u{201C}\(f.name)\u{201D} profile."
+                                        : " Couldn\u{2019}t put it on \u{201C}\(f.name)\u{201D}: choose it at the top of Stream Deck\u{2019}s window."
+                    if !ok && result.state == .done { result.state = .warn }
+                    self.endWorkingSign(ok ? .deckProfileSwitched(f.name) : .deckProfileFailed(f.name), ok: ok)
+                    if ok {
+                        self.verifyDeckProfile(device: f.device, target: f.target, name: f.name, during: "Start-up") { stuck in
+                            self.diagEvent("self_repair", ["what": .string("deck_profile"), "why": .string("Start-up"), "result": .string(stuck ? "ok" : "didn't stick")])
+                            self.refresh()
+                        }
+                    } else {
+                        self.diagEvent("self_repair", ["what": .string("deck_profile"), "why": .string("Start-up"), "result": .string("failed")])
+                    }
+                }
                 self.setStep(i, result.state, result.detail)
                 // When the show comes next, give the plugin a few seconds to connect to Lightkey first,
                 // so it's listening when Lightkey sends every cue's state as the show opens.
@@ -3171,8 +3778,9 @@ extension Booth {
             if shouldRestartStreamDeck(enabled: true, deckRunning: isRunning(IDs.streamDeck), startUpDeckStep: true,
                                        lightkeyJustLaunched: false, busy: false) {
                 setStep(i, .running, "Restarting it so every key starts clean\u{2026}")
-                restartStreamDeck(during: "Start-up", then: finish)
+                restartStreamDeck(during: "Start-up", whileClosed: write, then: finish)
             } else {
+                write()
                 finish(openStreamDeckInBackground(during: "Start-up"))
             }
 
@@ -3264,7 +3872,10 @@ extension Booth {
 
     /// Quits Stream Deck (made to quit after 5 seconds if it hangs: it has nothing to save), then opens
     /// it again in the background, so every key starts dark (see `shouldRestartStreamDeck`). Logged.
-    func restartStreamDeck(during what: String, then done: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
+    /// `whileClosed` runs in the gap, once Stream Deck has quit and before it opens again (1.32: the
+    /// profile switch, see `setPreferredProfile`).
+    func restartStreamDeck(during what: String, whileClosed: (() -> Void)? = nil,
+                           then done: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck)
         apps.forEach { _ = $0.terminate() }
         let started = Date()
@@ -3275,6 +3886,7 @@ extension Booth {
                                         code: "NSRunningApplication.terminate (Stream Deck), then open it again",
                                         output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off. A freshly opened Stream Deck has every key dark.",
                                         status: 0), at: 0)
+                whileClosed?()
                 let result = openStreamDeckInBackground(during: what)
                 return done((result.state, "Restarted it so every key starts clean. " + result.detail, result.opened))
             }
@@ -3327,6 +3939,150 @@ extension Booth {
             self.diagEvent("self_repair", ["what": .string("streamdeck_open"), "why": .string("not running"), "result": .string(ok ? "ok" : "failed")])
             self.endWorkingSign(ok ? .deckReopened : .deckFailed, ok: ok)
         }
+    }
+
+    // MARK: The Stream Deck profile (1.32)
+
+    /// At the start-up: the switch to make, if the deck isn't on the chosen profile and the settings are
+    /// exactly the shape Booth Check knows. Logged either way.
+    func deckProfileFixNeeded() -> (device: String, target: String, name: String)? {
+        guard setup.streamDeck, let choice = setup.deckProfile else { return nil }
+        let read = readDeckProfiles()
+        deckProfiles = read
+        let devices = readStreamDeckDevices()
+        let preferred = deckPreferredProfiles(devices)
+        var out: String
+        var fix: (device: String, target: String, name: String)?
+        if let p = read.problem {
+            out = "Can\u{2019}t tell: \(p) Nothing changed."
+        } else if case .found(let target, _) = matchDeckProfile(choice, in: read.profiles) {
+            let current = preferred.preferred[target.device]
+            let sameKeys = read.profiles.first { $0.uuid == current }?.sigHash == target.sigHash
+            if current == target.uuid || (current != nil && sameKeys) {
+                out = "Already on \u{201C}\(target.name)\u{201D}. Nothing changed."
+            } else {
+                let g = deckPrefsWriteGuard(devices: devices, device: target.device, target: target.uuid,
+                                            targetFolderExists: deckProfileFolder(uuid: target.uuid, in: read.folder) != nil)
+                if g.ok {
+                    out = "On \(current.map { c in read.profiles.first { $0.uuid == c }.map { "\u{201C}\($0.name)\u{201D}" } ?? c } ?? "nothing"), the service needs \u{201C}\(target.name)\u{201D}: switching it while Stream Deck is closed."
+                    fix = (target.device, target.uuid, target.name)
+                } else {
+                    out = "On the wrong profile, but Booth Check won\u{2019}t write: \(g.why) Nothing changed."
+                }
+            }
+        } else {
+            out = "\u{201C}\(choice.name)\u{201D} isn\u{2019}t clearly one installed profile (missing, or more than one). Nothing changed."
+        }
+        changes.insert(LogEntry(title: "Start-up: Stream Deck\u{2019}s profile", language: "macOS API",
+                                code: "Read \(read.folder ?? streamDeckSupportDir) and CFPreferencesCopyAppValue(\"Devices\", \"\(IDs.streamDeck)\")",
+                                output: out, status: fix == nil && !out.hasPrefix("Already") ? 1 : 0), at: 0)
+        return fix
+    }
+
+    /// Writes `target` as `device`'s preferred profile through CFPreferences: only with Stream Deck
+    /// closed, and only when `deckPrefsWriteGuard` passes. Logs before and after.
+    @discardableResult
+    func setPreferredProfile(device: String, to target: String, name: String, during what: String) -> (ok: Bool, text: String) {
+        var out: String, ok = false
+        if isRunning(IDs.streamDeck) {
+            out = "Stream Deck is still open, so nothing was written (it would write its own choice back)."
+        } else {
+            let devices = readStreamDeckDevices()
+            let folder = readDeckProfiles().folder
+            let g = deckPrefsWriteGuard(devices: devices, device: device, target: target,
+                                        targetFolderExists: deckProfileFolder(uuid: target, in: folder) != nil)
+            if !g.ok {
+                out = "Nothing written: \(g.why)"
+            } else if g.current?.lowercased() == target.lowercased() {
+                out = "Already \(target). Nothing written."
+                ok = true
+            } else if let d = devices as? [String: Any], let new = deckDevicesSetting(d, device: device, preferred: target) {
+                let synced = writeStreamDeckDevices(new)
+                let after = deckPreferredProfiles(readStreamDeckDevices()).preferred[device]
+                ok = synced && after == target.lowercased()
+                out = "Before: \(g.current ?? "(none)"). After: \(after ?? "(none)")." + (synced ? "" : " macOS said it couldn\u{2019}t save the setting.")
+            } else {
+                out = "Nothing written: the Devices setting changed shape while it was read."
+            }
+        }
+        changes.insert(LogEntry(title: "\(what): put Stream Deck on \u{201C}\(name)\u{201D}", language: "macOS API",
+                                code: "CFPreferencesSetAppValue(\"Devices\", \u{2026}, \"\(IDs.streamDeck)\"): \(device) \u{2192} ESDProfilesInfo \u{2192} ESDProfilesPreferred = \"\(target)\"; CFPreferencesAppSynchronize",
+                                output: out, status: ok ? 0 : 1), at: 0)
+        return (ok, out)
+    }
+
+    /// Once Stream Deck is up again, waits 10 s and reads the preferred profile back: Stream Deck may
+    /// write its own choice over it. If it did, the row says how to choose it in Stream Deck instead.
+    func verifyDeckProfile(device: String, target: String, name: String, during what: String, then done: @escaping (Bool) -> Void) {
+        poll(every: 1, for: 30, {
+            NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck).first?.isFinishedLaunching == true
+        }) { up in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                let now = deckPreferredProfiles(readStreamDeckDevices()).preferred[device]
+                let ok = up && now == target.lowercased()
+                self.deckProfileWriteFailed = !ok
+                self.changes.insert(LogEntry(
+                    title: "\(what): checked Stream Deck kept \u{201C}\(name)\u{201D}", language: "macOS API",
+                    code: "CFPreferencesCopyAppValue(\"Devices\", \"\(IDs.streamDeck)\") \u{2192} \(device) \u{2192} ESDProfilesInfo \u{2192} ESDProfilesPreferred, 10 s after Stream Deck opened",
+                    output: !up ? "Stream Deck didn\u{2019}t open within 30 seconds, so Booth Check can\u{2019}t tell."
+                        : ok ? "Still \(target): it stuck."
+                        : "Now \(now ?? "(none)"), not \(target): the write didn\u{2019}t take (Stream Deck put its own choice back). The row now says to choose \u{201C}\(name)\u{201D} in Stream Deck.",
+                    status: ok ? 0 : 1), at: 0)
+                done(ok)
+            }
+        }
+    }
+
+    /// The row's Fix: Stream Deck closes, the profile is switched in the gap, it opens again, then the
+    /// switch is read back. The working sign says what's happening.
+    func switchDeckProfile(device: String, to target: String, name: String, during what: String, then done: @escaping (Bool) -> Void) {
+        guard !deckProfileSwitching, !shuttingDown else { return done(false) }
+        deckProfileSwitching = true
+        showWorkingSign(.deckProfileSwitching(name))
+        var wrote = (ok: false, text: "Stream Deck didn\u{2019}t close, so nothing was written.")
+        let write = { wrote = self.setPreferredProfile(device: device, to: target, name: name, during: what) }
+        let end = { (ok: Bool, why: String) in
+            self.deckProfileSwitching = false
+            self.diagEvent("self_repair", ["what": .string("deck_profile"), "why": .string(why), "result": .string(ok ? "ok" : "failed")])
+            self.endWorkingSign(ok ? .deckProfileSwitched(name) : .deckProfileFailed(name), ok: ok)
+            done(ok)
+            self.refresh()
+        }
+        let opened = { (result: (state: StepState, detail: String, opened: Bool)) in
+            guard wrote.ok else { return end(false, "\(what): " + wrote.text) }
+            self.verifyDeckProfile(device: device, target: target, name: name, during: what) { ok in
+                end(ok, ok ? "\(what): switched" : "\(what): didn\u{2019}t stick")
+            }
+        }
+        if isRunning(IDs.streamDeck) {
+            restartStreamDeck(during: what, whileClosed: write, then: opened)
+        } else {
+            write()
+            opened(openStreamDeckInBackground(during: what))
+        }
+    }
+
+    /// deck_profile: what the deck is on and what the service wants, at each start-up and on change.
+    func diagDeckProfile(choice: DeckProfileChoice, read: DeckProfilesRead, preferred: [String: String], check: Check) {
+        var target: DeckProfile?
+        if case .found(let p, _) = matchDeckProfile(choice, in: read.profiles) { target = p }
+        let current = target.flatMap { preferred[$0.device] }
+        let match: String
+        switch check.status {
+        case .ok: match = "yes"
+        case .warn: match = "yes_warn"
+        case .fail: match = "no"
+        default: match = "unknown"
+        }
+        let props: [String: DiagValue] = [
+            "preferred": .string(current.map { c in read.profiles.first { $0.uuid == c }?.name ?? "not installed" } ?? "unknown"),
+            "wanted": .string(choice.name), "match": .string(match),
+            "keys": .int(target?.keys.count ?? 0), "sig": .string(target?.sigHash ?? choice.sigHash),
+            "plugin": .string(target?.pluginVersions.joined(separator: ",") ?? "")]
+        let sig = props.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value.text)" }.joined(separator: "|")
+        guard sig != lastDeckProfileDiag else { return }
+        lastDeckProfileDiag = sig
+        diagEvent("deck_profile", props)
     }
 
     /// After each check of the deck lights helper: when it has stopped working, start or restart it
@@ -4656,7 +5412,8 @@ func passTitlesForCheck(_ id: String) -> [String] {
     case "lkpass": return ["Lightkey connects without the password"]
     case "midi": return ["Lightkey's MIDI input", "Running apps"]
     case "deck": return ["USB devices"]
-    case "deckLights": return ["Deck lights helper installed", "Deck lights helper in launchd", "Deck lights helper's copy and log", "The deck lights helper's MIDI port"]
+    case "deckLights": return ["Deck lights helper installed", "Deck lights helper in launchd", "Deck lights helper's copy and log", "Deck lights helper's settings", "The deck lights helper's MIDI port", "The show's deck file"]
+    case "deckProfile": return ["Stream Deck profiles", "Stream Deck's profile per deck"]
     case "ac": return ["Power source"]
     case "sleep", "lpm": return ["Sleep settings"]
     case "screen": return ["What keeps the screen on"]
@@ -5268,7 +6025,7 @@ struct SetupSheet: View {
                                 ? "Controls Lightkey. Checks the deck, its app, and that Lightkey is listening for it."
                                 : "Checks the deck is plugged in and its app is open.",
                                isOn: $booth.setup.streamDeck) {
-                            if booth.setup.streamDeck && booth.setup.lightkey { deckOptions }
+                            if booth.setup.streamDeck { deckOptions }
                         }
                         ForEach($booth.setup.apps) { $app in
                             Divider().padding(.leading, indent)
@@ -5408,6 +6165,64 @@ struct SetupSheet: View {
     /// by itself the first time Booth Check finds it installed.
     private var deckOptions: some View {
         VStack(alignment: .leading, spacing: 6) {
+            profilePicker
+            if booth.setup.lightkey { helperOptions }
+        }
+        .padding(.leading, indent)
+    }
+
+    /// The installed profile the saved choice is (its tag), "missing" when it isn't installed, "" for Don't check.
+    private var chosenProfileTag: String {
+        guard let c = booth.setup.deckProfile else { return "" }
+        if case .found(let p, _) = matchDeckProfile(c, in: booth.deckProfiles.profiles) { return p.uuid }
+        return "missing"
+    }
+
+    /// 1.32: the profile that goes with the show. Picked once; Booth Check checks the deck is on it and
+    /// switches it at the start-up.
+    private var profilePicker: some View {
+        let profiles = booth.deckProfiles.profiles
+        let tag = chosenProfileTag
+        let suggested = booth.setup.deckProfile == nil ? booth.deckShow?.profile : nil
+        let suggestions = suggested.map { s in profiles.filter { $0.name == s } } ?? []
+        return VStack(alignment: .leading, spacing: 2) {
+            Picker(selection: Binding(get: { tag }, set: { booth.chooseDeckProfile($0) })) {
+                Text("Don\u{2019}t check").tag("")
+                if tag == "missing", let c = booth.setup.deckProfile {
+                    Text("\u{201C}\(c.name)\u{201D} (not installed)").tag("missing")
+                }
+                ForEach(profiles) { p in Text(deckProfileHint(p, among: profiles)).tag(p.uuid) }
+            } label: {
+                Text("Profile for the service").font(.system(size: 12))
+            }
+            .fixedSize()
+            Text(booth.deckProfiles.problem.map { "Can\u{2019}t list the profiles: \($0)" }
+                 ?? (tag.isEmpty ? "Pick the profile that goes with the show, and Booth Check checks Stream Deck is on it."
+                                 : "Booth Check checks Stream Deck is on it, and switches it at the start-up, while Stream Deck is closed."))
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let suggested {
+                HStack(spacing: 8) {
+                    Text(suggestions.count == 1 ? "The show\u{2019}s deck file suggests \u{201C}\(suggested)\u{201D}."
+                         : suggestions.isEmpty ? "The show\u{2019}s deck file suggests \u{201C}\(suggested)\u{201D}, which isn\u{2019}t installed."
+                         : "The show\u{2019}s deck file suggests \u{201C}\(suggested)\u{201D}: \(suggestions.count) profiles have that name, pick one above.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if suggestions.count == 1 {
+                        Button("Use it") { booth.chooseDeckProfile(suggestions[0].uuid) }.controlSize(.small)
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var helperOptions: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !booth.showUsesHelper {
+                Text("The show\u{2019}s deck file says it doesn\u{2019}t use the deck lights helper, so it isn\u{2019}t checked.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             Toggle(isOn: Binding(get: { booth.setup.deckLights != false }, set: { booth.setup.deckLights = $0 })) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Deck lights helper").font(.system(size: 12))
@@ -5430,7 +6245,6 @@ struct SetupSheet: View {
             }
             .padding(.leading, 20)
         }
-        .padding(.leading, indent)
     }
 
     private var deckHelperVersions: String {

@@ -28,8 +28,9 @@ its window once so whoever sits down sees what to fix.
      Deck plugin looks for it when it starts), with the [deck lights helper](#the-deck-lights-helper)
      also wait for its "Lightkey Feedback" port (launchd starts the helper at login; not there
      within 3 seconds, Booth Check starts or restarts it through launchd at once, logged, and waits
-     up to 20 seconds in all, then carries on with a warning), switch App Nap off if it's on, open **Stream Deck in
-     the background**, and give its plugin 10 seconds to connect. Lightkey sends every cue's state
+     up to 20 seconds in all, then carries on with a warning), switch App Nap off if it's on, put the
+     deck on the [profile chosen for the service](#the-stream-deck-profile) if it isn't (while Stream
+     Deck is closed), open **Stream Deck in the background**, and give its plugin 10 seconds to connect. Lightkey sends every cue's state
      once, at the moment the show opens, so the deck is listening by then and its Default key lights
      (tested with the DMX box and a Stream Deck XL, 9 Oct 2026: Lightkey 1.4 s, Stream Deck 2.4 s,
      the show 13.8 s, Default sent as on)
@@ -99,7 +100,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | On this Mac | What Booth Check does |
 |---|---|
 | **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks; switching Lightkey off switches those off too |
-| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check, start-up wait and restarts. Until someone unticks it, it counts as on, so a Mac without the helper shows the row red with **Install…**. **Install / update…** under it installs the helper Booth Check carries |
+| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check, start-up wait and restarts. Until someone unticks it, it counts as on, so a Mac without the helper shows the row red with **Install…**. **Install / update…** under it installs the helper Booth Check carries. **Profile for the service** picks the Stream Deck profile that goes with the show (default **Don't check**; see [The Stream Deck profile](#the-stream-deck-profile)) |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
@@ -127,7 +128,7 @@ the sheet.
 | Group | Checks |
 |---|---|
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey connects without the password · Lightkey's MIDI input ready for the Stream Deck |
-| Stream Deck | Stream Deck plugged in · Stream Deck app running · deck lights helper running *(where it's ticked in This Mac)* |
+| Stream Deck | Stream Deck plugged in · Stream Deck app running · deck lights helper running *(where it's ticked in This Mac)* · Stream Deck is on the right profile *(where a profile is chosen in This Mac)* |
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · the screen stays on · Low Power Mode off · App Nap off |
 | Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) · old apps don't reopen at start-up (macOS's "Reopen windows when logging back in"; **Switch it off…** runs `defaults write com.apple.loginwindow TALLogoutSavesState -bool false` and the same for `LoginwindowLaunchesRelaunchApps`, undo `-bool true`) |
 | Updates | macOS won't install updates by itself |
@@ -266,6 +267,61 @@ back after a restart. Restarting the helper doesn't need Stream Deck restarted: 
 port up again by itself (rig, 28 Oct 2026). The check is under This Mac → Stream Deck → **Deck
 lights helper**; Booth Check ticks it the first time it finds the helper installed, and after that
 it's a plain setting, so a helper that goes missing shows red rather than vanishing.
+
+The row also compares the installed LaunchAgent's `ProgramArguments` with what Booth Check would
+install for this show: different, it's orange, "installed with old settings", with **Install…** (the
+same install, with the right rules).
+
+### The show's deck file
+
+A show can carry a `<show name>.deck.json` next to it (for `BackupChurch_modular_v38.lightkeyproj`,
+`BackupChurch_modular_v38.deck.json`), saying how its deck is meant to work:
+
+```json
+{"helper": {"channels": "2", "mask": "2:3-6", "while": "2:38-39", "alias": "2:22=2:40,2:23=2:41"},
+ "profile": "Lightkey XL Service"}
+```
+
+- `helper`: the deck lights helper's rules for this show, passed as `--channels`, `--mask`, `--while`,
+  `--alias` (each optional text; `mask` and `while` go together; every key inside `channels`, which
+  defaults to 5-13). `"helper": null`: this show doesn't use the helper, so its rows and its start-up
+  wait don't apply.
+- `profile`: the Stream Deck profile name This Mac suggests (**Use it**), when none is chosen yet.
+
+No file: exactly the built-in Summit rules (`--mask 5:3-6 --while 6:38-39,8:38-39,10:38-39,13:38-39
+--alias 5:22=5:40,5:23=5:41`). Unknown keys are ignored; a bad value means the built-in rules, with a
+warning in the Log. What the file says goes in the Log when it changes.
+
+### The Stream Deck profile
+
+A tech picks the profile that goes with the show once, in This Mac → Stream Deck → **Profile for the
+service**. The list shows each installed profile with a hint ("Lightkey XL Service · 44 keys · channel
+2"); two with the same name are told apart by the hint, then by their keys' hash. Booth Check keeps
+the profile's name, UUID and a **signature**: the set of (channel, note, mode, MIDI in, MIDI out) over
+its MIDI keys. Importing a `.streamDeckProfile` makes a copy with a new UUID, and versions share a
+name, so the chosen profile is found by UUID, then by signature, then by name; more than one left is
+"can't tell", not a failure.
+
+Booth Check reads the profiles from `~/Library/Application Support/com.elgato.StreamDeck/ProfilesV3`
+(or `ProfilesV2` when it's the same shape), and which profile the deck shows from Stream Deck's
+settings (`Devices` → the deck → `ESDProfilesInfo` → `ESDProfilesPreferred`), every 15 seconds,
+logged. **Stream Deck is on the right profile** is green when the deck is on it (or on a copy with the
+same keys), red with "Stream Deck is on '…', the service needs '…'" when it isn't, and unknown when
+it can't be read. The same row is red when the profile isn't installed any more, and warns (orange)
+when its keys changed since it was chosen (**Use it as it is now** keeps it as it is), when some MIDI keys don't
+send to "Lightkey Input", and when its keys were made with different or older (before 4.3) MIDI
+plugin versions.
+
+There's no supported way to switch a profile, so Booth Check changes that one setting itself, **only
+with Stream Deck closed** and only when it's exactly the shape above and the profile's folder exists;
+anything else, it writes nothing. It reads `Devices`, changes the one value, writes it back with
+`CFPreferencesSetAppValue` (never the plist file), logs before and after, opens Stream Deck in the
+background, and 10 seconds later reads it back. At the start-up it does this in the Stream Deck
+step, when Stream Deck is closed anyway, only if the deck is on the wrong profile, with the sign
+"Putting Stream Deck on the '…' profile". Afterwards it never switches by itself: the red row's
+**Switch Stream Deck to it…** shows the steps (Stream Deck closes for a few seconds, its keys go dark)
+and the undo. If Stream Deck puts its own choice back, the Log says the write didn't take, and the row
+says "In Stream Deck, choose '…' at the top of its window" instead.
 
 ## Get the show started
 
