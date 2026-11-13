@@ -9,7 +9,10 @@ its window once so whoever sits down sees what to fix.
 - **Lives in the menu bar.** No Dock icon, not in Cmd-Tab, never takes focus from Lightkey. The icon's
   shape shows the state: a tick when everything's fine, a triangle or cross with a count when
   something needs attention. Click it to see just the problems, **Get the show started**, **Shut
-  down the booth**, and **Open Booth Check** for the full window.
+  down the booth**, and **Open Booth Check** for the full window. **Quit** shows only while you
+  hold **Option**, so it isn't one stray click. The icon is kept in the menu bar: dragged off, it's
+  put straight back, and each check makes sure it's showing (logged only when that changes; missing
+  twice running, it's put back once more).
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
   the top right that floats over everything, full-screen Lightkey included, without taking focus:
 
@@ -114,7 +117,7 @@ the sheet.
 | Lighting | DMX interface plugged in · Lightkey running · the right show open · Lightkey sending DMX *(experimental)* · Lightkey connects without the password · Lightkey's MIDI input ready for the Stream Deck |
 | Stream Deck | Stream Deck plugged in · Stream Deck app running · deck lights helper running *(where it's ticked in This Mac)* |
 | Power & sleep | on the charger · starts up when the charger is plugged in *(laptops, optional)* · never sleeps on the charger · the screen stays on · Low Power Mode off · App Nap off |
-| Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) |
+| Start at login | Booth Check opens at login · Booth Check starts the show · no show opens on its own · Stream Deck waits for Lightkey (each offers Remove when something else would race it; This Mac also lists anything else macOS opens at login) · old apps don't reopen at start-up (macOS's "Reopen windows when logging back in"; **Switch it off…** runs `defaults write com.apple.loginwindow TALLogoutSavesState -bool false` and the same for `LoginwindowLaunchesRelaunchApps`, undo `-bool true`) |
 | Updates | macOS won't install updates by itself |
 | Check these yourself | USB accessories allowed without asking *(Apple silicon only; Intel Macs don't ask)* · no password after idle (macOS doesn't let apps read these two) |
 
@@ -242,19 +245,23 @@ sign is only for the start-up at login: whoever clicks the button is already at 
 
 1. A **10-second countdown** comes up in the middle of the screen, with **Not yet** (stops it) and
    **Shut down now**.
-2. Behind a "Shutting the booth down" sign, **Stream Deck closes**. It has nothing to save, so if
-   it hangs it's made to quit after 5 seconds.
-3. **Lightkey closes.** In Live mode, when it's the front app, Lightkey asks "Are you sure you want to
+2. Behind a "Shutting the booth down" sign, **every other app is asked to quit** (Chrome, Mail…:
+   anything with a Dock icon but Finder), as its own Quit would, never forced. Booth Check waits up
+   to 8 seconds, logs any still open, and carries on; one asking to save holds up step 5.
+3. **Stream Deck closes**. It has nothing to save, so if it hangs it's made to quit after 5 seconds.
+4. **Lightkey closes.** In Live mode, when it's the front app, Lightkey asks "Are you sure you want to
    quit Lightkey?"; Booth Check presses its **Quit** (Accessibility, the permission it already has
    for reading the show). Still open after 15 seconds, say asking to save the show, it's made to
    quit, as Force Quit does: changes since the show opened aren't saved, the same as **Don't Save**,
    and Booth Check opens the chosen show file next time anyway. Nothing waits for a person. Only if
    Lightkey survives even that does Booth Check stop and leave the Mac on.
-4. **macOS shuts down** (`tell application "System Events" to shut down`). Any other app can still
+5. **macOS shuts down** (`tell application "System Events" to shut down`). Any other app can still
    say no, and then the Mac stays on and the sign says so.
 
-Closing Stream Deck and Lightkey first also keeps macOS from reopening them at the next login, where
-they'd race the start-up. Every step is kept in the Log.
+Closing the apps first also keeps macOS from reopening them at the next login, where they'd race
+the start-up (the "Old apps don't reopen at start-up" check covers a shutdown from the Apple menu).
+At a login start-up the Log lists the apps that were already open, and says so when macOS reopened
+Lightkey before the start-up. Every step is kept in the Log.
 
 **Shut down by itself** (in This Mac) is the backstop for when nobody remembers. At the set time it
 gives a **5-minute** countdown, then does the same. **Not yet** asks again in half an hour. It only
@@ -280,7 +287,7 @@ macOS has no setting for this on a MacBook's own battery; its power-cut shutdown
   page of System Settings instead and says which setting to change.
 
 Other buttons only open things: the show, the Stream Deck app, or a page of System Settings. The one
-exception is **Shut down the booth**, which closes Stream Deck and Lightkey and shuts the Mac down
+exception is **Shut down the booth**, which closes the open apps and shuts the Mac down
 once its countdown runs out (**Not yet** stops it). Its timed version only runs if it's switched on
 in This Mac. Both keep every step in the Log.
 
@@ -326,7 +333,7 @@ It needs nothing installed. It's one universal app for Apple silicon and Intel, 
 10. Print `docs/Lighting_SOP.pdf` for the booth: one page for volunteers with starting, finishing and
     what to do when something's wrong.
 
-To quit it, click the menu bar icon → Quit. To bring the window back, click the icon → Open Booth
+To quit it, click the menu bar icon, hold **Option** and click **Quit**. To bring the window back, click the icon → Open Booth
 Check, or open Booth Check again from Applications.
 
 ## Updates

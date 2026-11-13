@@ -437,6 +437,100 @@ func defaultsSaysOn(_ output: String) -> Bool {
     ["1", "true", "yes"].contains(output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
 }
 
+// MARK: - Old apps reopening at login, other apps at the shutdown, the menu bar icon (1.30)
+
+/// The commands that stop macOS reopening the apps that were open at shutdown, and their undo.
+/// TALLogoutSavesState is the "Reopen windows when logging back in" tick in the shutdown dialog; macOS
+/// treats it as on when it isn't set.
+func reopenAppsCommands(reopen: Bool) -> [[String]] {
+    let value = reopen ? "true" : "false"
+    return [["write", "com.apple.loginwindow", "TALLogoutSavesState", "-bool", value],
+            ["write", "com.apple.loginwindow", "LoginwindowLaunchesRelaunchApps", "-bool", value]]
+}
+
+/// Whether macOS reopens the apps that were open at shutdown, from
+/// `defaults read com.apple.loginwindow TALLogoutSavesState` (output with stderr, and its exit code).
+/// Not set means on (macOS's default). nil: the output made no sense, so the row says it couldn't tell.
+func reopensAppsAtLogin(_ output: String, code: Int32) -> Bool? {
+    if output.contains("does not exist") { return true }
+    guard code == 0 else { return nil }
+    // `defaults` can print a timestamped line first; the value is the last line.
+    let last = output.split(separator: "\n").last.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+    switch last {
+    case "0", "false", "no": return false
+    case "1", "true", "yes": return true
+    default: return nil
+    }
+}
+
+/// A running app as the shutdown and the start-up's log see it.
+typealias RunningAppInfo = (bundleID: String?, name: String, regular: Bool)
+
+/// Apps the shutdown leaves to its own steps or never asks to quit: Finder (it always relaunches),
+/// and Lightkey and Stream Deck, which close afterwards with their own handling (see `close`).
+let shutdownLeavesOpen: Set<String> = ["com.apple.finder", IDs.lightkey, IDs.streamDeck]
+
+/// Which of `apps` (by index) count as other apps someone opened: ordinary apps with a Dock icon
+/// (activation policy .regular), not Booth Check itself and not any bundle ID in `skip`.
+func otherRegularApps(_ apps: [RunningAppInfo], selfID: String?, skip: Set<String>) -> [Int] {
+    apps.indices.filter { i in
+        let a = apps[i]
+        guard a.regular else { return false }
+        if let id = a.bundleID {
+            if id == selfID || skip.contains(id) { return false }
+        }
+        return true
+    }
+}
+
+/// The apps the shutdown asks to quit before Stream Deck and Lightkey close.
+func appsToQuitBeforeShutdown(_ apps: [RunningAppInfo], selfID: String?) -> [Int] {
+    otherRegularApps(apps, selfID: selfID, skip: shutdownLeavesOpen)
+}
+
+/// Saved "NSStatusItem Visible …" keys that hide a menu bar icon (someone ⌘-dragged it off), so the
+/// launch can clear them and the icon comes back.
+func hiddenStatusItemKeys(_ defaults: [String: Any]) -> [String] {
+    defaults.compactMap { key, value in
+        key.hasPrefix("NSStatusItem Visible") && (value as? Bool) == false ? key : nil
+    }.sorted()
+}
+
+/// Whether Booth Check's own menu bar icon is showing: its status bar window exists, has a size, and
+/// sits on a screen.
+func menuIconShown(windowFound: Bool, frame: CGRect, screens: [CGRect]) -> Bool {
+    windowFound && frame.width > 0 && frame.height > 0 && screens.contains { $0.intersects(frame) }
+}
+
+/// Whether one of the front app's window sizes covers a whole screen (a full-screen app hides the menu bar).
+func coversAScreen(_ windows: [CGSize], screens: [CGSize]) -> Bool {
+    windows.contains { w in screens.contains { $0.width == w.width && $0.height == w.height } }
+}
+
+/// The menu bar icon's watch from pass to pass (see `watchMenuIcon`).
+struct IconWatch: Equatable {
+    var lastShown: Bool? = nil      // nil before the first pass
+    var missingPasses = 0
+    var reinsertTried = false       // once per time it goes missing
+}
+
+/// One 15-second pass of the icon's watch: the new state, whether to log (only when shown/not shown
+/// changes), and whether to try putting the icon back (missing two passes in a row, once).
+func iconPass(_ w: IconWatch, shown: Bool) -> (watch: IconWatch, log: Bool, reinsert: Bool) {
+    var n = w
+    let log = w.lastShown != shown
+    n.lastShown = shown
+    if shown {
+        n.missingPasses = 0
+        n.reinsertTried = false
+        return (n, log, false)
+    }
+    n.missingPasses += 1
+    let reinsert = n.missingPasses >= 2 && !n.reinsertTried
+    if reinsert { n.reinsertTried = true }
+    return (n, log, reinsert)
+}
+
 /// Apps whose window must keep the keyboard: macOS's password box, permission prompts, the login window.
 let promptApps: Set<String> = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter", "com.apple.coreservices.uiagent",
                                "com.apple.accessibility.universalAccessAuthWarn", "com.apple.loginwindow"]
@@ -1009,7 +1103,7 @@ enum Status {
 }
 
 enum Action {
-    case fixAppNap, chooseShow, openShow, launchStreamDeck, lightkeyNoPassword
+    case fixAppNap, chooseShow, openShow, launchStreamDeck, lightkeyNoPassword, stopReopeningApps
     case startDeckHelper, restartDeckHelper, installDeckHelper
     case allowAccessibility, allowAutomation, makeLoginShow, addStreamDeckToLogin, addSelfToLogin
     case removeLoginItem(LoginItem)
@@ -1027,6 +1121,7 @@ enum Action {
         case .openShow: return "Open the show"
         case .launchStreamDeck: return "Open Stream Deck"
         case .lightkeyNoPassword: return "Switch it on\u{2026}"
+        case .stopReopeningApps: return "Switch it off\u{2026}"
         case .startDeckHelper: return "Start\u{2026}"
         case .restartDeckHelper: return "Restart\u{2026}"
         case .installDeckHelper: return "Install\u{2026}"
@@ -1103,6 +1198,7 @@ struct Snapshot {
     var lightkeySerial: [String] = []       // USB serial ports Lightkey has open
     var hasBattery = false                  // a laptop, so starting from the charger applies
     var lightkeyNoPassword = false          // Lightkey's DontUnloadFTDIDrivers is on
+    var reopensApps: Bool? = true           // macOS reopens the apps open at shutdown; nil = couldn't tell
     var screenKeptOn = false                // macOS lists Booth Check's keep-the-screen-on request
     var deckHelperRead = false              // the deck lights helper was looked at this pass
     var deckHelperInstalled = false         // its LaunchAgents plist is there
@@ -1155,6 +1251,26 @@ func appNapCheck(appNapOff: Bool, switchedOffAt: Date?, deckLaunched: Date?) -> 
                  detail: "macOS won't put the Stream Deck app to sleep.")
 }
 
+/// macOS reopening the apps that were open at shutdown (see `reopensAppsAtLogin`): they open before
+/// Booth Check's start-up, in no order, Lightkey included.
+func reopenAppsCheck(_ reopens: Bool?) -> Check {
+    let title = "Old apps don\u{2019}t reopen at start-up"
+    switch reopens {
+    case false?:
+        return Check(id: "reopen", group: "Start at login", title: title, status: .ok,
+                     detail: "macOS doesn\u{2019}t reopen the apps that were open at shutdown.")
+    case true?:
+        return Check(id: "reopen", group: "Start at login", title: title, status: .warn,
+                     detail: "macOS reopens the apps that were open at shutdown, before Booth Check\u{2019}s start-up and in no order.",
+                     fix: "Switch off reopening windows when logging back in.", action: .stopReopeningApps)
+    case nil:
+        return Check(id: "reopen", group: "Start at login", title: title, status: .unknown,
+                     detail: "Couldn\u{2019}t read the setting.",
+                     fix: "When shutting down from the Apple menu, untick \u{201C}Reopen windows when logging back in\u{201D}.",
+                     action: .stopReopeningApps)
+    }
+}
+
 final class Booth: ObservableObject {
     static let shared = Booth()
 
@@ -1202,6 +1318,14 @@ final class Booth: ObservableObject {
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
+    /// Lightkey was running when Booth Check started at login: macOS reopened it (see `logAppsOpenAtLogin`).
+    var lightkeyReopenedByMacOS = false
+    /// The menu bar icon: kept inserted (see `keepMenuIcon`), and its 15-second self-check (`watchMenuIcon`).
+    @Published var menuIconInserted = true {
+        didSet { if !menuIconInserted && !reinsertingIcon { keepMenuIcon() } }
+    }
+    var reinsertingIcon = false
+    var iconWatch = IconWatch()
     private var timers: [Timer] = []
 
     /// What this Mac is for. Checks for parts it doesn't use are switched off (and counted).
@@ -1334,6 +1458,9 @@ final class Booth: ObservableObject {
             s.hasBattery = batt.contains("InternalBattery")
             s.lightkeyNoPassword = defaultsSaysOn(pass.sh("Lightkey connects without the password", "/usr/bin/defaults",
                                                           ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
+            let reopen = pass.sh("Old apps reopen at start-up", "/usr/bin/defaults",
+                                 ["read", "com.apple.loginwindow", "TALLogoutSavesState"])
+            s.reopensApps = reopensAppsAtLogin(reopen.out, code: reopen.code)
             if s.hasBattery {
                 let boot = pass.sh("Starts from the charger", "/usr/sbin/nvram", [bootVariable])
                 if boot.code == 0 {
@@ -1658,6 +1785,7 @@ final class Booth: ObservableObject {
                              status: .unknown, detail: "Couldn't read the login items: \(msg)",
                              action: .open(Settings.loginItems, "Open Login Items")))
         }
+        out.append(reopenAppsCheck(s.reopensApps))
 
         // Updates ------------------------------------------------------------------------------
         switch s.autoInstall {
@@ -1810,6 +1938,24 @@ final class Booth: ObservableObject {
                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                 undo: commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: false)),
                 run: { shell("/usr/bin/defaults", args) })
+            return
+        case .stopReopeningApps:
+            let off = reopenAppsCommands(reopen: false), on = reopenAppsCommands(reopen: true)
+            pending = PendingChange(
+                key: "reopen", title: "Don\u{2019}t reopen old apps at start-up",
+                explanation: "Switches off macOS reopening the apps that were open at shutdown (the \u{201C}Reopen windows when logging back in\u{201D} tick when you shut down from the Apple menu). They\u{2019}d open before Booth Check\u{2019}s start-up and in no order, Lightkey included. Booth Check still opens what this Mac needs, in order. It applies from the next shutdown, for this account. No password needed.",
+                language: "Terminal",
+                code: off.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
+                undo: on.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
+                run: {
+                    var outs: [String] = [], code: Int32 = 0
+                    for args in off {
+                        let r = shell("/usr/bin/defaults", args)
+                        outs.append("$ " + commandLine("/usr/bin/defaults", args) + (r.out.isEmpty ? "" : "\n" + r.out))
+                        if r.code != 0 { code = r.code }
+                    }
+                    return (outs.joined(separator: "\n"), code)
+                })
             return
         case .restartDeckHelper:
             let args = deckHelperRestartArgs()
@@ -2044,7 +2190,7 @@ extension Booth {
         case "deck", "deckapp", "nap": return s.streamDeck
         // Undecided counts too (1.27): a Mac that hasn't got the helper yet shows the row red with Install…
         case "deckLights": return s.lightkey && s.streamDeck && s.deckLights != false
-        case "ac", "sleep", "screen", "lpm", "autoboot", "upd", "lock": return s.alwaysOn
+        case "ac", "sleep", "screen", "lpm", "autoboot", "upd", "lock", "reopen": return s.alwaysOn
         case "selfLogin": return s.alwaysOn || (autoStart && canStartShow)
         case "autoShow": return autoStart && canStartShow
         case "loginShows", "loginShow": return s.alwaysOn && s.lightkey
@@ -2134,11 +2280,91 @@ extension Booth {
     }
 }
 
+// MARK: - The menu bar icon (1.30)
+
+/// "NSStatusItem Visible …" keys found false and cleared at launch (see `BoothCheckApp.init`).
+var clearedStatusItemKeys: [String] = []
+
+extension Booth {
+    /// At launch: the icon is inserted, and any saved setting that hid it was cleared.
+    func logMenuIconLaunch() {
+        changes.insert(LogEntry(title: "Menu bar icon: put in the menu bar at launch", language: "macOS API",
+                                code: "MenuBarExtra(isInserted: true); UserDefaults: remove any \u{201C}NSStatusItem Visible \u{2026}\u{201D} key set to false",
+                                output: clearedStatusItemKeys.isEmpty ? "No saved setting hid it."
+                                    : "Cleared: " + clearedStatusItemKeys.joined(separator: ", ") + " (it had been dragged off the menu bar).",
+                                status: 0), at: 0)
+    }
+
+    /// The icon was taken out (⌘-dragged off the menu bar): put it straight back, and say so.
+    func keepMenuIcon() {
+        DispatchQueue.main.async {
+            guard !self.menuIconInserted, !self.reinsertingIcon else { return }
+            self.menuIconInserted = true
+            self.changes.insert(LogEntry(title: "Menu bar icon: put back", language: "macOS API",
+                                         code: "MenuBarExtra isInserted false \u{2192} true",
+                                         output: "The icon had been taken out of the menu bar, so Booth Check put it back.",
+                                         status: 0), at: 0)
+        }
+    }
+
+    /// Read-only, each 15-second pass: is Booth Check's own status bar window there, sized and on a
+    /// screen? Logged only when that changes. Missing two passes running, it's re-inserted once.
+    func watchMenuIcon() {
+        let (shown, about) = menuIconState()
+        let r = iconPass(iconWatch, shown: shown)
+        iconWatch = r.watch
+        if r.log {
+            changes.insert(LogEntry(title: "Menu bar icon: \(shown ? "shown" : "not shown")", language: "macOS API",
+                                    code: "NSApp.windows: Booth Check\u{2019}s NSStatusBarWindow, its frame and screen; CGWindowList: the front app\u{2019}s window sizes",
+                                    output: about, status: shown ? 0 : 1), at: 0)
+        }
+        guard r.reinsert else { return }
+        reinsertingIcon = true
+        menuIconInserted = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.menuIconInserted = true
+            self.reinsertingIcon = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let (back, about) = self.menuIconState()
+                self.changes.insert(LogEntry(title: "Menu bar icon: re-inserted (missing two checks running)", language: "macOS API",
+                                             code: "MenuBarExtra isInserted true \u{2192} false \u{2192} true",
+                                             output: (back ? "Shown again. " : "Still not shown. ") + about, status: back ? 0 : 1), at: 0)
+            }
+        }
+    }
+
+    private func menuIconState() -> (Bool, String) {
+        let window = NSApp.windows.first { $0.className.contains("NSStatusBarWindow") }
+        let frame = window?.frame ?? .zero
+        let shown = menuIconShown(windowFound: window != nil, frame: frame, screens: NSScreen.screens.map(\.frame))
+        let front = NSWorkspace.shared.frontmostApplication
+        let about = (window == nil ? "No status bar window." : "Frame: \(NSStringFromRect(frame)).")
+            + " Screen: " + (window?.screen?.localizedName ?? "none") + "."
+            + " Front app: \(front?.localizedName ?? "none"), " + (frontAppFullScreen(front) ? "full screen." : "not full screen.")
+        return (shown, about)
+    }
+
+    private func frontAppFullScreen(_ app: NSRunningApplication?) -> Bool {
+        guard let pid = app?.processIdentifier,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        let sizes = list.compactMap { w -> CGSize? in
+            guard (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid,
+                  (w[kCGWindowLayer as String] as? Int) == 0,
+                  let b = w[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: b) else { return nil }
+            return rect.size
+        }
+        return coversAScreen(sizes, screens: NSScreen.screens.map(\.frame.size))
+    }
+}
+
 // MARK: - Timing and getting the show started
 
 extension Booth {
     /// Called by the 15-second timer. Holds off while a change is waiting for approval.
     func tick() {
+        watchMenuIcon()
         keepScreenOn()
         if pending == nil { refresh() }
         checkShutdownTime()
@@ -2171,6 +2397,22 @@ extension Booth {
         }
     }
 
+    /// 1.30: at login, writes to the Log which apps with a Dock icon were already open as Booth Check
+    /// started (macOS reopening the apps open at shutdown, see `reopenAppsCheck`). Log only; nothing is quit.
+    func logAppsOpenAtLogin() {
+        let running = NSWorkspace.shared.runningApplications
+        let info: [RunningAppInfo] = running.map { ($0.bundleIdentifier, $0.localizedName ?? $0.bundleIdentifier ?? "pid \($0.processIdentifier)", $0.activationPolicy == .regular) }
+        let open = otherRegularApps(info, selfID: Bundle.main.bundleIdentifier, skip: ["com.apple.finder"]).map { info[$0].name }
+        lightkeyReopenedByMacOS = isRunning(IDs.lightkey)
+        changes.insert(LogEntry(title: "Start-up: apps already open when the start-up began", language: "macOS API",
+                                code: "NSWorkspace: list the running apps with a Dock icon (not Finder, not Booth Check)",
+                                output: (open.isEmpty ? "None." : "Already open when the start-up began: " + open.joined(separator: ", ") + ".")
+                                    + (lightkeyReopenedByMacOS
+                                       ? "\nLightkey was already running before the start-up: macOS reopened it at login, not Booth Check. The start-up\u{2019}s Lightkey steps say \u{201C}Already open\u{201D}."
+                                       : ""),
+                                status: nil), at: 0)
+    }
+
     /// Runs the start-up steps in order, shown live in a small panel that floats over everything,
     /// full-screen Lightkey included. Opens apps only; changes no settings. `checkOnly` is the
     /// login path on a Mac that doesn't start the show: just check, and show the result. `atLogin`
@@ -2181,6 +2423,7 @@ extension Booth {
         bootFinished = false
         bootSettled = false
         bootSteps = plannedSteps(checkOnly: checkOnly)
+        if !atLogin && !checkOnly { lightkeyReopenedByMacOS = false }   // only the login start-up's own find
         signOn = startUpShowsSign(atLogin: atLogin, steps: bootSteps.map(\.id))
         signLightkeyOpened = isRunning(IDs.lightkey)       // reopened by macOS, it may be asking already
         signDMXLinked = false
@@ -2326,7 +2569,10 @@ extension Booth {
                 } else if showMissing {
                     self.setStep(i, .failed, "Can\u{2019}t find \(self.showName ?? "the show"): it was moved, renamed or deleted. Open the show from Lightkey\u{2019}s File menu, then choose it again in Booth Check.")
                 } else if let showPath = self.showPath {
-                    return self.confirmShowOpen(i, showPath, doneText: wasRunning ? "Already open; brought to the front." : "Opened.",
+                    let reopened = self.lightkeyReopenedByMacOS && !self.bootSteps.contains { $0.id == "lightkeyApp" }
+                return self.confirmShowOpen(i, showPath, doneText: !wasRunning ? "Opened."
+                                                : reopened ? "Already open (macOS reopened it at login, before the start-up); brought to the front."
+                                                : "Already open; brought to the front.",
                                                 then: next)
                 } else {
                     self.setStep(i, .warn, "No show is chosen in Booth Check, so open it in Lightkey.")
@@ -2395,7 +2641,7 @@ extension Booth {
             // Lightkey on its own, so its MIDI ports exist and Stream Deck can connect before the show
             // opens (see `startUpOrder`). Launched without a show it opens none (rig, 9 Oct 2026).
             if isRunning(IDs.lightkey) {
-                setStep(i, .done, "Already open.")
+                setStep(i, .done, lightkeyReopenedByMacOS ? "Already open (macOS reopened it at login, before the start-up)." : "Already open.")
                 return next()
             }
             guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) else {
@@ -2746,8 +2992,8 @@ extension Booth {
     }
 
     /// Shuts the booth down (the user asked for it, 6 Oct 2026): first a warning with Not yet (10
-    /// seconds from the menu, 5 minutes at the set time, 1 minute when the power goes off), then Stream
-    /// Deck closes, then Lightkey (its quit question answered, made to quit if it hangs on, see
+    /// seconds from the menu, 5 minutes at the set time, 1 minute when the power goes off), then every
+    /// other app is asked to quit (`quitOtherApps`), then Stream Deck closes, then Lightkey (its quit question answered, made to quit if it hangs on, see
     /// `close`), then macOS shuts down. Closing
     /// the apps first also keeps macOS from reopening them at the next login, where they'd race the
     /// start-up. Every step is logged.
@@ -2788,6 +3034,48 @@ extension Booth {
         guard shuttingDown, !closingApps else { return }
         closingApps = true
         countdownTimer?.invalidate()
+        quitOtherApps { self.closeBoothApps() }
+    }
+
+    /// 1.30: every other app with a Dock icon (Chrome, Mail…) is asked to quit first, as Quit in its
+    /// menu would, never forced: left open, macOS would reopen it at the next login. Up to 8 seconds,
+    /// then the shutdown carries on regardless; an app still asking something holds up macOS's shut
+    /// down, which the minute's wait in `closeBoothApps` covers.
+    private func quitOtherApps(then done: @escaping () -> Void) {
+        let running = NSWorkspace.shared.runningApplications
+        let info: [RunningAppInfo] = running.map { ($0.bundleIdentifier, $0.localizedName ?? $0.bundleIdentifier ?? "pid \($0.processIdentifier)", $0.activationPolicy == .regular) }
+        let apps = appsToQuitBeforeShutdown(info, selfID: Bundle.main.bundleIdentifier).map { running[$0] }
+        let name = { (a: NSRunningApplication) in a.localizedName ?? a.bundleIdentifier ?? "pid \(a.processIdentifier)" }
+        guard !apps.isEmpty else {
+            logShutdown("quit the other apps", "No other apps were open.", status: nil)
+            return done()
+        }
+        SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing the other apps\u{2026}")
+        for a in apps {
+            let asked = a.terminate()
+            logShutdown("quit \(name(a))", asked ? "Asked it to quit (NSRunningApplication terminate, not forced)."
+                                                 : "macOS didn\u{2019}t pass the request on (NSRunningApplication terminate returned false).",
+                        status: asked ? 0 : 1)
+        }
+        let started = Date()
+        func look() {
+            let left = apps.filter { !$0.isTerminated }
+            if left.isEmpty {
+                logShutdown("quit the other apps", "All \(apps.count) closed after \(String(format: "%.1f", Date().timeIntervalSince(started))) s.", status: 0)
+                return done()
+            }
+            if Date().timeIntervalSince(started) >= 8 {
+                logShutdown("quit the other apps",
+                            "Still open after 8 seconds: \(left.map(name).joined(separator: ", ")). Carrying on; one asking to save can hold up macOS\u{2019}s shut down.",
+                            status: 1)
+                return done()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { look() }
+        }
+        look()
+    }
+
+    private func closeBoothApps() {
         SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Stream Deck\u{2026}")
         close(IDs.streamDeck, name: "Stream Deck", forceAfter: 5) { _ in
             SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Lightkey\u{2026}")
@@ -4387,6 +4675,7 @@ struct StatusLabel: View {
 /// What drops down from the menu bar: only what needs attention, and the two things you'd reach for.
 struct MenuPanel: View {
     @ObservedObject var booth: Booth
+    @ObservedObject private var option = OptionKey.shared
 
     var body: some View {
         let s = booth.summary
@@ -4460,12 +4749,30 @@ struct MenuPanel: View {
                 Button("Open Booth Check") { booth.showWindow() }
                 Button("Check again") { booth.refresh() }
                 Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
+                // 1.30: Quit shows only while Option is held, so a volunteer can't close the watch by accident.
+                if option.down {
+                    Button("Quit") { NSApp.terminate(nil) }
+                }
             }
             .controlSize(.small)
         }
         .padding(14)
         .frame(width: 360)
+        .onAppear { option.down = NSEvent.modifierFlags.contains(.option) }
+    }
+}
+
+/// Whether the Option key is held, for the dropdown's Quit (see `MenuPanel`).
+final class OptionKey: ObservableObject {
+    static let shared = OptionKey()
+    @Published var down = false
+    private var monitor: Any?
+    private init() {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in
+            let down = e.modifierFlags.contains(.option)
+            if self?.down != down { self?.down = down }
+            return e
+        }
     }
 }
 
@@ -4492,6 +4799,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                             reason: "Booth Check watches the booth in the background")
         let booth = Booth.shared
         let atLogin = launchedAsLoginItem()
+        booth.logMenuIconLaunch()
+        if atLogin { booth.logAppsOpenAtLogin() }
         booth.start()
         if !atLogin {
             booth.showWindow()                       // someone opened it on purpose
@@ -4517,8 +4826,15 @@ struct BoothCheckApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var booth = Booth.shared
 
+    /// Before the menu bar icon is made: a saved "NSStatusItem Visible …" set to false (someone
+    /// ⌘-dragged it off) would keep it hidden, so it's cleared (logged once the Log exists).
+    init() {
+        clearedStatusItemKeys = hiddenStatusItemKeys(UserDefaults.standard.dictionaryRepresentation())
+        clearedStatusItemKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+    }
+
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: $booth.menuIconInserted) {
             MenuPanel(booth: booth)
         } label: {
             StatusLabel(booth: booth)
