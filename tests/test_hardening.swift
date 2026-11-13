@@ -104,5 +104,18 @@ expect("first 30 s: just Checking…", checkingTitle(waited: 29, waitingFor: "/u
 expect("after 30 s: says what it waits for", checkingTitle(waited: 31, waitingFor: "/usr/sbin/ioreg -p IOUSB") == "Still checking after 31 s: waiting for \u{201C}/usr/sbin/ioreg -p IOUSB\u{201D}",
        checkingTitle(waited: 31, waitingFor: "/usr/sbin/ioreg -p IOUSB"))
 
+// Review fixes (1.30): shell() never waits forever; lsof does no name lookups; the AX timeout.
+let t0 = Date()
+let slow = shell("/bin/sleep", ["30"], timeout: 1)
+let took = Date().timeIntervalSince(t0)
+expect("a command that runs too long is stopped and says so", slow.code == shellTimedOutCode && slow.out.contains("Timed out after 1 s"), "\(slow)")
+expect("…within a few seconds, not 30", took < 5, "\(took)")
+let quick = shell("/bin/echo", ["hello"])
+expect("a quick command is unaffected", quick.code == 0 && quick.out == "hello\n", "\(quick)")
+let failing = shell("/bin/sh", ["-c", "echo nope; exit 3"])
+expect("a failing command keeps its own exit code and output", failing.code == 3 && failing.out == "nope\n", "\(failing)")
+expect("lsof: -n -P, then the pids", lsofArgs([700, 812]) == ["-n", "-P", "-p", "700,812", "-Fn"], "\(lsofArgs([700, 812]))")
+expect("Accessibility calls into other apps wait at most 1 s", axMessagingTimeout == 1.0)
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

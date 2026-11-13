@@ -18,6 +18,7 @@ import CryptoKit
 import IOKit.ps
 import IOKit.pwr_mgt
 import SwiftUI
+import SystemConfiguration
 import UniformTypeIdentifiers
 
 // MARK: - Constants
@@ -228,9 +229,24 @@ func commandLine(_ path: String, _ args: [String]) -> String {
 
 // MARK: - Reading the system
 
+/// lsof's arguments for the files these processes have open: no DNS or port-name lookups (-n -P),
+/// which can stall it for many seconds.
+func lsofArgs(_ pids: [pid_t]) -> [String] {
+    ["-n", "-P", "-p", pids.map(String.init).joined(separator: ","), "-Fn"]
+}
+
+/// The exit code `shell` returns when it stopped a command that ran too long.
+let shellTimedOutCode: Int32 = -2
+
+/// What `shell` adds to a command's output when it had to stop it.
+func shellTimeoutText(_ seconds: TimeInterval) -> String {
+    "Timed out after \(Int(seconds.rounded())) s: Booth Check stopped the command."
+}
+
 /// Runs a built-in command and returns what it printed. Reads before waiting so a large output can't
-/// fill the pipe and hang the command.
-func shell(_ path: String, _ args: [String]) -> (out: String, code: Int32) {
+/// fill the pipe and hang the command. A command still running after `timeout` seconds is stopped
+/// (SIGTERM, then SIGKILL 2 s later) and the result says it timed out, so nothing waits forever.
+func shell(_ path: String, _ args: [String], timeout: TimeInterval = 20) -> (out: String, code: Int32) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
@@ -238,9 +254,33 @@ func shell(_ path: String, _ args: [String]) -> (out: String, code: Int32) {
     p.standardOutput = pipe
     p.standardError = pipe
     do { try p.run() } catch { return ("Couldn't start \(path): \(error.localizedDescription)", -1) }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return (String(decoding: data, as: UTF8.self), p.terminationStatus)
+    let lock = NSLock()
+    var data = Data()
+    let read = DispatchSemaphore(value: 0)
+    let deadline = Date().addingTimeInterval(timeout)
+    DispatchQueue.global(qos: .utility).async {
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        lock.lock(); data = d; lock.unlock()
+        read.signal()
+    }
+    guard read.wait(timeout: .now() + timeout) == .success else {
+        p.terminate()
+        if read.wait(timeout: .now() + 2) == .timedOut {
+            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            _ = read.wait(timeout: .now() + 2)
+        }
+        lock.lock(); let got = String(decoding: data, as: UTF8.self); lock.unlock()
+        return ((got.isEmpty ? "" : got + "\n") + shellTimeoutText(timeout), shellTimedOutCode)
+    }
+    // Output closed; the command itself may take a moment more to exit (or have left a child behind).
+    while p.isRunning && Date() < deadline { usleep(5_000) }
+    if p.isRunning {
+        p.terminate()
+        lock.lock(); let got = String(decoding: data, as: UTF8.self); lock.unlock()
+        return ((got.isEmpty ? "" : got + "\n") + shellTimeoutText(timeout), shellTimedOutCode)
+    }
+    lock.lock(); let out = String(decoding: data, as: UTF8.self); lock.unlock()
+    return (out, p.terminationStatus)
 }
 
 /// One section of `pmset -g custom` output ("AC Power" or "Battery Power") as key -> value.
@@ -360,14 +400,32 @@ final class MIDIWatch {
     }
 }
 
+/// How long an Accessibility call into another app may wait for it to answer (macOS's default is
+/// about 6 s, and these calls run on the main thread: a busy Lightkey would freeze Booth Check).
+let axMessagingTimeout: Float = 1.0
+
+/// An app's Accessibility element with the short timeout. Every application element is made here.
+func axApp(_ pid: pid_t) -> AXUIElement {
+    axTimed(AXUIElementCreateApplication(pid))
+}
+
+/// The same short timeout on an element read from an app (windows, buttons, menu items): set
+/// locally, no message to the app. Used before every call that asks the app something.
+@discardableResult
+func axTimed(_ element: AXUIElement) -> AXUIElement {
+    AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
+    return element
+}
+
 /// Documents (file URLs) and titles of Lightkey's open windows, read through Accessibility.
 func windowsOf(pid: pid_t) -> (docs: [URL], titles: [String]) {
-    let app = AXUIElementCreateApplication(pid)
+    let app = axApp(pid)
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
           let windows = value as? [AXUIElement] else { return ([], []) }
     var docs: [URL] = [], titles: [String] = []
     for w in windows {
+        axTimed(w)
         var doc: CFTypeRef?, title: CFTypeRef?
         if AXUIElementCopyAttributeValue(w, kAXDocumentAttribute as CFString, &doc) == .success,
            let s = doc as? String, let u = URL(string: s) { docs.append(u) }
@@ -395,7 +453,7 @@ func macHasBattery() -> Bool {
 
 private func axAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
     var value: CFTypeRef?
-    return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+    return AXUIElementCopyAttributeValue(axTimed(element), name as CFString, &value) == .success ? value : nil
 }
 
 private func axChildren(_ element: AXUIElement) -> [AXUIElement] {
@@ -404,7 +462,7 @@ private func axChildren(_ element: AXUIElement) -> [AXUIElement] {
 
 /// An app's dialogs and its windows' sheets, not the show's own big window (Accessibility).
 private func axQuestions(pid: pid_t) -> [AXUIElement] {
-    let windows = axAttribute(AXUIElementCreateApplication(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
+    let windows = axAttribute(axApp(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
     return windows.flatMap { window -> [AXUIElement] in
         let subrole = axAttribute(window, kAXSubroleAttribute) as? String
         if subrole == kAXDialogSubrole || subrole == kAXSystemDialogSubrole { return [window] }
@@ -441,7 +499,7 @@ func pressQuitIfAsked(pid: pid_t, message: String, quit: String) -> Bool {
         collect(question, depth: 3, texts: &texts, buttons: &buttons)
         let titles = buttons.map { axAttribute($0, kAXTitleAttribute) as? String ?? "" }
         if let i = quitButton(texts: texts, buttons: titles, message: message, quit: quit) {
-            return AXUIElementPerformAction(buttons[i], kAXPressAction as CFString) == .success
+            return AXUIElementPerformAction(axTimed(buttons[i]), kAXPressAction as CFString) == .success
         }
     }
     return false
@@ -725,17 +783,49 @@ func orphanOladPIDs(_ procs: [PsProcess]) -> [pid_t] {
     return procs.filter { $0.isOlad && ($0.args.contains("Lightkey") || $0.args.hasPrefix("/Library/OLA/")) }.map(\.pid)
 }
 
+/// Whether `pid`, in a `ps` read just now, is still the olad Booth Check meant to signal. Lightkey's
+/// server (Reconnect, the ladder's SIGHUP): an olad whose parent is Lightkey, or the only olad
+/// running. A left-over one (`orphan`): still an olad left without Lightkey (`orphanOladPIDs`).
+/// Anything else (gone, a new pid, another process now holding the number) is not signalled.
+func oladStillTarget(_ procs: [PsProcess], pid: pid_t, orphan: Bool) -> Bool {
+    guard let p = procs.first(where: { $0.pid == pid }), p.isOlad else { return false }
+    if orphan { return orphanOladPIDs(procs).contains(pid) }
+    let lightkeys = Set(procs.filter(\.isLightkey).map(\.pid))
+    return lightkeys.contains(p.ppid) || procs.filter(\.isOlad).count == 1
+}
+
+/// What the Log and the sheet say when the olad has changed since its pid was read.
+let oladChangedText = "Lightkey\u{2019}s DMX server has changed; check again. Booth Check sent nothing."
+
+/// Re-reads `ps` and sends `signal` (e.g. "-HUP") to `pid` only if it's still the olad meant
+/// (`oladStillTarget`); otherwise sends nothing and says so. The output shows the ps read and kill's.
+func signalOladIfStill(_ signal: String, pid: pid_t, orphan: Bool) -> (out: String, code: Int32, sent: Bool) {
+    let ps = shell("/bin/ps", psDMXArgs)
+    let procs = parsePs(ps.out)
+    let found = procs.first { $0.pid == pid }
+    let seen = "$ " + commandLine("/bin/ps", psDMXArgs) + "\n"
+        + (found.map { "pid \($0.pid): \($0.name), parent \($0.ppid), running \($0.etime)" } ?? "pid \(pid) isn\u{2019}t running.")
+    guard ps.code == 0, oladStillTarget(procs, pid: pid, orphan: orphan) else {
+        return (seen + "\n" + oladChangedText, 3, false)
+    }
+    let k = shell("/bin/kill", [signal, String(pid)])
+    return (seen + "\n$ " + commandLine("/bin/kill", [signal, String(pid)]) + (k.out.isEmpty ? "" : "\n" + k.out), k.code, k.code == 0)
+}
+
 /// The olad serving this Lightkey: its child if there is one, else any olad (an external one it reused).
 func lightkeyOlad(_ procs: [PsProcess], lightkeyPID: pid_t?) -> PsProcess? {
     procs.first { $0.isOlad && $0.ppid == lightkeyPID } ?? procs.first(where: \.isOlad)
 }
 
-/// Why the start-up shouldn't wait before trying to reconnect, or nil: Lightkey was already running
-/// when the start-up began and the box wasn't seen at once, or olad started before the box first
-/// appeared (so its one scan missed it). Two seconds' slack: ps gives whole seconds, polls are 1 s apart.
-func dmxLinkSuspect(lightkeyRunningAtStart: Bool, boxSeenAtStart: Bool, oladStarted: Date?, boxFirstSeen: Date?) -> String? {
-    if lightkeyRunningAtStart && !boxSeenAtStart {
-        return "Lightkey was already running when the start-up began, before the DMX interface was seen."
+/// Why the start-up shouldn't wait before trying to reconnect, or nil. Only two things make the link
+/// suspect: at a login start-up, macOS reopened Lightkey before the box was seen; or the box really
+/// appeared during this start-up (not at the first look) after olad had started, so olad's one scan
+/// missed it. When the box was there at the first look, when olad started says nothing (an olad that
+/// has run for an hour during a service is fine). Two seconds' slack: ps gives whole seconds, polls are 1 s apart.
+func dmxLinkSuspect(atLogin: Bool, lightkeyRunningAtStart: Bool, boxSeenAtStart: Bool, oladStarted: Date?, boxFirstSeen: Date?) -> String? {
+    if boxSeenAtStart { return nil }
+    if atLogin && lightkeyRunningAtStart {
+        return "macOS reopened Lightkey at login, before the DMX interface was seen."
     }
     if let o = oladStarted, let b = boxFirstSeen, o.addingTimeInterval(2) < b {
         let f = DateFormatter()
@@ -766,23 +856,31 @@ enum DMXRung: Equatable { case held, noLightkey, noBox, waitForPassword, hup(pid
 /// evidence that olad hasn't got the box (`dmxRelaunchJustified`); without it the ladder stops at
 /// `.unconfirmed` and nothing is restarted.
 func dmxLadderNext(boxPresent: Bool, held: Bool, lightkeyRunning: Bool, oladPID: pid_t?, asking: Bool,
-                   accessibility: Bool, ladder: DMXLadder, olaFound: Int?, suspect: Bool, maxRelaunches: Int = 2) -> DMXRung {
+                   accessibility: Bool, ladder: DMXLadder, olaFound: Int?, suspect: Bool, suspectCounts: Bool, maxRelaunches: Int = 2) -> DMXRung {
     if held { return .held }
     if !lightkeyRunning { return .noLightkey }
     if !boxPresent { return .noBox }
     if asking { return .waitForPassword }
     if !ladder.hupTried { return oladPID.map { .hup($0) } ?? .skipHup }
     if !ladder.resetTried { return accessibility ? .resetOutput : .skipReset }
-    guard dmxRelaunchJustified(olaFound: olaFound, oladRunning: oladPID != nil, suspect: suspect) else { return .unconfirmed }
+    guard dmxRelaunchJustified(olaFound: olaFound, oladRunning: oladPID != nil, suspect: suspect, suspectCounts: suspectCounts) else { return .unconfirmed }
     return ladder.relaunches < maxRelaunches ? .relaunch : .giveUp
 }
 
 /// Whether restarting Lightkey for the DMX link is backed by evidence, not just the experimental
 /// "is holding the interface" check: olad's log says "Found 0 FTDI devices", or olad isn't running,
 /// or the link was suspect (olad started before the box appeared, or macOS reopened Lightkey). An
-/// OLA log that found a device, or says nothing, isn't enough.
-func dmxRelaunchJustified(olaFound: Int?, oladRunning: Bool, suspect: Bool) -> Bool {
-    olaFound == 0 || !oladRunning || suspect
+/// OLA log that found a device, or says nothing, isn't enough. A suspect link doesn't count on its own
+/// (`suspectCounts` false) for a Get the show started by hand while Lightkey was already running:
+/// that's during a service, so only olad's log or a missing olad may restart Lightkey.
+func dmxRelaunchJustified(olaFound: Int?, oladRunning: Bool, suspect: Bool, suspectCounts: Bool) -> Bool {
+    olaFound == 0 || !oladRunning || (suspect && suspectCounts)
+}
+
+/// Whether a suspect link may justify restarting Lightkey: not for a start-up by hand (not at login)
+/// that began with Lightkey already running.
+func dmxSuspectCounts(atLogin: Bool, lightkeyRunningAtStart: Bool) -> Bool {
+    atLogin || !lightkeyRunningAtStart
 }
 
 /// What the recovery did, in plain words, for the step's warning.
@@ -796,10 +894,12 @@ func dmxLadderTriedText(_ l: DMXLadder) -> String {
     return "Booth Check " + list + "."
 }
 
-/// Whether a menu item is Lightkey's "Reset DMX Output".
+/// Whether a menu item is Lightkey's "Reset DMX Output": that exact title (any case, spaces around
+/// it, an optional trailing ellipsis), nothing else that mentions reset and DMX.
 func isResetDMXOutputTitle(_ title: String) -> Bool {
-    let t = title.trimmingCharacters(in: .whitespaces).lowercased()
-    return t == "reset dmx output" || (t.contains("reset") && t.contains("dmx"))
+    var t = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if t.hasSuffix("\u{2026}") { t = String(t.dropLast()) } else if t.hasSuffix("...") { t = String(t.dropLast(3)) }
+    return t.trimmingCharacters(in: .whitespaces) == "reset dmx output"
 }
 
 enum DMXRowFix: Equatable { case reconnect(pid_t), checking, restart }
@@ -965,7 +1065,7 @@ func readDMXState(lightkeyPID: pid_t?) -> DMXState {
     guard let lk = lightkeyPID else { return s }
     let pids = [lk] + s.procs.filter(\.isOlad).map(\.pid)
     s.held = !usbConnections(shell("/usr/sbin/ioreg", ["-l", "-w0", "-c", "IOUserClient"]).out, pids: pids).isEmpty
-        || shell("/usr/sbin/lsof", ["-p", pids.map(String.init).joined(separator: ","), "-Fn"]).out.split(separator: "\n").contains {
+        || shell("/usr/sbin/lsof", lsofArgs(pids)).out.split(separator: "\n").contains {
             $0.hasPrefix("n/dev/") && ($0.contains("usbserial") || $0.contains("usbmodem"))
         }
     return s
@@ -974,7 +1074,7 @@ func readDMXState(lightkeyPID: pid_t?) -> DMXState {
 /// Presses a menu item of an app's menu bar through Accessibility. Returns whether it pressed, and
 /// the item's menu path if found ("Lightkey > Reset DMX Output").
 func pressMenuItem(pid: pid_t, matching: (String) -> Bool) -> (pressed: Bool, path: String?) {
-    guard let bar = axAttribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute) else { return (false, nil) }
+    guard let bar = axAttribute(axApp(pid), kAXMenuBarAttribute) else { return (false, nil) }
     func search(_ e: AXUIElement, depth: Int, path: [String]) -> (AXUIElement, String)? {
         for c in axChildren(e) {
             let title = axAttribute(c, kAXTitleAttribute) as? String ?? ""
@@ -986,7 +1086,7 @@ func pressMenuItem(pid: pid_t, matching: (String) -> Bool) -> (pressed: Bool, pa
     }
     guard let (item, path) = search(bar as! AXUIElement, depth: 4, path: []) else { return (false, nil) }
     let enabled = axAttribute(item, kAXEnabledAttribute) as? Bool ?? true
-    return (enabled && AXUIElementPerformAction(item, kAXPressAction as CFString) == .success, path)
+    return (enabled && AXUIElementPerformAction(axTimed(item), kAXPressAction as CFString) == .success, path)
 }
 
 // MARK: - The deck lights helper (pure parts)
@@ -1089,7 +1189,7 @@ func deckHelperStartVerdict(_ log: String, final: Bool, args: [String] = deckHel
 func runDeckHelperInstall(_ script: String, args: [String] = deckHelperArgs) -> (out: String, code: Int32) {
     let logSize = { (try? FileManager.default.attributesOfItem(atPath: deckHelperLog)[.size] as? Int) ?? 0 }
     let from = logSize()
-    let r = shell("/bin/bash", ["-c", script])
+    let r = shell("/bin/bash", ["-c", script], timeout: 60)
     guard r.code == 0 else { return (r.out + "\nThe install stopped there; nothing was started.", r.code) }
     var verdict: (ok: Bool, text: String)?
     for i in 1...24 where verdict == nil {
@@ -1637,6 +1737,12 @@ func deckProfileCheck(choice: DeckProfileChoice, read: DeckProfilesRead, preferr
 func shouldOpenStreamDeck(enabled: Bool, installed: Bool, running: Bool, busy: Bool,
                           needsLightkey: Bool, lightkeyReady: Bool, sinceLast: TimeInterval) -> Bool {
     enabled && installed && !running && !busy && (!needsLightkey || lightkeyReady) && sinceLast >= 60
+}
+
+/// Whether Booth Check is busy with Stream Deck itself, so the 15-second checks leave it closed: a
+/// start-up, the shutdown, or a restart or profile switch that closed it on purpose.
+func streamDeckBusy(starting: Bool, shuttingDown: Bool, closedOnPurpose: Bool) -> Bool {
+    starting || shuttingDown || closedOnPurpose
 }
 
 /// Whether to restart a running Stream Deck so its keys start clean. A latch key (a colour, a house
@@ -2192,6 +2298,12 @@ final class Booth: ObservableObject {
     var deckProfileWriteFailed = false
     var lastDeckProfileDiag: String?
     var deckProfileSwitching = false
+    /// Stream Deck restarts under way (`restartStreamDeck`: the start-up, a Lightkey launch, the helper
+    /// install, a profile switch). See `streamDeckClosedOnPurpose`.
+    var deckRestartsRunning = 0
+    /// Booth Check has closed Stream Deck on purpose (or is about to): a restart or a profile switch
+    /// under way. The shutdown has `shuttingDown`. Nothing may reopen it meanwhile.
+    var streamDeckClosedOnPurpose: Bool { deckRestartsRunning > 0 || deckProfileSwitching }
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
@@ -2203,6 +2315,8 @@ final class Booth: ObservableObject {
     var bootStartedAt: Date?
     var bootTimeline: [String] = []
     var lightkeyRunningAtStart = false
+    /// Whether this start-up is the login one (a suspect link may then restart Lightkey; see `dmxSuspectCounts`).
+    var bootAtLogin = false
     var dmxFirstSeen: Date?
     var dmxSeenAtStart = false
     var dmxLadder = DMXLadder()
@@ -2441,7 +2555,7 @@ final class Booth: ObservableObject {
                     output: (s.lightkeyUSB.isEmpty ? "None opened by \(who)." : s.lightkeyUSB.joined(separator: "\n"))
                         + "\n(Only connections opened by Lightkey or olad are shown.)",
                     status: io.code))
-                let lsofArgs = ["-p", pids.map(String.init).joined(separator: ","), "-Fn"]
+                let lsofArgs = lsofArgs(pids)
                 let ls = shell("/usr/sbin/lsof", lsofArgs)
                 s.lightkeySerial = ls.out.split(separator: "\n").compactMap { line in
                     line.hasPrefix("n/dev/") && (line.contains("usbserial") || line.contains("usbmodem"))
@@ -2937,8 +3051,9 @@ final class Booth: ObservableObject {
             let args = ["-HUP", String(pid)]
             pending = PendingChange(
                 key: "dmxReconnect", title: "Reconnect the lights",
-                explanation: "Sends a hang-up signal to olad (pid \(pid)), Lightkey\u{2019}s DMX server: it asks Lightkey\u{2019}s DMX server to look for the interface again (olad reloads its plugins and scans USB once more). The lights should not change. Booth Check shows a sign while it checks for about 12 seconds; if this row is still red afterwards, it offers Restart Lightkey instead. No password needed.",
-                language: "Terminal", code: commandLine("/bin/kill", args), run: { shell("/bin/kill", args) })
+                explanation: "Sends a hang-up signal to olad (pid \(pid)), Lightkey\u{2019}s DMX server: it asks Lightkey\u{2019}s DMX server to look for the interface again (olad reloads its plugins and scans USB once more). The lights should not change. Booth Check first checks that pid \(pid) is still Lightkey\u{2019}s olad, and sends nothing if it has changed. Booth Check shows a sign while it checks for about 12 seconds; if this row is still red afterwards, it offers Restart Lightkey instead. No password needed.",
+                language: "Terminal", code: commandLine("/bin/ps", psDMXArgs) + "   # still Lightkey\u{2019}s olad?\n" + commandLine("/bin/kill", args),
+                run: { let r = signalOladIfStill("-HUP", pid: pid, orphan: false); return (r.out, r.code) })
             return
         case .restartLightkeyForDMX:
             pending = PendingChange(
@@ -3487,6 +3602,7 @@ extension Booth {
         lastDeckProfileDiag = nil           // deck_profile goes once per start-up (and on change)
         bootTimeline = []
         lightkeyRunningAtStart = isRunning(IDs.lightkey)
+        bootAtLogin = atLogin
         dmxFirstSeen = nil
         dmxSeenAtStart = false
         dmxLadder = DMXLadder()
@@ -3875,7 +3991,13 @@ extension Booth {
     /// `whileClosed` runs in the gap, once Stream Deck has quit and before it opens again (1.32: the
     /// profile switch, see `setPreferredProfile`).
     func restartStreamDeck(during what: String, whileClosed: (() -> Void)? = nil,
-                           then done: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
+                           then finished: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
+        // While it's closed on purpose, the 15-second checks mustn't reopen it (`keepStreamDeckOpen`).
+        deckRestartsRunning += 1
+        let done = { (r: (state: StepState, detail: String, opened: Bool)) in
+            self.deckRestartsRunning -= 1
+            finished(r)
+        }
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.streamDeck)
         apps.forEach { _ = $0.terminate() }
         let started = Date()
@@ -3907,11 +4029,12 @@ extension Booth {
                   (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == IDs.lightkey,
                   shouldRestartStreamDeck(enabled: self.setup.streamDeck, deckRunning: self.isRunning(IDs.streamDeck),
                                           startUpDeckStep: false, lightkeyJustLaunched: true,
-                                          busy: self.starting || self.shuttingDown) else { return }
+                                          busy: streamDeckBusy(starting: self.starting, shuttingDown: self.shuttingDown,
+                                                               closedOnPurpose: self.streamDeckClosedOnPurpose)) else { return }
             self.poll(every: 1, for: 30, {
                 MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }
             }) { _ in
-                guard !self.starting, !self.shuttingDown, self.isRunning(IDs.streamDeck) else { return }
+                guard !self.starting, !self.shuttingDown, !self.streamDeckClosedOnPurpose, self.isRunning(IDs.streamDeck) else { return }
                 self.showWorkingSign(.deckRestarting)
                 self.restartStreamDeck(during: "Lightkey started") { result in
                     let ok = result.state == .done
@@ -3927,7 +4050,8 @@ extension Booth {
     func keepStreamDeckOpen() {
         guard shouldOpenStreamDeck(enabled: setup.streamDeck,
                                    installed: NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) != nil,
-                                   running: isRunning(IDs.streamDeck), busy: starting || shuttingDown,
+                                   running: isRunning(IDs.streamDeck),
+                                   busy: streamDeckBusy(starting: starting, shuttingDown: shuttingDown, closedOnPurpose: streamDeckClosedOnPurpose),
                                    needsLightkey: setup.lightkey,
                                    lightkeyReady: MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) },
                                    sinceLast: Date().timeIntervalSince(lastDeckOpen ?? .distantPast)) else { return }
@@ -4036,7 +4160,7 @@ extension Booth {
     /// The row's Fix: Stream Deck closes, the profile is switched in the gap, it opens again, then the
     /// switch is read back. The working sign says what's happening.
     func switchDeckProfile(device: String, to target: String, name: String, during what: String, then done: @escaping (Bool) -> Void) {
-        guard !deckProfileSwitching, !shuttingDown else { return done(false) }
+        guard !streamDeckClosedOnPurpose, !shuttingDown else { return done(false) }
         deckProfileSwitching = true
         showWorkingSign(.deckProfileSwitching(name))
         var wrote = (ok: false, text: "Stream Deck didn\u{2019}t close, so nothing was written.")
@@ -4235,20 +4359,21 @@ extension Booth {
                                         + "\n(Only olad is shown.)",
                                     status: ps.code))
             func alive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
+            // Each signal re-reads ps first (`signalOladIfStill`): the pid must still be a left-over olad.
             for pid in orphans {
-                let term = shell("/bin/kill", ["-TERM", String(pid)])
-                var gone = false
-                for _ in 0..<12 where !gone { usleep(250_000); gone = !alive(pid) }
+                let term = signalOladIfStill("-TERM", pid: pid, orphan: true)
+                var gone = !term.sent
+                if term.sent { for _ in 0..<12 where !gone { usleep(250_000); gone = !alive(pid) } }
                 entries.append(LogEntry(title: "\(why): stopped the left-over olad (pid \(pid))", language: "Terminal",
-                                        code: commandLine("/bin/kill", ["-TERM", String(pid)]),
-                                        output: (term.out.isEmpty ? "" : term.out + "\n") + (gone ? "olad stopped." : "Still running after 3 seconds."),
+                                        code: commandLine("/bin/ps", psDMXArgs) + "\n" + commandLine("/bin/kill", ["-TERM", String(pid)]),
+                                        output: term.out + "\n" + (!term.sent ? "" : gone ? "olad stopped." : "Still running after 3 seconds."),
                                         status: term.code))
                 if !gone {
-                    let k = shell("/bin/kill", ["-KILL", String(pid)])
-                    usleep(300_000)
+                    let k = signalOladIfStill("-KILL", pid: pid, orphan: true)
+                    if k.sent { usleep(300_000) }
                     entries.append(LogEntry(title: "\(why): made the left-over olad (pid \(pid)) stop", language: "Terminal",
-                                            code: commandLine("/bin/kill", ["-KILL", String(pid)]),
-                                            output: (k.out.isEmpty ? "" : k.out + "\n") + (alive(pid) ? "Still running." : "olad stopped."),
+                                            code: commandLine("/bin/ps", psDMXArgs) + "\n" + commandLine("/bin/kill", ["-KILL", String(pid)]),
+                                            output: k.out + (k.sent ? "\n" + (alive(pid) ? "Still running." : "olad stopped.") : ""),
                                             status: k.code))
                 }
             }
@@ -4271,11 +4396,13 @@ extension Booth {
             let st = readDMXState(lightkeyPID: lk)
             DispatchQueue.main.async {
                 if st.held { return self.dmxLinked(i, next: next) }
-                if self.dmxFirstSeen == nil && st.planes.present { self.dmxFirstSeen = Date() }
+                // Not seen yet (no DMX interface step) but there now: this is the first look, so it was there at once.
+                if self.dmxFirstSeen == nil && st.planes.present { self.dmxFirstSeen = Date(); self.dmxSeenAtStart = true }
                 let why = afterRelaunch ? nil
-                    : dmxLinkSuspect(lightkeyRunningAtStart: self.lightkeyRunningAtStart, boxSeenAtStart: self.dmxSeenAtStart,
+                    : dmxLinkSuspect(atLogin: self.bootAtLogin, lightkeyRunningAtStart: self.lightkeyRunningAtStart, boxSeenAtStart: self.dmxSeenAtStart,
                                      oladStarted: st.olad?.started, boxFirstSeen: self.dmxFirstSeen)
-                self.dmxSuspect = !afterRelaunch && (why != nil || self.lightkeyReopenedByMacOS)
+                self.dmxSuspect = !afterRelaunch
+                    && (why != nil || (self.bootAtLogin && self.lightkeyReopenedByMacOS && !self.dmxSeenAtStart))
                 if let why {
                     self.changes.insert(LogEntry(title: "Start-up: the DMX link is suspect, so Booth Check reconnects straight away",
                                                  language: "Terminal", code: commandLine("/bin/ps", psDMXArgs),
@@ -4320,7 +4447,8 @@ extension Booth {
             DispatchQueue.main.async {
                 let rung = dmxLadderNext(boxPresent: st.planes.present, held: st.held, lightkeyRunning: lk != nil,
                                          oladPID: st.olad?.pid, asking: asking, accessibility: ax, ladder: self.dmxLadder,
-                                         olaFound: found?.count, suspect: self.dmxSuspect)
+                                         olaFound: found?.count, suspect: self.dmxSuspect,
+                                         suspectCounts: dmxSuspectCounts(atLogin: self.bootAtLogin, lightkeyRunningAtStart: self.lightkeyRunningAtStart))
                 let elapsed = Date().timeIntervalSince(since)
                 let climb = { self.climbDMXLadder(i, since: since, next: next) }
                 let again = { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { climb() } }
@@ -4363,13 +4491,13 @@ extension Booth {
                     self.setStep(i, .running, "Asking Lightkey\u{2019}s DMX server to look for the interface again\u{2026}")
                     DispatchQueue.global(qos: .userInitiated).async {
                         let args = ["-HUP", String(pid)]
-                        let r = shell("/bin/kill", args)
+                        let r = signalOladIfStill("-HUP", pid: pid, orphan: false)
                         DispatchQueue.main.async {
-                            self.dmxLadder.hupSent = self.dmxLadder.hupSent || r.code == 0
-                            self.diagDMXRecovery("sighup", r.code == 0 ? "sent" : "failed")
+                            self.dmxLadder.hupSent = self.dmxLadder.hupSent || r.sent
+                            self.diagDMXRecovery("sighup", r.sent ? "sent" : r.code == 3 ? "changed" : "failed")
                             self.changes.insert(LogEntry(title: "DMX recovery: asked olad (pid \(pid)) to look for the interface again", language: "Terminal",
-                                                         code: commandLine("/bin/kill", args),
-                                                         output: (r.out.isEmpty ? "(no output)" : r.out) + "\nolad reloads its plugins on SIGHUP and scans USB again. Checking for 12 seconds.",
+                                                         code: commandLine("/bin/ps", psDMXArgs) + "\n" + commandLine("/bin/kill", args),
+                                                         output: r.out + (r.sent ? "\nolad reloads its plugins on SIGHUP and scans USB again." : "") + " Checking for 12 seconds.",
                                                          status: r.code), at: 0)
                             recheck()
                         }
@@ -5014,7 +5142,7 @@ extension Booth {
             // 3. Unzip
             let unzipped = work.appendingPathComponent("unzipped")
             let unzipArgs = ["-x", "-k", zip.path, unzipped.path]
-            let u = shell("/usr/bin/ditto", unzipArgs)
+            let u = shell("/usr/bin/ditto", unzipArgs, timeout: 120)
             log("Update: unzip", "Terminal", commandLine("/usr/bin/ditto", unzipArgs), u.out.isEmpty ? "(no output)" : u.out, u.code)
             guard u.code == 0,
                   let newApp = (try? fm.contentsOfDirectory(at: unzipped, includingPropertiesForKeys: nil))?
@@ -5031,7 +5159,7 @@ extension Booth {
                 return fail("The download isn\u{2019}t Booth Check \(r.version) (it says \(newID ?? "?") \(newVersion ?? "?")), so it wasn\u{2019}t installed.")
             }
             let sigArgs = ["--verify", "--deep", "--strict", newApp.path]
-            let sig = shell("/usr/bin/codesign", sigArgs)
+            let sig = shell("/usr/bin/codesign", sigArgs, timeout: 60)
             log("Update: check the app", "Terminal", commandLine("/usr/bin/codesign", sigArgs),
                 sig.out.isEmpty ? "Signature is intact." : sig.out, sig.code)
             guard sig.code == 0 else {
@@ -5146,12 +5274,16 @@ struct ScrubContext {
     var home: String
     var users: [String]         // NSUserName, NSFullUserName
     var macs: [String]          // the computer name, the host name
+    /// The names come from configd (the computer name, the Bonjour name) and the kernel (gethostname),
+    /// never `ProcessInfo.hostName` or `Host.current()`, which can wait on DNS.
     static func current() -> ScrubContext {
-        let host = ProcessInfo.processInfo.hostName
+        let name = (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? ""
+        let local = (SCDynamicStoreCopyLocalHostName(nil) as String?) ?? ""
+        var buf = [CChar](repeating: 0, count: 256)
+        let host = gethostname(&buf, buf.count) == 0 ? String(cString: buf) : ""
         let short = host.hasSuffix(".local") ? String(host.dropLast(6)) : host
-        let name = Host.current().localizedName ?? ""
         return ScrubContext(home: NSHomeDirectory(), users: [NSFullUserName(), NSUserName()],
-                            macs: [name, host, short, name.replacingOccurrences(of: " ", with: "-")])
+                            macs: [name, local, local.isEmpty ? "" : local + ".local", host, short, name.replacingOccurrences(of: " ", with: "-")])
     }
 }
 
@@ -5170,7 +5302,8 @@ func regexReplace(_ s: String, _ pattern: String, _ f: ([String]) -> String) -> 
 }
 
 /// The home folder becomes ~, the user's names <user>, the computer's name <mac>, USB serial numbers
-/// sn: plus the first 6 hex digits of their SHA-256, emails <email>, IPv4 addresses <ip>; lines with
+/// and the serial in Stream Deck device ids ([4057/143/<serial>]) sn: plus the first 6 hex digits of
+/// their SHA-256, emails <email>, IPv4 addresses <ip>; lines with
 /// the Mac's own serial number or UUID go.
 func scrub(_ text: String, _ c: ScrubContext) -> String {
     var s = text.split(separator: "\n", omittingEmptySubsequences: false)
@@ -5179,6 +5312,8 @@ func scrub(_ text: String, _ c: ScrubContext) -> String {
     s = regexReplace(s, "\"(USB Serial Number|kUSBSerialNumberString|Serial Number)\" = \"(?!sn:)([^\"]*)\"") { "\"\($0[1])\" = \"sn:\(shortHash($0[2]))\"" }
     s = regexReplace(s, "(usbserial|usbmodem)-(?!sn:)([A-Za-z0-9]+)") { "\($0[1])-sn:\(shortHash($0[2]))" }
     s = regexReplace(s, "([Ss]erial:? )(?!sn:)([A-Za-z0-9]*[0-9][A-Za-z0-9]*)") { "\($0[1])sn:\(shortHash($0[2]))" }
+    // Stream Deck device ids, @(1)[vendor/product/serial] (also with JSON's escaped slashes): the serial goes.
+    s = regexReplace(s, "\\[([0-9]+)(\\\\?/)([0-9]+)(\\\\?/)(?!sn:)([A-Za-z0-9]+)\\]") { "[\($0[1])\($0[2])\($0[3])\($0[4])sn:\(shortHash($0[5]))]" }
     s = regexReplace(s, "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}") { _ in "<email>" }
     for u in c.users.filter({ $0.count >= 3 }).sorted(by: { $0.count > $1.count }) { s = s.replacingOccurrences(of: u, with: "<user>") }
     for m in c.macs.filter({ $0.count >= 3 }).sorted(by: { $0.count > $1.count }) { s = s.replacingOccurrences(of: m, with: "<mac>") }
@@ -5481,7 +5616,16 @@ final class Diagnostics {
     let queue = DispatchQueue(label: "app.boothcheck.diagnostics", qos: .utility)
     let session = UUID().uuidString.lowercased()
     let launchedAt = Date()
-    lazy var scrubContext = ScrubContext.current()
+    /// Built once, on `queue` at launch (see init); read from any thread under the lock.
+    private let scrubLock = NSLock()
+    private var builtScrubContext: ScrubContext?
+    var scrubContext: ScrubContext {
+        scrubLock.lock(); defer { scrubLock.unlock() }
+        if let c = builtScrubContext { return c }
+        let c = ScrubContext.current()
+        builtScrubContext = c
+        return c
+    }
     var systemProps: [String: DiagValue] = [:]
     /// Read and set on `queue` (set it with `setEnabled`).
     private(set) var enabled = true
@@ -5498,6 +5642,7 @@ final class Diagnostics {
         self.files = files
         self.appKey = appKey
         self.transport = transport
+        queue.async { _ = self.scrubContext }
     }
 
     func setEnabled(_ on: Bool) { queue.async { self.enabled = on } }
@@ -5870,8 +6015,9 @@ extension Booth {
         let summary = "Booth Check \(currentVersion) (build \(buildNumber)), \(runArch), \(hardwareModel()), macOS \(ProcessInfo.processInfo.operatingSystemVersionString)\n"
             + "Saved \(diskTime(Date())). Setup: \(setupTag(setup)). Diagnostics: \(setup.diagnostics ? "on" : "off").\n"
             + "Problems now: \(problemCount)\n" + checks.map { "  \(statusWord($0.status)) \($0.id): \($0.title) \u{2014} \($0.detail)\n" }.joined()
-        let files = diag.files, ctx = diag.scrubContext
+        let files = diag.files, diag = self.diag
         diag.queue.async {
+            let ctx = diag.scrubContext     // read off the main thread
             let fm = FileManager.default
             let stamp = dmxSnapshotFileName(Date(), reason: "x").dropFirst(4).dropLast(6)
             let dir = fm.temporaryDirectory.appendingPathComponent("BoothCheck-diagnostics-\(stamp)")
@@ -5886,14 +6032,15 @@ extension Booth {
                 copied.append(out)
             }
             if let q = fm.contents(atPath: files.queue) {
-                try? q.write(to: dir.appendingPathComponent("aptabase-queue.jsonl"))
+                // Scrubbed again: events queued by an older version weren't scrubbed for every id.
+                try? Data(scrub(String(decoding: q, as: UTF8.self), ctx).utf8).write(to: dir.appendingPathComponent("aptabase-queue.jsonl"))
                 copied.append("aptabase-queue.jsonl")
             }
             try? Data(scrub(summary, ctx).utf8).write(to: dir.appendingPathComponent("summary.txt"))
             let zip = dir.path + ".zip"
             try? fm.removeItem(atPath: zip)
             let args = ["-c", "-k", "--keepParent", dir.path, zip]
-            let r = shell("/usr/bin/ditto", args)
+            let r = shell("/usr/bin/ditto", args, timeout: 120)
             DispatchQueue.main.async {
                 self.changes.insert(LogEntry(title: "Save diagnostics", language: "Terminal", code: commandLine("/usr/bin/ditto", args),
                                              output: (r.out.isEmpty ? "" : r.out + "\n") + "Scrubbed copies of: summary.txt, " + copied.joined(separator: ", ") + "\nZip: \(zip)",

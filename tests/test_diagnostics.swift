@@ -91,6 +91,20 @@ expect("email, IP, Mac name, user names", clean.contains("<email>") && clean.con
 expect("show names, versions and 'serial ports' kept", clean.contains("Lightkey 5.2, show BackupChurch_modular_v37.lightkeyproj, no serial ports open"), clean)
 expect("scrubbing twice changes nothing", scrub(clean, ctx) == clean)
 
+// 4b. Stream Deck device ids carry the deck's hardware serial.
+let deckRaw = """
+Stream Deck's profile per deck: @(1)[4057/143/A00NA525320EK4] → Church XL
+{"Device":{"UUID":"@(1)[4057\\/143\\/A00NA525320EK4]"},"Name":"Church XL"}
+defaults write com.elgato.StreamDeck … "@(1)[4057/96/CL12K1A00213]" = "6D3F…"
+"""
+let deckClean = scrub(deckRaw, ctx)
+let dh = shortHash("A00NA525320EK4")
+expect("deck serial → sn:hash, vendor/product kept", deckClean.contains("@(1)[4057/143/sn:\(dh)] → Church XL"), deckClean)
+expect("JSON's escaped slashes too", deckClean.contains("@(1)[4057\\/143\\/sn:\(dh)]"), deckClean)
+expect("a second deck's serial too", deckClean.contains("[4057/96/sn:\(shortHash("CL12K1A00213"))]") && !deckClean.contains("CL12K1A00213"), deckClean)
+expect("the raw deck serial is gone", !deckClean.contains("A00NA525320EK4"), deckClean)
+expect("scrubbing a deck id twice changes nothing", scrub(deckClean, ctx) == deckClean)
+
 // 5. The queue's cap: log_chunk goes first, app_start/startup/shutdown/check last.
 let q: [(name: String, bytes: Int)] = [("app_start", 10), ("log_chunk", 10), ("setting", 10), ("check_failed", 10), ("log_chunk", 10), ("startup_done", 10)]
 expect("under the cap: all kept", trimDiagQueue(q, maxCount: 10) == Array(0..<6))

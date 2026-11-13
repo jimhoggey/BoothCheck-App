@@ -36,6 +36,11 @@ expect("Lightkey's MIDI input not there yet: wait", !open(ready: false))
 expect("no Lightkey on this Mac: open it anyway", open(lightkeyMac: false, ready: false))
 expect("opened 20 seconds ago: not again yet", !open(since: 20))
 expect("a minute later: again", open(since: 70))
+expect("a profile switch or restart has it closed on purpose: busy, so not reopened",
+       !open(busy: streamDeckBusy(starting: false, shuttingDown: false, closedOnPurpose: true)))
+expect("busy covers the start-up and the shutdown too",
+       streamDeckBusy(starting: true, shuttingDown: false, closedOnPurpose: false) && streamDeckBusy(starting: false, shuttingDown: true, closedOnPurpose: false))
+expect("nothing under way: not busy", !streamDeckBusy(starting: false, shuttingDown: false, closedOnPurpose: false))
 
 // 3. 1.23: restarting Stream Deck so its keys start clean. A latch key ignores Lightkey's "off", so a
 //    colour left lit stays lit after Lightkey restarts (church Mac, 9 Oct 2026: Lavender). A freshly

@@ -97,27 +97,62 @@ let orphanPs = parsePs("""
 expect("no Lightkey: Lightkey's olad is an orphan; someone else's olad and other names aren't",
        orphanOladPIDs(orphanPs) == [812], "\(orphanOladPIDs(orphanPs))")
 
+// --- Re-checking a pid just before signalling it -------------------------------------------------------
+
+expect("Reconnect: still Lightkey's child olad: signal", oladStillTarget(procs, pid: 812, orphan: false))
+expect("Reconnect: the pid is gone: don't", !oladStillTarget(procs, pid: 999, orphan: false))
+expect("Reconnect: the pid is now Lightkey itself, not olad: don't", !oladStillTarget(procs, pid: 700, orphan: false))
+let reused = parsePs("""
+  700     1 Fri Nov 13 10:00:10 2026     09:51 /Applications/Lightkey.app/Contents/MacOS/Lightkey
+  812     1 Fri Nov 13 10:09:00 2026     00:05 /usr/bin/some-other-tool
+  830   700 Fri Nov 13 10:09:01 2026     00:04 /Library/OLA/0.10.8/bin/olad --config-dir x
+""", timeZone: utc)
+expect("Reconnect: the pid now belongs to another program: don't", !oladStillTarget(reused, pid: 812, orphan: false))
+let lone = parsePs("""
+  700     1 Fri Nov 13 10:00:10 2026     09:51 /Applications/Lightkey.app/Contents/MacOS/Lightkey
+  812     1 Fri Nov 13 10:00:11 2026     09:50 /Library/OLA/0.10.8/bin/olad --config-dir x
+""", timeZone: utc)
+expect("Reconnect: the only olad (an external one Lightkey reused): signal", oladStillTarget(lone, pid: 812, orphan: false))
+let two = parsePs("""
+  700     1 Fri Nov 13 10:00:10 2026     09:51 /Applications/Lightkey.app/Contents/MacOS/Lightkey
+  812     1 Fri Nov 13 10:00:11 2026     09:50 /Library/OLA/0.10.8/bin/olad --config-dir x
+  950     1 Fri Nov 13 10:00:11 2026     09:50 /opt/homebrew/bin/olad
+""", timeZone: utc)
+expect("Reconnect: one of two olads, not Lightkey's child: don't", !oladStillTarget(two, pid: 812, orphan: false))
+expect("orphan: still a left-over Lightkey olad: stop it", oladStillTarget(orphanPs, pid: 812, orphan: true))
+expect("orphan: someone else's olad: don't", !oladStillTarget(orphanPs, pid: 950, orphan: true))
+expect("orphan: Lightkey is running again, so it isn't left over: don't", !oladStillTarget(procs, pid: 812, orphan: true))
+expect("orphan: gone: don't", !oladStillTarget(orphanPs, pid: 999, orphan: true))
+
 // --- Suspect link ----------------------------------------------------------------------------------------
 
 let t0 = Date(timeIntervalSince1970: 1_800_000_000)
-expect("Lightkey already running and the box not seen at once: suspect",
-       dmxLinkSuspect(lightkeyRunningAtStart: true, boxSeenAtStart: false, oladStarted: nil, boxFirstSeen: t0) != nil)
-expect("Lightkey already running but the box there at once: not suspect",
-       dmxLinkSuspect(lightkeyRunningAtStart: true, boxSeenAtStart: true, oladStarted: t0, boxFirstSeen: t0) == nil)
-expect("olad started 10 s before the box appeared: suspect",
-       dmxLinkSuspect(lightkeyRunningAtStart: false, boxSeenAtStart: false, oladStarted: t0, boxFirstSeen: t0 + 10)?.contains("olad started") == true)
-expect("olad started a second before the box was seen (ps rounds, polls are 1 s): not suspect",
-       dmxLinkSuspect(lightkeyRunningAtStart: false, boxSeenAtStart: true, oladStarted: t0, boxFirstSeen: t0 + 1) == nil)
+expect("login: macOS reopened Lightkey and the box not seen at once: suspect",
+       dmxLinkSuspect(atLogin: true, lightkeyRunningAtStart: true, boxSeenAtStart: false, oladStarted: nil, boxFirstSeen: t0) != nil)
+expect("by hand: Lightkey already running and the box not seen at once, no olad timing: not suspect",
+       dmxLinkSuspect(atLogin: false, lightkeyRunningAtStart: true, boxSeenAtStart: false, oladStarted: nil, boxFirstSeen: t0) == nil)
+expect("Lightkey already running, olad started 3 hours before, but the box there at the first look: not suspect",
+       dmxLinkSuspect(atLogin: false, lightkeyRunningAtStart: true, boxSeenAtStart: true, oladStarted: t0 - 3 * 3600, boxFirstSeen: t0) == nil)
+expect("login too: the box there at the first look is never suspect",
+       dmxLinkSuspect(atLogin: true, lightkeyRunningAtStart: true, boxSeenAtStart: true, oladStarted: t0 - 3600, boxFirstSeen: t0) == nil)
+expect("olad started 10 s before the box appeared during the start-up: suspect",
+       dmxLinkSuspect(atLogin: false, lightkeyRunningAtStart: false, boxSeenAtStart: false, oladStarted: t0, boxFirstSeen: t0 + 10)?.contains("olad started") == true)
+expect("olad started a second before the box appeared (ps rounds, polls are 1 s): not suspect",
+       dmxLinkSuspect(atLogin: false, lightkeyRunningAtStart: false, boxSeenAtStart: false, oladStarted: t0, boxFirstSeen: t0 + 1) == nil)
 expect("olad after the box: not suspect",
-       dmxLinkSuspect(lightkeyRunningAtStart: false, boxSeenAtStart: true, oladStarted: t0 + 5, boxFirstSeen: t0) == nil)
+       dmxLinkSuspect(atLogin: false, lightkeyRunningAtStart: false, boxSeenAtStart: false, oladStarted: t0 + 5, boxFirstSeen: t0) == nil)
+expect("a suspect link counts at login", dmxSuspectCounts(atLogin: true, lightkeyRunningAtStart: true))
+expect("a suspect link counts by hand when Lightkey wasn't running", dmxSuspectCounts(atLogin: false, lightkeyRunningAtStart: false))
+expect("a suspect link doesn't count by hand with Lightkey already running (a service)",
+       !dmxSuspectCounts(atLogin: false, lightkeyRunningAtStart: true))
 
 // --- The ladder ------------------------------------------------------------------------------------------
 
 // `found` is olad's log's "Found N FTDI devices"; 0 (it missed the box) unless a test says otherwise.
 func next(_ l: DMXLadder, box: Bool = true, held: Bool = false, lk: Bool = true, olad: pid_t? = 812, asking: Bool = false, ax: Bool = true,
-          found: Int? = 0, suspect: Bool = false) -> DMXRung {
+          found: Int? = 0, suspect: Bool = false, counts: Bool = true) -> DMXRung {
     dmxLadderNext(boxPresent: box, held: held, lightkeyRunning: lk, oladPID: olad, asking: asking, accessibility: ax, ladder: l,
-                  olaFound: found, suspect: suspect)
+                  olaFound: found, suspect: suspect, suspectCounts: counts)
 }
 var l = DMXLadder()
 expect("held: done", next(l, held: true) == .held)
@@ -151,11 +186,32 @@ expect("found 1: the SIGHUP and Reset rungs still run first", next(DMXLadder(), 
 var u2 = u; u2.relaunches = 2
 expect("found 0 after two relaunches: give up", next(u2, found: 0) == .giveUp)
 expect("found 1 after two relaunches: unconfirmed, not give up", next(u2, found: 1) == .unconfirmed)
-expect("justified: found 0", dmxRelaunchJustified(olaFound: 0, oladRunning: true, suspect: false))
-expect("not justified: found 1", !dmxRelaunchJustified(olaFound: 1, oladRunning: true, suspect: false))
-expect("not justified: no line", !dmxRelaunchJustified(olaFound: nil, oladRunning: true, suspect: false))
-expect("justified: no olad", dmxRelaunchJustified(olaFound: nil, oladRunning: false, suspect: false))
-expect("justified: suspect", dmxRelaunchJustified(olaFound: 3, oladRunning: true, suspect: true))
+expect("justified: found 0", dmxRelaunchJustified(olaFound: 0, oladRunning: true, suspect: false, suspectCounts: true))
+expect("not justified: found 1", !dmxRelaunchJustified(olaFound: 1, oladRunning: true, suspect: false, suspectCounts: true))
+expect("not justified: no line", !dmxRelaunchJustified(olaFound: nil, oladRunning: true, suspect: false, suspectCounts: true))
+expect("justified: no olad", dmxRelaunchJustified(olaFound: nil, oladRunning: false, suspect: false, suspectCounts: true))
+expect("justified: suspect", dmxRelaunchJustified(olaFound: 3, oladRunning: true, suspect: true, suspectCounts: true))
+expect("by hand with Lightkey running: suspect alone isn't enough",
+       !dmxRelaunchJustified(olaFound: nil, oladRunning: true, suspect: true, suspectCounts: false))
+expect("by hand with Lightkey running: found 0 still is", dmxRelaunchJustified(olaFound: 0, oladRunning: true, suspect: true, suspectCounts: false))
+expect("by hand with Lightkey running: no olad still is", dmxRelaunchJustified(olaFound: nil, oladRunning: false, suspect: false, suspectCounts: false))
+expect("by hand, suspect, OLA log found the box: stop, don't restart", next(u, found: 1, suspect: true, counts: false) == .unconfirmed)
+
+// The real case: Get the show started by hand during a service. olad has run for hours, the box was
+// there at the first look, the experimental held check reads false: the link isn't suspect, so the
+// ladder never reaches a restart without olad's log saying it found nothing.
+do {
+    let atLogin = false, lkAtStart = true
+    let suspect = dmxLinkSuspect(atLogin: atLogin, lightkeyRunningAtStart: lkAtStart, boxSeenAtStart: true,
+                                 oladStarted: t0 - 2 * 3600, boxFirstSeen: t0) != nil
+    let counts = dmxSuspectCounts(atLogin: atLogin, lightkeyRunningAtStart: lkAtStart)
+    expect("service case: not suspect", !suspect)
+    var lad = DMXLadder(); lad.hupTried = true; lad.resetTried = true
+    for f in [nil, 1, 2] as [Int?] {
+        expect("service case, OLA log \(f.map(String.init) ?? "silent"): no relaunch",
+               next(lad, held: false, found: f, suspect: suspect, counts: counts) == .unconfirmed)
+    }
+}
 
 var tried = DMXLadder()
 expect("nothing tried", dmxLadderTriedText(tried) == "Booth Check couldn\u{2019}t try anything.", dmxLadderTriedText(tried))
@@ -166,6 +222,10 @@ expect("what was tried, in plain words",
 
 expect("Lightkey's menu item matches", isResetDMXOutputTitle("Reset DMX Output") && isResetDMXOutputTitle(" reset dmx output "))
 expect("other menu items don't", !isResetDMXOutputTitle("Reset") && !isResetDMXOutputTitle("DMX Settings\u{2026}") && !isResetDMXOutputTitle("Quit Lightkey"))
+expect("a trailing ellipsis is fine", isResetDMXOutputTitle("Reset DMX Output\u{2026}") && isResetDMXOutputTitle("RESET DMX OUTPUT..."))
+expect("other reset-and-DMX titles don't match",
+       !isResetDMXOutputTitle("Reset DMX Settings") && !isResetDMXOutputTitle("Reset All DMX Patches\u{2026}")
+       && !isResetDMXOutputTitle("Reset DMX Output Universe 2") && !isResetDMXOutputTitle("Don\u{2019}t reset DMX output"))
 
 // --- The row after the start-up ---------------------------------------------------------------------------
 
