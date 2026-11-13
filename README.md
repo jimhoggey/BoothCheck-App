@@ -16,7 +16,8 @@ its window once so whoever sits down sees what to fix.
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
   the top right that floats over everything, full-screen Lightkey included, without taking focus:
 
-  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it. Usually it's found at
+  1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it (either USB plane
+     counts: `ioreg -p IOUSB` or `ioreg -r -c IOUSBHostDevice`). Usually it's found at
      once and nothing is asked. If it isn't there after 10 seconds, a **big sign in the middle of the
      screen** (over a dimmed backdrop) says to unplug the USB cable from the DMX box and plug it back
      in, with a short animation of exactly that: an interface left plugged in sometimes only shows up
@@ -40,7 +41,18 @@ its window once so whoever sits down sees what to fix.
      up behind another app (its alert, and the Touch Bar's Authenticate, only show while it's in
      front), Booth Check brings it forward: at most three times, ten seconds apart, and never over
      macOS's password box. It also sees when Lightkey's Authenticate alert is up and says so
-  5. Confirm Lightkey has the DMX interface open (experimental)
+  5. Confirm Lightkey has the DMX interface open (experimental), and **reconnect it if it hasn't**.
+     After 20 seconds (a minute while Lightkey may ask for its password; at once when the link is
+     suspect: Lightkey was already running before the box was seen, or its `olad` started before the
+     box appeared), with the box on USB but not held, Booth Check tries in order, each logged with
+     its command and output and checked for 12 seconds: `kill -HUP <olad>` (olad reloads its plugins
+     and scans USB again), Lightkey's **Reset DMX Output** menu item (through Accessibility; skipped
+     without it), then **restarting Lightkey** the shutdown's no-questions way and running steps 3
+     and 4 again (at most twice). While it does, the hands-off sign says what it's doing ("The lights
+     aren't connected. Reconnecting…", "Restarting Lightkey", then "The lights are connected" or
+     "Couldn't reconnect the lights"). Nothing is tried while Lightkey asks for its password, or when
+     the box is on neither USB plane (that's the replug sign's job). If it all fails, the step warns
+     with what was tried
   6. Without Lightkey on this Mac, Stream Deck opens here instead
   7. Check everything
 
@@ -181,6 +193,29 @@ Lightkey has the interface open. Lightkey drives USB interfaces through its own 
 (Open Lighting Architecture, installed in `/Library/OLA`), so a connection held by either counts:
 macOS records which process opened each USB driver connection (`ioreg`), and `lsof` lists the serial
 ports they hold. If the lights respond and this row disagrees, trust the lights.
+
+**When the lights drop out during a service** (the box on USB, Lightkey open, but not holding it,
+say after the cable was unplugged and plugged back in: olad scans for interfaces only when it starts),
+the row turns red and offers **Reconnect the lights…**: the sheet shows `kill -HUP <olad pid>`, which
+asks Lightkey's DMX server to look for the interface again (the lights should not change). If the row
+is still red afterwards, it offers **Restart Lightkey…** instead, which warns that the lights go dark
+for about 20 seconds, quits Lightkey and runs Get the show started. **Once the booth is ready, Booth
+Check never does either by itself**; only the start-up retries on its own. Before the start-up opens
+Lightkey, an `olad` left running without Lightkey (from a force-quit Lightkey; the next Lightkey would
+reuse it, with no interface) is stopped (`kill -TERM`, `-KILL` after 3 seconds), logged.
+
+**Whenever Booth Check fixes something by itself** (reconnecting the lights, reopening or restarting
+Stream Deck, restarting the deck lights helper), the hands-off sign says what it's doing, then how it
+went, and goes. Outside a start-up it's the bottom banner, with nothing dimmed, since someone may be
+running the service in Lightkey.
+
+**DMX snapshots** for a tech: when a DMX step fails, when the reconnect runs (and before each Lightkey
+restart, which overwrites olad's log), when the DMX rows change after the start-up, and at the end of
+every start-up, Booth Check saves `~/Library/Logs/Booth Check/dmx-<date-time>-<reason>.txt` (the newest
+30 kept): the FTDI device from both USB planes (serial, location, speed, hub chain, driver), the
+`/dev/cu.usbserial*` devices, olad's and Lightkey's processes with start times, olad's log
+(`~/Library/Logs/Lightkey OLA.log`, e.g. "Found 0 FTDI devices"), the FTDI drivers, boot time, uptime
+and the start-up's step timings. The Log gets one entry with the path and a summary.
 
 **Booth Check keeps itself awake** by opting out of App Nap (`NSAppSleepDisabled` plus a background
 activity), so its checks keep running behind full-screen Lightkey. It has no row of its own: nobody
