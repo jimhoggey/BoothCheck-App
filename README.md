@@ -106,6 +106,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
 | **Shut down by itself** | at the days and time set under it (Sundays at 1 pm to start with), shuts the booth down if nobody has: see [Shut down the booth](#shut-down-the-booth). Off until switched on |
 | **Shut down when the power goes off** | MacBooks only: when the charger loses power, shuts the booth down after a 1-minute warning (see [Shut down the booth](#shut-down-the-booth)). Off until switched on |
+| **Black out the stage first** | with Lightkey on: every shutdown sends the show's Blackout to Lightkey before it closes, so the stage lights don't flicker as it stops (see [Shut down the booth](#shut-down-the-booth)). The description says which note it will send and where that came from, or why it can't. Off until switched on |
 
 So a ProPresenter Mac is: ProPresenter on, Lightkey and Stream Deck off, stays on, start at login.
 Booth Check keeps it awake, opens ProPresenter at startup, and checks it's running.
@@ -279,7 +280,7 @@ A show can carry a `<show name>.deck.json` next to it (for `BackupChurch_modular
 
 ```json
 {"helper": {"channels": "2", "mask": "2:3-6", "while": "2:38-39", "alias": "2:22=2:40,2:23=2:41"},
- "profile": "Lightkey XL Service"}
+ "profile": "Lightkey XL Service", "blackout": "2:0"}
 ```
 
 - `helper`: the deck lights helper's rules for this show, passed as `--channels`, `--mask`, `--while`,
@@ -287,6 +288,9 @@ A show can carry a `<show name>.deck.json` next to it (for `BackupChurch_modular
   defaults to 5-13). `"helper": null`: this show doesn't use the helper, so its rows and its start-up
   wait don't apply.
 - `profile`: the Stream Deck profile name This Mac suggests (**Use it**), when none is chosen yet.
+- `blackout` (optional): the show's Blackout as `"channel:note"`, for **Black out the stage first**.
+  Left out, Booth Check uses the Stream Deck's Blackout key instead (nothing to write for the Sunday
+  decks); `"blackout": null` says this show has no Blackout, so the shutdown doesn't send one.
 
 No file: exactly the built-in Summit rules (`--mask 5:3-6 --while 6:38-39,8:38-39,10:38-39,13:38-39
 --alias 5:22=5:40,5:23=5:41`). Unknown keys are ignored; a bad value means the built-in rules, with a
@@ -339,6 +343,20 @@ sign is only for the start-up at login: whoever clicks the button is already at 
 2. Behind a "Shutting the booth down" sign, **every other app is asked to quit** (Chrome, Mail…:
    anything with a Dock icon but Finder), as its own Quit would, never forced. Booth Check waits up
    to 8 seconds, logs any still open, and carries on; one asking to save holds up step 5.
+   - **Black out the stage first** (This Mac, off unless switched on): the sign says "Turning the
+     stage lights off…" and Booth Check sends the show's Blackout to "Lightkey Input" exactly as the
+     deck's Blackout key does (a note-on, velocity 127; channel 2 note 0 on the Sunday decks), waits
+     for Lightkey to report it on "Lightkey Output", then 2 seconds for the lights, and carries on.
+     The note comes from the show's `.deck.json` (`"blackout"`), else the key titled Blackout on the
+     Stream Deck profile chosen in This Mac, else on every profile on this Mac if they agree; if none
+     of those gives one note, the switch says so and the shutdown goes on without it. **Toggle
+     safety:** the Sunday show's Blackout is a Flash trigger, so a note-on only ever switches it on
+     (sent to an already-on Blackout, Lightkey reports nothing and it stays on). If a show's binding
+     toggled instead, the note-on would switch an already-on Blackout off; Lightkey reports that off,
+     and Booth Check sends once more to put it back on (never more than twice). It never sends without
+     "Lightkey Output" to listen to, and skips the step (logged) when Lightkey isn't open or its MIDI
+     ports aren't there. At most about 5 seconds; every send, what Lightkey reported and the outcome
+     go in the Log. Blackout leaves the house lights on, as on the deck.
 3. **Stream Deck closes**. It has nothing to save, so if it hangs it's made to quit after 5 seconds.
 4. **Lightkey closes.** In Live mode, when it's the front app, Lightkey asks "Are you sure you want to
    quit Lightkey?"; Booth Check presses its **Quit** (Accessibility, the permission it already has

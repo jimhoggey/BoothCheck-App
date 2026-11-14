@@ -29,6 +29,7 @@ enum IDs {
     static let elgatoVendor = 0x0FD9          // USB vendor ID on every Stream Deck
     static let ftdiVendor = 0x0403            // the chip inside Enttec Open DMX USB and most USB-DMX cables
     static let lightkeyMIDIInput = "Lightkey Input"
+    static let lightkeyMIDIOutput = "Lightkey Output"     // where Lightkey reports each cue's on/off
     static let deckHelper = "com.c3b.deckstatehelper"     // the deck lights helper's launchd label
     static let deckFeedback = "Lightkey Feedback"         // the MIDI source it publishes for the deck's keys
     static let showKey = "showPath"
@@ -68,6 +69,9 @@ struct MacSetup: Codable, Equatable {
     /// The Stream Deck profile that goes with the show (1.32), picked once by a tech in This Mac. Nil:
     /// "Don't check". Booth Check puts Stream Deck on it at the start-up and checks it stays there.
     var deckProfile: DeckProfileChoice? = nil
+    /// Black out the stage first (1.30, off by default; the owner asked for it optional): every shutdown
+    /// sends the show's Blackout before Stream Deck and Lightkey close (see `blackoutBeforeClosing`).
+    var blackoutAtShutdown = false
 
     /// Apps worth offering on a production Mac when they're installed.
     static let knownApps = [("com.renewedvision.propresenter", "ProPresenter")]
@@ -89,6 +93,7 @@ struct MacSetup: Codable, Equatable {
         deckLights = try c.decodeIfPresent(Bool.self, forKey: .deckLights)
         diagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnostics) ?? true
         deckProfile = try? c.decodeIfPresent(DeckProfileChoice.self, forKey: .deckProfile)
+        blackoutAtShutdown = try c.decodeIfPresent(Bool.self, forKey: .blackoutAtShutdown) ?? false
     }
 
     static var saved: MacSetup? {
@@ -397,6 +402,56 @@ final class MIDIWatch {
                   let n = name?.takeRetainedValue() else { return nil }
             return n as String
         }
+    }
+
+    private func endpoint(named want: String, count: Int, get: (Int) -> MIDIEndpointRef) -> MIDIEndpointRef? {
+        (0..<count).map(get).first { e in
+            var name: Unmanaged<CFString>?
+            return MIDIObjectGetStringProperty(e, kMIDIPropertyName, &name) == noErr && (name?.takeRetainedValue() as String?) == want
+        }
+    }
+
+    private var outPort = MIDIPortRef()
+
+    /// Sends one MIDI 1.0 note-on to a destination by name (1.30: the shutdown's Blackout, see
+    /// `blackoutBeforeClosing`), as the Stream Deck's MIDI plugin does. Returns what happened, for the Log.
+    func sendNoteOn(_ n: MIDINote, velocity: Int = 127, to destination: String) -> (ok: Bool, detail: String) {
+        guard let dest = endpoint(named: destination, count: MIDIGetNumberOfDestinations(), get: MIDIGetDestination) else {
+            return (false, "There\u{2019}s no MIDI destination called \u{201C}\(destination)\u{201D}.")
+        }
+        if outPort == 0 {
+            let s = MIDIOutputPortCreate(client, "Booth Check out" as CFString, &outPort)
+            guard s == noErr else { return (false, "CoreMIDI couldn\u{2019}t make an output port (\(s)).") }
+        }
+        var list = MIDIEventList()
+        let packet = MIDIEventListInit(&list, ._1_0)
+        var word = midiNoteOnWord(n, velocity: velocity)
+        guard MIDIEventListAdd(&list, MemoryLayout<MIDIEventList>.size, packet, 0, 1, &word) != nil else {
+            return (false, "CoreMIDI couldn\u{2019}t build the message.")
+        }
+        let s = MIDISendEventList(outPort, dest, &list)
+        return (s == noErr, s == noErr ? "Sent note-on, \(n.text), velocity \(velocity) (bytes \(midiBytesText(word))) to \u{201C}\(destination)\u{201D}."
+                                       : "CoreMIDI didn\u{2019}t send it (\(s)).")
+    }
+
+    /// Listens to a source by name (read only) and hands each MIDI 1.0 channel-voice word to `onWord`
+    /// on the main thread. Returns the way to stop listening, or nil when there's no such source.
+    func listen(to source: String, onWord: @escaping (UInt32) -> Void) -> (() -> Void)? {
+        guard let src = endpoint(named: source, count: MIDIGetNumberOfSources(), get: MIDIGetSource) else { return nil }
+        var port = MIDIPortRef()
+        let s = MIDIInputPortCreateWithProtocol(client, "Booth Check in" as CFString, ._1_0, &port) { list, _ in
+            var words: [UInt32] = []
+            for packet in list.unsafeSequence() {           // walk the pointers; never copy a packet and step past it
+                let n = Int(packet.pointee.wordCount)
+                words += withUnsafeBytes(of: packet.pointee.words) { Array($0.bindMemory(to: UInt32.self).prefix(n)) }
+            }
+            DispatchQueue.main.async { words.forEach(onWord) }
+        }
+        guard s == noErr, MIDIPortConnectSource(port, src, nil) == noErr else {
+            if port != 0 { MIDIPortDispose(port) }
+            return nil
+        }
+        return { MIDIPortDisconnectSource(port, src); MIDIPortDispose(port) }
     }
 }
 
@@ -1291,9 +1346,11 @@ func deckHelperArgsCurrent(installed: [String]?, binary: String = deckHelperBina
 
 // A show may carry `<show name>.deck.json` next to it, saying how its deck is meant to work:
 //   {"helper": {"channels": "2", "mask": "2:3-6", "while": "2:38-39", "alias": "2:22=2:40"} | null,
-//    "profile": "Lightkey XL Service"}
+//    "profile": "Lightkey XL Service", "blackout": "2:0"}
 // `helper`: the deck lights helper's rules for this show (null: this show doesn't use the helper);
-// `profile`: the Stream Deck profile name suggested in This Mac. No file: the built-in Summit rules.
+// `profile`: the Stream Deck profile name suggested in This Mac; `blackout` (1.30, optional): the
+// show's Blackout as channel:note for the shutdown's "Black out the stage first" (null: this show has
+// none; left out: the deck profile's Blackout key). No file: the built-in Summit rules.
 
 struct DeckShowFile: Equatable {
     /// The helper's arguments; nil when the file says `"helper": null` (the helper rows don't apply).
@@ -1301,6 +1358,7 @@ struct DeckShowFile: Equatable {
     /// The arguments came from the file (false: the built-in Summit ones).
     var helperFromFile = false
     var profile: String? = nil
+    var blackout: DeckFileBlackout = .notSet
 }
 
 /// "<show folder>/<show name>.deck.json" for a show file.
@@ -1330,6 +1388,11 @@ func parseDeckShowFile(_ data: Data) -> (file: DeckShowFile, warnings: [String])
     if let p = d["profile"] {
         if let name = p as? String, !name.trimmingCharacters(in: .whitespaces).isEmpty { file.profile = name }
         else if !(p is NSNull) { warnings.append("\u{201C}profile\u{201D} isn\u{2019}t a name, so it\u{2019}s ignored.") }
+    }
+    if let b = d["blackout"] {
+        if b is NSNull { file.blackout = .none }
+        else if let s = b as? String, let n = parseMIDINote(s) { file.blackout = .note(n) }
+        else { warnings.append("\u{201C}blackout\u{201D} isn\u{2019}t channel:note like \u{201C}2:0\u{201D} (or null), so it\u{2019}s ignored and the deck\u{2019}s Blackout key is used.") }
     }
     guard let h = d["helper"] else { return (file, warnings) }
     if h is NSNull {
@@ -1420,7 +1483,13 @@ func deckShowFileText(_ r: (file: DeckShowFile, warnings: [String], path: String
     let helper = r.file.helperArgs == nil ? "This show doesn\u{2019}t use the deck lights helper, so its rows don\u{2019}t apply."
         : r.file.helperFromFile ? "Deck lights helper rules: " + (r.file.helperArgs!.isEmpty ? "(none: the helper\u{2019}s defaults)" : r.file.helperArgs!.joined(separator: " ")) + "."
         : "Deck lights helper rules: the built-in ones (" + deckHelperArgs.joined(separator: " ") + ")."
-    return "\(r.path)\n\(helper)" + (r.file.profile.map { "\nSuggested Stream Deck profile: \u{201C}\($0)\u{201D}." } ?? "")
+    let blackout: String
+    switch r.file.blackout {
+    case .notSet: blackout = ""
+    case .none: blackout = "\nBlackout: none in this show."
+    case .note(let n): blackout = "\nBlackout: \(n.text)."
+    }
+    return "\(r.path)\n\(helper)" + (r.file.profile.map { "\nSuggested Stream Deck profile: \u{201C}\($0)\u{201D}." } ?? "") + blackout
         + r.warnings.map { "\nWarning: \($0)" }.joined()
 }
 
@@ -1459,6 +1528,8 @@ struct DeckProfile: Equatable, Identifiable {
     let pages: Int
     let keys: [DeckMIDIKey]         // every MIDI key with a channel and a note
     let pluginVersions: [String]    // every MIDI plugin version its keys were made with, sorted
+    /// The MIDI keys whose title says Blackout (1.30, for the shutdown's Blackout). Not in the signature.
+    var blackoutKeys: [DeckMIDIKey] = []
     var id: String { uuid }
     var signatureKeys: [DeckMIDIKey] { Array(Set(keys)).sorted() }
     var signature: String { signatureKeys.map(\.text).joined(separator: ";") }
@@ -1493,7 +1564,7 @@ func parseDeckProfile(uuid: String, manifest: Data, pages: [Data]) -> DeckProfil
     guard let m = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
           let name = m["Name"] as? String,
           let device = m["Device"] as? [String: Any], let deviceID = device["UUID"] as? String else { return nil }
-    var keys: [DeckMIDIKey] = [], versions = Set<String>()
+    var keys: [DeckMIDIKey] = [], blackout: [DeckMIDIKey] = [], versions = Set<String>()
     for page in pages {
         guard let p = (try? JSONSerialization.jsonObject(with: page)) as? [String: Any] else { return nil }
         guard let controllers = p["Controllers"] else { return nil }
@@ -1505,12 +1576,16 @@ func parseDeckProfile(uuid: String, manifest: Data, pages: [Data]) -> DeckProfil
             for pos in byPos.keys.sorted() {
                 guard let a = byPos[pos] as? [String: Any], let midi = deckMIDIKey(a) else { continue }
                 if let v = midi.version { versions.insert(v) }
-                if let k = midi.key { keys.append(k) }
+                if let k = midi.key {
+                    keys.append(k)
+                    let titles = (a["States"] as? [[String: Any]] ?? []).compactMap { $0["Title"] as? String }
+                    if titles.contains(where: isBlackoutTitle) { blackout.append(k) }
+                }
             }
         }
     }
     return DeckProfile(uuid: uuid.lowercased(), name: name, device: deviceID, model: device["Model"] as? String ?? "",
-                       pages: pages.count, keys: keys, pluginVersions: versions.sorted())
+                       pages: pages.count, keys: keys, pluginVersions: versions.sorted(), blackoutKeys: blackout)
 }
 
 struct DeckProfilesRead: Equatable {
@@ -1915,6 +1990,172 @@ func powerNext(enabled: Bool, onAC: Bool, outage: Bool, handled: Bool, busy: Boo
     return enabled && outage && !handled && !busy ? .warn : .nothing
 }
 
+// MARK: - Blackout before the shutdown (1.30)
+
+// The stage lights flickered as Lightkey and its DMX server stopped with the lights still on (the
+// owner asked for this, optional, off by default). With "Black out the stage first" on, the shutdown
+// sends the show's Blackout to "Lightkey Input" exactly as the deck's Blackout key does (a note-on,
+// velocity 127), waits for Lightkey to report it on "Lightkey Output", then 2 seconds, and only then
+// closes Stream Deck and Lightkey. The Sunday show's Blackout is a Flash trigger (ch 2 note 0, "while
+// held", fade 0): a note-on only ever switches it on. If a show's binding toggled instead, a note-on
+// to an already-on Blackout would switch it off; Lightkey then reports it off, and Booth Check sends
+// once more to switch it back on (`blackoutNext`). It never sends without Lightkey's output to listen to.
+
+/// A MIDI channel (1–16, as Lightkey and the deck show it) and note.
+struct MIDINote: Hashable {
+    let channel: Int
+    let note: Int
+    var text: String { "MIDI channel \(channel), note \(note)" }
+}
+
+/// "2:0" (channel:note) as `.deck.json` writes it; nil when it isn't one.
+func parseMIDINote(_ s: String) -> MIDINote? {
+    let p = s.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
+    guard p.count == 2, let ch = Int(p[0]), (1...16).contains(ch), let note = Int(p[1]), (0...127).contains(note) else { return nil }
+    return MIDINote(channel: ch, note: note)
+}
+
+/// The UMP word for a MIDI 1.0 note-on (group 0).
+func midiNoteOnWord(_ n: MIDINote, velocity: Int = 127) -> UInt32 {
+    0x2000_0000 | UInt32(0x90 | (n.channel - 1)) << 16 | UInt32(n.note) << 8 | UInt32(max(0, min(127, velocity)))
+}
+
+/// "90 00 7F": the MIDI 1.0 bytes in a UMP word, for the Log.
+func midiBytesText(_ word: UInt32) -> String {
+    [(word >> 16) & 0xFF, (word >> 8) & 0xFF, word & 0xFF].map { String(format: "%02X", $0) }.joined(separator: " ")
+}
+
+/// What `.deck.json` says about Blackout: nothing, `"blackout": null` (this show has none), or a note.
+enum DeckFileBlackout: Equatable { case notSet, none, note(MIDINote) }
+
+/// A deck key's title says Blackout ("BLACKOUT", "Black out"…).
+func isBlackoutTitle(_ title: String) -> Bool {
+    title.lowercased().filter { !$0.isWhitespace && $0 != "-" }.contains("blackout")
+}
+
+/// The notes a profile's Blackout keys send to Lightkey (a key called Blackout whose MIDI out is
+/// "Lightkey Input"), each once.
+func deckProfileBlackoutNotes(_ p: DeckProfile) -> [MIDINote] {
+    var seen: [MIDINote] = []
+    for k in p.blackoutKeys where k.outPort == IDs.lightkeyMIDIInput {
+        let n = MIDINote(channel: k.channel, note: k.note)
+        if !seen.contains(n) { seen.append(n) }
+    }
+    return seen
+}
+
+enum BlackoutSource: Equatable {
+    case note(MIDINote, from: String)
+    case unknown(String)        // why Booth Check can't tell, in plain words
+}
+
+/// Where the shutdown's Blackout comes from, needing nothing from a tech when the deck has a Blackout
+/// key: the show's `.deck.json` (`"blackout": "2:0"`, or null for a show without one) wins; then the
+/// Stream Deck profile chosen in This Mac; then every profile on this Mac, if their Blackout keys agree.
+func blackoutSource(file: DeckShowFile?, chosen: DeckProfileChoice?, profiles: [DeckProfile]) -> BlackoutSource {
+    switch file?.blackout ?? .notSet {
+    case .note(let n): return .note(n, from: "the show\u{2019}s .deck.json")
+    case .none: return .unknown("The show\u{2019}s .deck.json says this show has no Blackout.")
+    case .notSet: break
+    }
+    if let chosen, case .found(let p, _) = matchDeckProfile(chosen, in: profiles) {
+        let notes = deckProfileBlackoutNotes(p)
+        if notes.count == 1 { return .note(notes[0], from: "the Blackout key on the Stream Deck profile \u{201C}\(p.name)\u{201D}") }
+        return .unknown(notes.isEmpty
+            ? "The Stream Deck profile \u{201C}\(p.name)\u{201D} has no key called Blackout that sends to Lightkey."
+            : "The Stream Deck profile \u{201C}\(p.name)\u{201D} has Blackout keys on different notes (" + notes.map { "\($0.channel):\($0.note)" }.joined(separator: ", ") + ").")
+    }
+    let withKey = profiles.filter { !deckProfileBlackoutNotes($0).isEmpty }
+    var notes: [MIDINote] = []
+    for n in withKey.flatMap(deckProfileBlackoutNotes) where !notes.contains(n) { notes.append(n) }
+    if notes.count == 1 {
+        let names = Array(Set(withKey.map(\.name))).sorted().map { "\u{201C}\($0)\u{201D}" }
+        return .note(notes[0], from: "the Blackout key on the Stream Deck profile" + (names.count == 1 ? " " : "s ") + names.joined(separator: ", "))
+    }
+    if notes.isEmpty {
+        return .unknown("No Stream Deck profile on this Mac has a key called Blackout, and the show has no .deck.json naming one.")
+    }
+    return .unknown("Stream Deck profiles here use different notes for Blackout (" + notes.map { "\($0.channel):\($0.note)" }.joined(separator: ", ")
+                    + "). Choose the deck\u{2019}s profile under Stream Deck above.")
+}
+
+enum BlackoutPlan: Equatable {
+    case skip(String)
+    case send(MIDINote, from: String)
+}
+
+/// Whether the shutdown sends Blackout. Never blind: without "Lightkey Output" Booth Check couldn't see
+/// a toggling Blackout go off, so it doesn't send.
+func blackoutPlan(lightkeyRunning: Bool, destinations: [String], sources: [String], source: BlackoutSource) -> BlackoutPlan {
+    guard lightkeyRunning else { return .skip("Lightkey isn\u{2019}t open, so there are no lights to black out.") }
+    guard destinations.contains(IDs.lightkeyMIDIInput) else {
+        return .skip("Lightkey\u{2019}s MIDI input \u{201C}\(IDs.lightkeyMIDIInput)\u{201D} isn\u{2019}t there (no show open?), so nothing was sent.")
+    }
+    guard sources.contains(IDs.lightkeyMIDIOutput) else {
+        return .skip("Lightkey\u{2019}s MIDI output \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D} isn\u{2019}t there, so Booth Check couldn\u{2019}t see whether Blackout went on, and doesn\u{2019}t send it blind.")
+    }
+    switch source {
+    case .unknown(let why): return .skip(why)
+    case .note(let n, let from): return .send(n, from: from)
+    }
+}
+
+enum CueReply: Equatable { case on, off }
+
+/// Lightkey's report for one note in a UMP word from "Lightkey Output": 127 (any velocity) = on, a
+/// Note Off or a note-on with velocity 0 = off. Other notes and messages: nil.
+func cueReply(_ word: UInt32, for n: MIDINote) -> CueReply? {
+    guard word >> 28 == 2 else { return nil }                       // MIDI 1.0 channel voice
+    let status = (word >> 16) & 0xFF, note = Int((word >> 8) & 0x7F), value = word & 0x7F
+    guard Int(status & 0x0F) + 1 == n.channel, note == n.note else { return nil }
+    switch status & 0xF0 {
+    case 0x90: return value > 0 ? .on : .off
+    case 0x80: return .off
+    default: return nil
+    }
+}
+
+enum BlackoutNext: Equatable {
+    case wait
+    case sendAgain
+    case done(on: Bool?, String)
+}
+
+/// Seconds to wait for Lightkey's report after each send, and for the lights after it.
+let blackoutListen: TimeInterval = 1.5
+let blackoutFade: TimeInterval = 2
+
+/// What to do after sending Blackout, from Lightkey's reports since the last send. On: done. Off: the
+/// binding toggles and Blackout was already on, so one more send puts it back on (never more than two
+/// sends). No report within `blackoutListen`: a note-on to a Flash cue that's already on changes
+/// nothing, so it's left as it is.
+func blackoutNext(replies: [CueReply], sends: Int, sinceSend: TimeInterval) -> BlackoutNext {
+    switch replies.last {
+    case .on?:
+        return .done(on: true, sends < 2 ? "Lightkey reported Blackout on."
+                     : "Lightkey reported Blackout off after the first send (its binding toggles, so it had been on already); sent once more, and Lightkey reported it on again.")
+    case .off?:
+        if sends < 2 { return .sendAgain }
+        return .done(on: false, "Lightkey still reported Blackout off after a second send, so Booth Check left it there.")
+    case nil:
+        guard sinceSend >= blackoutListen else { return .wait }
+        return .done(on: nil, sends < 2
+                     ? "No report from Lightkey within \(blackoutListen) s: Blackout was most likely on already (a note-on leaves the show\u{2019}s Blackout on)."
+                     : "No report from Lightkey after the second send.")
+    }
+}
+
+/// The switch's words in This Mac.
+func blackoutSwitchDetail(on: Bool, source: BlackoutSource) -> String {
+    guard on else { return "Off: the stage lights stay as they are while Lightkey closes, and may flicker." }
+    switch source {
+    case .note(let n, let from):
+        return "Every shutdown, before Lightkey closes: the show\u{2019}s Blackout (\(n.text), from \(from)), then \(Int(blackoutFade)) seconds for the lights to go dark."
+    case .unknown(let why):
+        return "Can\u{2019}t send it: \(why) The shutdown carries on without it."
+    }
+}
+
 /// The days the booth shuts down by itself, in words: "Sundays and Wednesdays".
 func shutdownDaysText(_ days: Set<Int>) -> String {
     if days.count == 7 { return "every day" }
@@ -2292,6 +2533,10 @@ final class Booth: ObservableObject {
     /// The helper's arguments for this show, and whether this show uses the helper at all.
     var helperArgsInUse: [String] { deckShow?.helperArgs ?? deckHelperArgs }
     var showUsesHelper: Bool { deckShow.map { $0.helperArgs != nil } ?? true }
+    /// Where the shutdown's Blackout would come from now, for This Mac (the shutdown reads it afresh).
+    var blackoutSourceNow: BlackoutSource {
+        blackoutSource(file: deckShow, chosen: setup.deckProfile, profiles: deckProfiles.profiles)
+    }
     /// Stream Deck's profiles as last read (for This Mac's picker); whether Booth Check's switch of
     /// the profile didn't stick (then the row says how to choose it by hand); the last deck_profile event.
     @Published var deckProfiles = DeckProfilesRead()
@@ -4856,7 +5101,66 @@ extension Booth {
         guard shuttingDown, !closingApps else { return }
         closingApps = true
         countdownTimer?.invalidate()
-        quitOtherApps { self.closeBoothApps() }
+        quitOtherApps { self.blackoutBeforeClosing { self.closeBoothApps() } }
+    }
+
+    /// The shutdown's Blackout (1.30, see `blackoutPlan` and `blackoutNext`): with "Black out the stage
+    /// first" on, sends the show's Blackout to Lightkey as the deck's Blackout key does, waits for
+    /// Lightkey's report (at most 1.5 s, twice if a toggling Blackout went off), then 2 seconds for the
+    /// lights. At most about 5 seconds; anything missing is logged and skipped. Only ever called by the
+    /// shutdown, never by the checks, the start-up or the DMX recovery.
+    private func blackoutBeforeClosing(then done: @escaping () -> Void) {
+        guard setup.blackoutAtShutdown else { return done() }
+        let source = blackoutSource(file: loadDeckShowFile(forShow: showPath)?.file, chosen: setup.deckProfile,
+                                    profiles: readDeckProfiles().profiles)
+        let midi = MIDIWatch.shared
+        let plan = blackoutPlan(lightkeyRunning: !NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).isEmpty,
+                                destinations: midi.destinationNames(), sources: midi.sourceNames(), source: source)
+        guard case .send(let note, let from) = plan else {
+            if case .skip(let why) = plan { logShutdown("black out the stage", "Skipped: \(why)", status: nil) }
+            return done()
+        }
+        SignOverlay.shared.present(.shuttingDown, banner: false, step: "Turning the stage lights off\u{2026}")
+        var replies: [CueReply] = [], heard: [String] = [], sends = 0, sentAt = Date(), finished = false
+        let stop = midi.listen(to: IDs.lightkeyMIDIOutput) { word in
+            guard !finished, let r = cueReply(word, for: note) else { return }
+            replies.append(r)
+            heard.append("\(midiBytesText(word)) (\(r == .on ? "on" : "off"))")
+        }
+        guard let stop else {
+            logShutdown("black out the stage", "Skipped: Booth Check couldn\u{2019}t listen to \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D}, and doesn\u{2019}t send Blackout blind.", status: 1)
+            return done()
+        }
+        func send() -> Bool {
+            sends += 1
+            replies = []
+            sentAt = Date()
+            let r = midi.sendNoteOn(note, to: IDs.lightkeyMIDIInput)
+            logShutdown("black out the stage", "Send \(sends): \(r.detail) The note is \(from).", status: r.ok ? 0 : 1)
+            return r.ok
+        }
+        func finish(_ outcome: String, on: Bool?, status: Int32?) {
+            finished = true
+            stop()
+            logShutdown("black out the stage", outcome + (heard.isEmpty ? "" : " Heard from Lightkey: " + heard.joined(separator: ", ") + "."), status: status)
+            diagEvent("shutdown_blackout", ["sends": .int(sends), "on": .string(on.map { $0 ? "yes" : "no" } ?? "unknown")])
+            guard on != false, sends > 0 else { return done() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + blackoutFade) {
+                self.logShutdown("black out the stage", "Waited \(Int(blackoutFade)) seconds for the lights, then carried on.", status: nil)
+                done()
+            }
+        }
+        func look() {
+            switch blackoutNext(replies: replies, sends: sends, sinceSend: Date().timeIntervalSince(sentAt)) {
+            case .wait: DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { look() }
+            case .sendAgain:
+                guard send() else { return finish("The second send failed; carrying on.", on: false, status: 1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { look() }
+            case .done(let on, let outcome): finish(outcome, on: on, status: on == false ? 1 : 0)
+            }
+        }
+        guard send() else { return finish("Nothing was sent; carrying on.", on: false, status: 1) }
+        look()
     }
 
     /// 1.30: every other app with a Dock icon (Chrome, Mail…) is asked to quit first, as Quit in its
@@ -6214,6 +6518,12 @@ struct SetupSheet: View {
                                         ? "When the charger loses power, say switched off at the wall: a 1-minute warning with Not yet, then Stream Deck and Lightkey close and the Mac shuts down. Power back during the warning stops it."
                                         : "Off: on battery, the Mac keeps running.",
                                        isOn: $booth.shutdownOnPowerOff)
+                        }
+                        if booth.setup.lightkey {
+                            Divider().padding(.leading, indent)
+                            SettingRow(symbol: "lightbulb.slash.fill", tint: .purple, title: "Black out the stage first",
+                                       detail: blackoutSwitchDetail(on: booth.setup.blackoutAtShutdown, source: booth.blackoutSourceNow),
+                                       isOn: $booth.setup.blackoutAtShutdown)
                         }
                         let others = booth.loginItems.filter { !$0.name.localizedCaseInsensitiveContains("Booth Check") }
                         if !others.isEmpty {
