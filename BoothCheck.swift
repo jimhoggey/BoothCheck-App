@@ -6342,7 +6342,9 @@ struct SetupSheet: View {
             } label: {
                 Text("Profile for the service").font(.system(size: 12))
             }
-            .fixedSize()
+            // No .fixedSize() here: a long profile name made the menu, and so the whole sheet, wider
+            // than the window (1.30 test build). The menu takes the row's width and shortens its title.
+            .frame(maxWidth: 440, alignment: .leading)
             Text(booth.deckProfiles.problem.map { "Can\u{2019}t list the profiles: \($0)" }
                  ?? (tag.isEmpty ? "Pick the profile that goes with the show, and Booth Check checks Stream Deck is on it."
                                  : "Booth Check checks Stream Deck is on it, and switches it at the start-up, while Stream Deck is closed."))
