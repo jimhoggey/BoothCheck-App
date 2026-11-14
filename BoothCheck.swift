@@ -1961,6 +1961,11 @@ func countdownText(_ seconds: Int) -> String {
 /// What started a shutdown: the menu button, the set time each week, or the power going off.
 enum ShutdownReason: Equatable { case button, timed, powerOff }
 
+/// The shutdown's trigger as diagnostics name it: menu, weekly_time or power_off.
+func shutdownTrigger(_ r: ShutdownReason) -> String {
+    switch r { case .button: return "menu"; case .timed: return "weekly_time"; case .powerOff: return "power_off" }
+}
+
 /// Seconds of warning, with Not yet, before the booth shuts down.
 func shutdownWarning(_ reason: ShutdownReason) -> Int {
     switch reason {
@@ -2490,10 +2495,35 @@ final class Booth: ObservableObject {
     var diagIncidentSent: Set<String> = []
     var lastPassSignature: String?
     var lastFullPass: Date?
-    var stepStartedAt: [Int: Date] = [:]
     var diagReplugShown = false
     var diagStartupDone = false
     var shutdownStartedAt: Date?
+    /// The session log (1.30, see `SessionTally`): plain storage, never @Published, so the 15-second
+    /// passes and the person events never ask SwiftUI for an update. Session seconds count from
+    /// `sessionUptime0` (monotonic).
+    var tally = SessionTally(session: "", version: "", launch: "", startedWall: Date().timeIntervalSince1970)
+    let sessionUptime0 = ProcessInfo.processInfo.systemUptime
+    var sessionEnded = false
+    /// Why Booth Check is quitting, when something other than a plain quit (see `endSession`).
+    var quitReason: String?
+    /// The row whose Fix opened the change sheet, as it was then (for the person events).
+    var pendingRow: (id: String, title: String, status: String)?
+    /// Lightkey's Authenticate: since when it has been asking (uptime), and how long it asked this start-up.
+    var authAskingSince: TimeInterval?
+    var authWaitTotal: Double = 0
+    /// This start-up: its start (uptime), whether someone started it, whether it's the check-only one,
+    /// person events during it, each step's start (uptime).
+    var bootStartedUptime: TimeInterval?
+    var bootByHand = false
+    var bootCheckOnly = false
+    var bootPeople = 0
+    var stepStartedUptime: [Int: TimeInterval] = [:]
+    /// The shutdown's timing marks (uptime) and how its apps closed.
+    var shutdownMarks: [(name: String, at: Double)] = []
+    var shutdownClosed: [String: DiagValue] = [:]
+    /// This Mac settings changed in the last 2 seconds, sent together as one settings_changed.
+    var settingKeysPending: Set<String> = []
+    var settingKeysWork: DispatchWorkItem?
 
     @Published var latest: Release?
     @Published var updateStatus = ""
@@ -2589,6 +2619,7 @@ final class Booth: ObservableObject {
     @Published var setup: MacSetup = MacSetup.saved ?? MacSetup.detected() {
         didSet {
             setup.save()
+            noteSettings(changedSetupKeys(oldValue, setup))
             if setup.deckProfile != oldValue.deckProfile { deckProfileWriteFailed = false }
             refresh()
             if setup.streamDeck && !oldValue.streamDeck { keepStreamDeckOpen() }    // switched on just now
@@ -2613,6 +2644,7 @@ final class Booth: ObservableObject {
     @Published var autoStart: Bool = (UserDefaults.standard.object(forKey: IDs.autoStartKey) as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(autoStart, forKey: IDs.autoStartKey)
+            if autoStart != oldValue { noteSettings(["autoStart"]) }
             refresh()
         }
     }
@@ -2622,6 +2654,7 @@ final class Booth: ObservableObject {
     @Published var autoShutdown: Bool = UserDefaults.standard.bool(forKey: IDs.autoShutdownKey) {
         didSet {
             UserDefaults.standard.set(autoShutdown, forKey: IDs.autoShutdownKey)
+            if autoShutdown != oldValue { noteSettings(["autoShutdown"]) }
             armShutdown()
         }
     }
@@ -2629,12 +2662,14 @@ final class Booth: ObservableObject {
     @Published var shutdownDays: Set<Int> = Set(UserDefaults.standard.array(forKey: IDs.shutdownDaysKey) as? [Int] ?? [1]) {
         didSet {
             UserDefaults.standard.set(shutdownDays.sorted(), forKey: IDs.shutdownDaysKey)
+            if shutdownDays != oldValue { noteSettings(["shutdownDays"]) }
             armShutdown()
         }
     }
     @Published var shutdownMinute: Int = UserDefaults.standard.object(forKey: IDs.shutdownMinuteKey) as? Int ?? 13 * 60 {
         didSet {
             UserDefaults.standard.set(shutdownMinute, forKey: IDs.shutdownMinuteKey)
+            if shutdownMinute != oldValue { noteSettings(["shutdownMinute"]) }
             armShutdown()
         }
     }
@@ -2652,13 +2687,17 @@ final class Booth: ObservableObject {
                                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                                 output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
         lightkeyNoPassword = defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
+        noteSettings(["lightkeyNoPassword"])
         refresh()
     }
 
     /// Shut the booth down when the charger's power goes off, after a 1-minute warning (see
     /// `powerNext`). Off unless switched on in This Mac.
     @Published var shutdownOnPowerOff: Bool = UserDefaults.standard.bool(forKey: IDs.powerOffKey) {
-        didSet { UserDefaults.standard.set(shutdownOnPowerOff, forKey: IDs.powerOffKey) }
+        didSet {
+            UserDefaults.standard.set(shutdownOnPowerOff, forKey: IDs.powerOffKey)
+            if shutdownOnPowerOff != oldValue { noteSettings(["shutdownOnPowerOff"]) }
+        }
     }
     /// When the set time next comes round (see `armShutdown`), and whether a shutdown is under way.
     @Published var shutdownAt: Date?
@@ -3452,7 +3491,8 @@ final class Booth: ObservableObject {
         let entry = LogEntry(title: change.title, language: change.language, code: change.code,
                              output: r.out.isEmpty ? "(no output)" : r.out, status: r.code)
         changes.insert(entry, at: 0)
-        diagEvent("change_run", ["key": .string(change.key), "code": .int(Int(r.code))])
+        person("run", row: pendingRow, ["key": .string(change.key), "code": .int(Int(r.code))])
+        if let row = pendingRow?.id { tallyAction(&tally, row: row, what: "run:\(change.key)", at: sessionNow) }
         if change.key == "appnap", r.code == 0 { appNapSwitchedOffAt = Date() }
         if change.key == "dmxReconnect", r.code == 0 { watchDMXReconnect() }
         if change.key == "dmxRestart" { DispatchQueue.main.async { self.restartLightkeyForDMX() } }
@@ -3471,7 +3511,39 @@ final class Booth: ObservableObject {
 
     func finishChange() {
         pending = nil
+        pendingRow = nil
         refresh()
+    }
+
+    /// Cancel on the change sheet: nothing ran.
+    func cancelChange(_ change: PendingChange) {
+        person("cancel", row: pendingRow, ["key": .string(change.key)])
+        finishChange()
+    }
+
+    /// A row's Fix button (Reconnect the lights…, Restart Lightkey…, Install…): the person event, the
+    /// row's tally, then the action as before.
+    func rowAction(_ check: Check, _ action: Action) {
+        let row = (id: check.id, title: check.title, status: statusWord(check.status))
+        pendingRow = row
+        person("fix", row: row, ["button": .string(action.label)])
+        tallyAction(&tally, row: check.id, title: check.title, what: "fix:\(action.label)", at: sessionNow)
+        perform(action)
+    }
+
+    /// Check again, from the window or the menu.
+    func checkAgain() {
+        person("check_again", ["problems": .int(problemCount)])
+        refresh()
+    }
+
+    /// Get the show started, clicked: the rows not OK now are put down to it if they clear.
+    func startShowByHand() {
+        guard !starting else { return }
+        person("start_show", ["problems": .int(problemCount)])
+        let at = sessionNow
+        for c in checks where statusIsBad(c.status) { tallyAction(&tally, row: c.id, title: c.title, what: "startup", at: at) }
+        startShow(byHand: true)
     }
 
     func chooseShow() {
@@ -3622,11 +3694,16 @@ extension Booth {
     }
 
     func mute(_ check: Check) {
+        person("mute", row: (check.id, check.title, statusWord(check.status)))
+        tallyAction(&tally, row: check.id, title: check.title, what: "mute", at: sessionNow)
+        persistTally()
         muted.insert(check.id)
         logSetting("Muted \u{201C}\(check.title)\u{201D}", "It stays listed under Muted on this Mac, with an Unmute button.")
     }
 
     func unmute(_ check: Check) {
+        person("unmute", row: (check.id, check.title, statusWord(check.status)))
+        tallyAction(&tally, row: check.id, title: check.title, what: "unmute", at: sessionNow)
         muted.remove(check.id)
         logSetting("Unmuted \u{201C}\(check.title)\u{201D}", "It\u{2019}s checked again.")
     }
@@ -3833,9 +3910,16 @@ extension Booth {
     /// full-screen Lightkey included. Opens apps only; changes no settings. `checkOnly` is the
     /// login path on a Mac that doesn't start the show: just check, and show the result. `atLogin`
     /// is the start-up that runs by itself at login, which also puts up the hands-off sign.
-    func startShow(checkOnly: Bool = false, atLogin: Bool = false) {
+    func startShow(checkOnly: Bool = false, atLogin: Bool = false, byHand: Bool = false) {
         guard !starting else { return }
         starting = true
+        bootByHand = byHand
+        bootCheckOnly = checkOnly
+        bootPeople = 0
+        bootStartedUptime = ProcessInfo.processInfo.systemUptime
+        stepStartedUptime = [:]
+        authAskingSince = nil
+        authWaitTotal = 0
         bootFinished = false
         bootSettled = false
         bootSteps = plannedSteps(checkOnly: checkOnly)
@@ -3852,7 +3936,6 @@ extension Booth {
         dmxSeenAtStart = false
         dmxLadder = DMXLadder()
         dmxSuspect = false
-        stepStartedAt = [:]
         diagReplugShown = false
         frontAttempts = 0
         lastFront = nil
@@ -3889,16 +3972,18 @@ extension Booth {
         if let detail { bootSteps[i].detail = detail }
         let at = bootStartedAt.map { String(format: "+%6.1f s", Date().timeIntervalSince($0)) } ?? "?"
         bootTimeline.append("\(at)  \(i + 1). \(bootSteps[i].title): \(state)" + (detail.map { " \u{2014} \($0)" } ?? ""))
+        let up = ProcessInfo.processInfo.systemUptime
         if state == .running {
-            if stepStartedAt[i] == nil { stepStartedAt[i] = Date() }
+            if stepStartedUptime[i] == nil { stepStartedUptime[i] = up }
         } else {
             changes.insert(LogEntry(title: "Start-up \(i + 1): \(bootSteps[i].title)", language: "Start-up",
                                     code: bootSteps[i].title, output: bootSteps[i].detail ?? "Done.",
                                     status: state == .done ? 0 : 1), at: 0)
-            let began = stepStartedAt.removeValue(forKey: i) ?? Date()
-            diagEvent("startup_step", ["step": .string(bootSteps[i].id),
+            let began = stepStartedUptime.removeValue(forKey: i) ?? up
+            diagEvent("startup_step", ["step": .string(bootSteps[i].id), "n": .int(i + 1),
                                        "result": .string(state == .done ? "done" : state == .warn ? "warn" : "failed"),
-                                       "seconds": .double((Date().timeIntervalSince(began) * 10).rounded() / 10),
+                                       "seconds": .double(((up - began) * 10).rounded() / 10),
+                                       "at_s": .double(((up - (bootStartedUptime ?? up)) * 10).rounded() / 10),
                                        "detail": .string(bootSteps[i].detail ?? "")])
         }
     }
@@ -3946,12 +4031,14 @@ extension Booth {
             // and the wait runs to 90 s so someone can get to the cable; it can also be skipped.
             var skipped = false
             var polls = 0, foundAtOnce = false, seen = DMXPlanes()
+            var shownAt: TimeInterval?
             let ask = DispatchWorkItem {
                 guard i < self.bootSteps.count, self.bootSteps[i].id == "dmxWait",
                       self.bootSteps[i].state == .running else { return }
                 self.setStep(i, .running, "Not found yet: unplug the DMX box\u{2019}s USB cable and plug it back in.")
                 ReplugOverlay.shared.show { skipped = true }
                 self.diagReplugShown = true
+                shownAt = ProcessInfo.processInfo.systemUptime
                 self.updateSign()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: ask)
@@ -3964,6 +4051,11 @@ extension Booth {
             }, stop: { skipped }, done: { ok in
                 ask.cancel()
                 if ok { ReplugOverlay.shared.found() } else { ReplugOverlay.shared.hide() }
+                // The replug card asked a person: how it was answered, and after how long.
+                if let shownAt {
+                    self.person("replug", ["result": .string(ok ? "found" : skipped ? "skipped" : "timeout"),
+                                           "wait_s": .double(((ProcessInfo.processInfo.systemUptime - shownAt) * 10).rounded() / 10)])
+                }
                 if ok {
                     self.dmxFirstSeen = Date()
                     self.dmxSeenAtStart = foundAtOnce
@@ -4173,15 +4265,18 @@ extension Booth {
                 asking = pid.map(asksToAuthenticate) ?? false
             }
             SignOverlay.shared.setAsking(asking)
+            if AXIsProcessTrusted() { self.noteAuthAsking(asking, during: "show") }
             if asking && !self.lightkeyMayAsk {         // it asks after all, say the setting was reset
                 self.lightkeyMayAsk = true
                 self.updateSign()
             }
             switch showOpenNext(isOpen: isOpen, waited: Date().timeIntervalSince(started)) {
             case .done:
+                self.endAuthWait(asking ? "still_asking" : "answered", during: "show")
                 self.setStep(i, .done, doneText)
                 next()
             case .notShowing:
+                self.endAuthWait(asking ? "still_asking" : "answered", during: "show")
                 self.setStep(i, .warn, "\(name) isn\u{2019}t open after 2 minutes. Click Authenticate if Lightkey asks, or open it from File \u{2192} Open Recent.")
                 next()
             case .wait:
@@ -4532,10 +4627,24 @@ extension Booth {
         bootFinished = true
         if setup.lightkey && setup.dmx { dmxSnapshot("startup-end") }
         let linked = bootSteps.first { $0.id == "dmxLink" }.map { $0.state == .done } ?? true
-        diagEvent("startup_done", ["ready": .int(bootReady ? 1 : 0), "problems": .int(problemCount),
-                                   "total_s": .int(Int(Date().timeIntervalSince(bootStartedAt ?? Date()))),
-                                   "replug_shown": .int(diagReplugShown ? 1 : 0),
-                                   "dmx_recovery": .string(dmxRecoverySummary(dmxLadder, linked: linked))])
+        endAuthWait("still_asking", during: "startup_end")
+        let total = ProcessInfo.processInfo.systemUptime - (bootStartedUptime ?? ProcessInfo.processInfo.systemUptime)
+        var props: [String: DiagValue] = [
+            "ready": .int(bootReady ? 1 : 0), "problems": .int(problemCount),
+            "total_s": .double((total * 10).rounded() / 10),
+            "replug_shown": .int(diagReplugShown ? 1 : 0),
+            "dmx_recovery": .string(dmxRecoverySummary(dmxLadder, linked: linked)),
+            "dmx_rungs": .int(dmxRungsRun(dmxLadder)),
+            "how": .string(bootAtLogin ? "login" : bootByHand ? "by_hand" : bootCheckOnly ? "check_only" : "restart_lightkey"),
+            "auth_wait_s": .double((authWaitTotal * 10).rounded() / 10),
+            "people": .int(bootPeople),
+            "started": .string(aptabaseTimestamp(bootStartedAt ?? Date()))]
+        props.merge(startupStepCounts(bootSteps.map(\.state))) { a, _ in a }
+        diagEvent("startup_done", props)
+        tally.startups += 1
+        tally.startupReady = bootReady
+        tally.startupSeconds = total
+        persistTally()
         if bootSteps.contains(where: { $0.state == .warn || $0.state == .failed }), let began = bootStartedAt {
             diag.incident("startup", logText(since: began))
         }
@@ -4665,6 +4774,7 @@ extension Booth {
 
     private func dmxLinked(_ i: Int, next: @escaping () -> Void) {
         signDMXLinked = true        // it has the interface, so it's past its password
+        endAuthWait("answered", during: "dmx")
         setStep(i, .done, dmxLadder.started ? "Lightkey has the interface open. " + dmxLadderTriedText(dmxLadder) : "Lightkey has the interface open.")
         if dmxLadder.started {
             diagDMXRecovery("held", "connected")
@@ -4674,6 +4784,7 @@ extension Booth {
     }
 
     private func failDMXLink(_ i: Int, _ text: String, next: @escaping () -> Void) {
+        endAuthWait("still_asking", during: "dmx")
         setStep(i, .warn, text)
         dmxSnapshot("dmxLink-failed")
         endWorkingSign(.dmxFailed, ok: false)
@@ -4694,6 +4805,7 @@ extension Booth {
                                          oladPID: st.olad?.pid, asking: asking, accessibility: ax, ladder: self.dmxLadder,
                                          olaFound: found?.count, suspect: self.dmxSuspect,
                                          suspectCounts: dmxSuspectCounts(atLogin: self.bootAtLogin, lightkeyRunningAtStart: self.lightkeyRunningAtStart))
+                if ax { self.noteAuthAsking(asking, during: "dmx") }
                 let elapsed = Date().timeIntervalSince(since)
                 let climb = { self.climbDMXLadder(i, since: since, next: next) }
                 let again = { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { climb() } }
@@ -5068,6 +5180,8 @@ extension Booth {
         shuttingDown = true
         shutdownReason = reason
         shutdownStartedAt = Date()
+        shutdownMarks = [("start", ProcessInfo.processInfo.systemUptime)]
+        shutdownClosed = [:]
         let warning = shutdownWarning(reason)
         logShutdown(reason == .button ? "someone clicked Shut down the booth" : reason == .timed ? "the set time came" : "the power is off",
                     "A \(countdownText(warning)) warning, with Not yet.", status: nil)
@@ -5076,6 +5190,8 @@ extension Booth {
             guard let self, !self.closingApps else { return }
             self.stopCountdown()
             SignOverlay.shared.hide()
+            self.person("not_yet", ["trigger": .string(shutdownTrigger(reason)), "left_s": .int(max(left, 0)),
+                                    "after_s": .int(Int(ProcessInfo.processInfo.systemUptime - (self.shutdownMarks.first?.at ?? 0)))])
             // At the set time, ask again in half an hour, so a Mac that's forgotten still goes off.
             // After a power cut, not again until the power comes back and goes off once more.
             if reason == .timed { self.shutdownAt = Date().addingTimeInterval(30 * 60) }
@@ -5101,7 +5217,27 @@ extension Booth {
         guard shuttingDown, !closingApps else { return }
         closingApps = true
         countdownTimer?.invalidate()
-        quitOtherApps { self.blackoutBeforeClosing { self.closeBoothApps() } }
+        markShutdown("countdown")
+        quitOtherApps {
+            self.markShutdown("other_apps")
+            self.blackoutBeforeClosing {
+                self.markShutdown("blackout")
+                self.closeBoothApps()
+            }
+        }
+    }
+
+    func markShutdown(_ name: String) { shutdownMarks.append((name, ProcessInfo.processInfo.systemUptime)) }
+
+    /// shutdown_done: the trigger, each step's seconds (`markDurations`), how Stream Deck and Lightkey
+    /// closed, and whether the Mac is going off or stayed on.
+    func diagShutdownDone(_ result: String) {
+        var props = markDurations(shutdownMarks)
+        props.merge(shutdownClosed) { a, _ in a }
+        props["trigger"] = .string(shutdownTrigger(shutdownReason))
+        props["result"] = .string(result)
+        props["blackout_on"] = .int(setup.blackoutAtShutdown ? 1 : 0)
+        diagEvent("shutdown_done", props)
     }
 
     /// The shutdown's Blackout (1.30, see `blackoutPlan` and `blackoutNext`): with "Black out the stage
@@ -5211,13 +5347,18 @@ extension Booth {
     private func closeBoothApps() {
         SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Stream Deck\u{2026}")
         close(IDs.streamDeck, name: "Stream Deck", forceAfter: 5) { _ in
+            self.markShutdown("stream_deck")
             SignOverlay.shared.present(.shuttingDown, banner: false, step: "Closing Lightkey\u{2026}")
             self.close(IDs.lightkey, name: "Lightkey", forceAfter: 15) { closed in
+                self.markShutdown("lightkey")
                 guard closed else {
                     return self.stayOn("Lightkey didn\u{2019}t close, even when made to quit, so Booth Check stopped there. Shut down from the Apple menu.")
                 }
                 SignOverlay.shared.present(.shuttingDown, banner: false, step: "Shutting down the Mac\u{2026}")
-                // Diagnostics: one last send (at most 4 seconds), and the clean-exit marker goes.
+                // Diagnostics: shutdown_done, app_quit and the session summary go into the queue
+                // ahead of one last send (at most 4 seconds), and the clean-exit marker goes.
+                self.diagShutdownDone("shutting_down")
+                self.endSession("shutdown_" + shutdownTrigger(self.shutdownReason))
                 var went = false
                 let shutDownNow = {
                     guard !went else { return }
@@ -5266,6 +5407,14 @@ extension Booth {
         let started = Date()
         let words = bundleID == IDs.lightkey ? lightkeyQuitWords(apps.first?.bundleURL) : nil
         var pressed = false, forced = false
+        // For shutdown_done: whether it had to be made to quit, and whether its quit question got Quit pressed.
+        let tag = bundleID == IDs.lightkey ? "lightkey" : "stream_deck"
+        func note(_ closed: Bool) {
+            guard logAs == "Shut down" else { return }
+            shutdownClosed[tag + "_forced"] = .int(forced ? 1 : 0)
+            if bundleID == IDs.lightkey { shutdownClosed["lightkey_quit_pressed"] = .int(pressed ? 1 : 0) }
+            if !closed { shutdownClosed[tag + "_stuck"] = .int(1) }
+        }
         func look() {
             let running = apps.contains { !$0.isTerminated }
             if running, !pressed, !forced, let words,
@@ -5280,6 +5429,7 @@ extension Booth {
                             ? "It didn\u{2019}t close within \(Int(forceAfter)) seconds (it may have been asking to save the show), so it was made to quit, as Force Quit does. Changes to the show since it opened weren\u{2019}t saved, as with Don\u{2019}t Save."
                             : "It didn\u{2019}t close within \(Int(forceAfter)) seconds, so it was made to quit, as Force Quit does.",
                             status: 0)
+                note(true)
                 done(true)
             case .wait:
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
@@ -5291,6 +5441,7 @@ extension Booth {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { look() }
             case .giveUp:
                 logShutdown("close \(name)", "Still open, even after being made to quit.", status: 1)
+                note(false)
                 done(false)
             }
         }
@@ -5302,7 +5453,10 @@ extension Booth {
         shuttingDown = false
         SignOverlay.shared.stayedOn(note)
         logShutdown("the Mac stays on", note, status: 1)
+        markShutdown("stayed_on")
+        diagShutdownDone("stayed_on")
         diag.writeMarker(version: currentVersion)       // still running after all: the marker goes back
+        reopenSession()
         diag.incident("shutdown_stayed_on", logText(since: shutdownStartedAt ?? Date().addingTimeInterval(-600)))
         diag.flush()
     }
@@ -5379,6 +5533,7 @@ extension Booth {
     /// Downloads, checks and installs a release, then reopens. Stops before touching anything if a
     /// check fails, and puts the old copy back if the swap itself fails.
     func installUpdate(_ r: Release) {
+        person("update", ["from": .string(currentVersion), "to": .string(r.version)])
         updating = true
         updateError = nil
         updateSteps = []
@@ -5499,8 +5654,10 @@ extension Booth {
                 try? p.run()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                     self.showUpdate = false
+                    self.quitReason = "update"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                        self.endSession("update")
                         self.diag.markCleanExit("update to \(r.version) (quit refused, exit)")
                         exit(0)
                     }
@@ -5520,6 +5677,8 @@ struct DiagFiles {
     var queue: String { supportDir + "/aptabase-queue.jsonl" }
     var marker: String { supportDir + "/running.json" }
     var lastVersion: String { supportDir + "/last-version.txt" }
+    /// The session's running tallies (`SessionTally`), so a session the Mac never finished still gets its summary.
+    var session: String { supportDir + "/session.json" }
     static let standard = DiagFiles(logDir: NSHomeDirectory() + "/Library/Logs/Booth Check",
                                     supportDir: NSHomeDirectory() + "/Library/Application Support/Booth Check")
 }
@@ -5892,6 +6051,226 @@ func dmxRecoverySummary(_ l: DMXLadder, linked: Bool) -> String {
     return l.hupSent ? "sighup" : "none"
 }
 
+/// How many rungs of the start-up's DMX ladder actually did something: SIGHUP sent, Reset DMX Output
+/// pressed, each Lightkey relaunch.
+func dmxRungsRun(_ l: DMXLadder) -> Int { (l.hupSent ? 1 : 0) + (l.resetPressed ? 1 : 0) + l.relaunches }
+
+// The session log (1.30): what the session_summary and session_row events are built from ------------
+//
+// The owner's question: a check that was red or orange but the service went ahead anyway probably
+// isn't needed. So for each row, how long it wasn't OK in the session. Times here are session seconds,
+// counted from launch with the monotonic clock (`ProcessInfo.systemUptime`, which stops while the Mac
+// sleeps); wall-clock time only for timestamps. Start-ups aren't counted (rows are red while apps
+// open, which says nothing), nor the shutdown's closing of the apps.
+
+/// One check row's tally for the session.
+struct RowTally: Codable, Equatable {
+    var id: String
+    var title: String
+    var worst = "ok"                // the worst it got: ok, warn or fail
+    var badSeconds: Double = 0      // not-OK time in spells that have ended
+    var badSince: Double?           // when the current not-OK spell began; nil while OK
+    var firstBadAt: Double?
+    var spells = 0                  // how many times it went not-OK
+    var everOK = false              // seen OK at least once (else it was not-OK the whole session)
+    var fixClicks = 0               // its Fix button clicked
+    var muted = false
+    var lastAction: String?         // the last thing done for it ("fix:…", "run:…", "self_repair:…", "startup", "mute")
+    var lastActionAt: Double?
+    var clearedBy: String?          // what ended its last spell
+}
+
+/// The session as it stands; also saved to session.json so the next launch can report a session the
+/// Mac never got to finish (power cut, force quit).
+struct SessionTally: Codable, Equatable {
+    var session: String
+    var version: String
+    var launch: String              // how Booth Check started (see `launchKind`)
+    var startedWall: Double
+    var elapsed: Double = 0         // session seconds when last saved
+    var savedWall: Double = 0
+    var passes = 0
+    var startups = 0
+    var startupReady: Bool?
+    var startupSeconds: Double?
+    var people = 0                  // person events this session
+    var rows: [String: RowTally] = [:]
+    var ended: String?              // how it ended, once it did
+    var sent = false                // its summary is queued
+}
+
+func statusIsBad(_ s: Status) -> Bool { s == .fail || s == .warn }
+
+func statusRank(_ word: String) -> Int { word == "fail" ? 2 : word == "warn" ? 1 : 0 }
+
+/// What a row's not-OK spell ending is put down to: the last thing done for it since the spell began
+/// (a second's slack), otherwise by_itself.
+func clearedByText(_ r: RowTally) -> String {
+    guard let since = r.badSince, let at = r.lastActionAt, let what = r.lastAction, at >= since - 1 else { return "by_itself" }
+    return what
+}
+
+/// A spell that ended in a pass: the row, how long it lasted, what ended it.
+struct RowCleared: Equatable { let id: String; let seconds: Double; let by: String }
+
+private func endSpell(_ r: inout RowTally, at: Double, by: String) -> RowCleared? {
+    guard let since = r.badSince else { return nil }
+    r.badSeconds += max(0, at - since)
+    r.clearedBy = by
+    r.badSince = nil
+    return RowCleared(id: r.id, seconds: max(0, at - since), by: by)
+}
+
+/// One pass into the tally. Unknown and manual results leave a row as it was (as `checkTransitions`
+/// does); a row missing from the pass (muted, switched off in This Mac) ends its spell. Returns the
+/// spells that ended.
+@discardableResult
+func tallyPass(_ t: inout SessionTally, _ checks: [Check], at: Double) -> [RowCleared] {
+    t.passes += 1
+    t.elapsed = max(t.elapsed, at)
+    var out: [RowCleared] = []
+    for c in checks where c.status != .unknown && c.status != .manual {
+        var r = t.rows[c.id] ?? RowTally(id: c.id, title: c.title)
+        r.title = c.title
+        if statusIsBad(c.status) {
+            if r.badSince == nil {
+                r.badSince = at
+                r.spells += 1
+                if r.firstBadAt == nil { r.firstBadAt = at }
+            }
+            let word = statusWord(c.status)
+            if statusRank(word) > statusRank(r.worst) { r.worst = word }
+        } else {
+            if let cleared = endSpell(&r, at: at, by: clearedByText(r)) { out.append(cleared) }
+            r.everOK = true
+        }
+        t.rows[c.id] = r
+    }
+    let present = Set(checks.map(\.id))
+    for id in t.rows.keys.sorted() where !present.contains(id) && t.rows[id]?.badSince != nil {
+        var r = t.rows[id]!
+        if let cleared = endSpell(&r, at: at, by: r.muted ? "muted" : "gone") { out.append(cleared) }
+        t.rows[id] = r
+    }
+    return out
+}
+
+/// Something done for a row: "fix:<button>" (its Fix clicked), "run:<key>" (a change run), "mute",
+/// "unmute", "startup" (Get the show started), "self_repair:<what>" (Booth Check fixing it).
+func tallyAction(_ t: inout SessionTally, row: String, title: String? = nil, what: String, at: Double) {
+    var r = t.rows[row] ?? RowTally(id: row, title: title ?? row)
+    r.lastAction = what
+    r.lastActionAt = at
+    if what.hasPrefix("fix:") { r.fixClicks += 1 }
+    if what == "mute" { r.muted = true }
+    if what == "unmute" { r.muted = false }
+    t.rows[row] = r
+}
+
+/// A self_repair's `what` → the rows it works on.
+func selfRepairRows(_ what: String) -> [String] {
+    switch what {
+    case "deck_profile": return ["deckProfile"]
+    case "streamdeck_restart", "streamdeck_open": return ["deckapp", "deck"]
+    case "helper_restart": return ["deckLights"]
+    default: return []
+    }
+}
+
+/// One session_row's props: a row that was warn or fail at some point.
+func sessionRowProps(_ r: RowTally, at: Double, sessionSeconds: Double) -> [String: DiagValue] {
+    let bad = r.badSeconds + (r.badSince.map { max(0, at - $0) } ?? 0)
+    let share = sessionSeconds > 0 ? min(100, Int((bad / sessionSeconds * 100).rounded())) : 0
+    return ["check": .string(r.id), "title": .string(r.title), "worst": .string(r.worst),
+            "bad_s": .int(Int(bad.rounded())), "share_pct": .int(share),
+            "whole": .int(r.everOK ? 0 : 1), "bad_at_end": .int(r.badSince != nil ? 1 : 0),
+            "spells": .int(r.spells), "first_bad_s": .int(Int((r.firstBadAt ?? 0).rounded())),
+            "fix_clicks": .int(r.fixClicks), "muted": .int(r.muted ? 1 : 0),
+            "cleared_by": .string(r.badSince != nil ? "still_bad" : r.clearedBy ?? "")]
+}
+
+/// session_summary's props.
+func sessionSummaryProps(_ t: SessionTally, at: Double, ended: String) -> [String: DiagValue] {
+    let bad = t.rows.values.filter { $0.spells > 0 }
+    return ["ended": .string(ended), "session_s": .int(Int(at.rounded())), "launch_how": .string(t.launch), "version": .string(t.version),
+            "started": .string(aptabaseTimestamp(Date(timeIntervalSince1970: t.startedWall))),
+            "startups": .int(t.startups),
+            "startup": .string(t.startupReady.map { $0 ? "ready" : "not_ready" } ?? "none"),
+            "startup_s": .int(Int((t.startupSeconds ?? 0).rounded())), "passes": .int(t.passes),
+            "rows": .int(t.rows.count), "rows_ok": .int(t.rows.count - bad.count), "rows_bad": .int(bad.count),
+            "bad_at_end": .int(bad.filter { $0.badSince != nil }.count), "people": .int(t.people),
+            "bad_rows": .string(bad.map(\.id).sorted().joined(separator: ","))]
+}
+
+/// The end of a session as events: session_summary, then a session_row for each row that was ever warn
+/// or fail (the most not-OK time first). All carry `ended` and, when sent, the same session id.
+func sessionEvents(_ t: SessionTally, at: Double, ended: String) -> [(name: String, props: [String: DiagValue])] {
+    let bad = t.rows.values.filter { $0.spells > 0 }
+        .map { ($0, sessionRowProps($0, at: at, sessionSeconds: at)) }
+        .sorted { a, b in
+            let x = Int(a.1["bad_s"]?.text ?? "0") ?? 0, y = Int(b.1["bad_s"]?.text ?? "0") ?? 0
+            return x != y ? x > y : a.0.id < b.0.id
+        }
+    return [("session_summary", sessionSummaryProps(t, at: at, ended: ended))]
+        + bad.map { ("session_row", $0.1.merging(["ended": .string(ended)]) { a, _ in a }) }
+}
+
+/// The session's end in the log on disk: one line for the session, one per row that wasn't OK.
+func sessionLogText(_ events: [(name: String, props: [String: DiagValue])], time: Date) -> String {
+    events.map { eventLogLine($0.name, $0.props, time: time) }.joined()
+}
+
+/// An event as one line in the log on disk: `<time>  event <name>: key=value …`, keys sorted, values
+/// with spaces quoted, newlines folded.
+func eventLogLine(_ name: String, _ props: [String: DiagValue], time: Date) -> String {
+    let parts = props.sorted { $0.key < $1.key }.map { k, v -> String in
+        let s = v.text.replacingOccurrences(of: "\n", with: " / ")
+        if case .string = v, s.isEmpty || s.contains(" ") || s.contains("=") { return "\(k)=\"\(s.replacingOccurrences(of: "\"", with: "'"))\"" }
+        return "\(k)=\(s)"
+    }
+    return "\(diskTime(time))  event \(name)" + (parts.isEmpty ? "" : ": " + parts.joined(separator: " ")) + "\n"
+}
+
+/// The time between marks as "<name>_s" props (one decimal), and total_s from the first mark to the last.
+func markDurations(_ marks: [(name: String, at: Double)]) -> [String: DiagValue] {
+    var out: [String: DiagValue] = [:]
+    for (a, b) in zip(marks, marks.dropFirst()) { out[b.name + "_s"] = .double((max(0, b.at - a.at) * 10).rounded() / 10) }
+    if let f = marks.first, let l = marks.last { out["total_s"] = .double((max(0, l.at - f.at) * 10).rounded() / 10) }
+    return out
+}
+
+/// The start-up's steps at its end: how many, and how many ended done, warn, failed or never ran.
+func startupStepCounts(_ states: [StepState]) -> [String: DiagValue] {
+    ["steps": .int(states.count), "steps_ok": .int(states.filter { $0 == .done }.count),
+     "steps_warn": .int(states.filter { $0 == .warn }.count), "steps_failed": .int(states.filter { $0 == .failed }.count),
+     "steps_not_run": .int(states.filter { $0 == .waiting || $0 == .running }.count)]
+}
+
+/// The This Mac settings that differ between two setups (top-level keys of their saved JSON).
+func changedSetupKeys(_ a: MacSetup, _ b: MacSetup) -> [String] {
+    let enc = JSONEncoder()
+    enc.outputFormatting = .sortedKeys
+    func dict(_ s: MacSetup) -> [String: Any] {
+        (try? enc.encode(s)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+    }
+    let x = dict(a), y = dict(b)
+    return Set(x.keys).union(y.keys).filter { k in
+        switch (x[k], y[k]) {
+        case (nil, nil): return false
+        case let (p?, q?): return !(p as AnyObject).isEqual(q)
+        default: return true
+        }
+    }.sorted()
+}
+
+/// How Booth Check was started: login_flag (`--login`, testing), login_item (macOS opened it at
+/// login), after_restart (in the first 3 minutes after a start), by_hand (someone opened it).
+func launchKind(flag: Bool, loginItemEvent: Bool, uptime: Double) -> String {
+    if flag { return "login_flag" }
+    if loginItemEvent { return "login_item" }
+    return uptime < 180 ? "after_restart" : "by_hand"
+}
+
 // MARK: - The log on disk and diagnostics (files and network; one serial queue, never the main thread)
 
 /// Sends a request and calls back with the HTTP status (nil on a network error) and the body. Tests
@@ -5997,6 +6376,18 @@ final class Diagnostics {
         write("\(diskTime(Date()))  ==== Booth Check ends: \(why) (clean-exit marker removed)\n")
     }
 
+    // The session's tallies on disk ---------------------------------------------------------------------
+
+    /// Saves session.json (a few KB; atomic). Safe from any thread: each write replaces the file whole.
+    func writeSession(_ data: Data) {
+        try? FileManager.default.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: files.session), options: .atomic)
+    }
+
+    func readSession() -> SessionTally? {
+        FileManager.default.contents(atPath: files.session).flatMap { try? JSONDecoder().decode(SessionTally.self, from: $0) }
+    }
+
     /// At launch, before anything else is written: how the previous run ended, and its log's tail.
     func readPreviousRun(currentVersion: String) -> (exit: String, tail: String, detail: String) {
         let fm = FileManager.default
@@ -6021,20 +6412,27 @@ final class Diagnostics {
 
     // Events and the queue ------------------------------------------------------------------------------
 
-    /// Queues one event (scrubbed, validated, with seq and launch). Nothing when switched off or keyless.
+    /// One event: a line in the log on disk (always, so the log has it with diagnostics off too), and
+    /// queued for Aptabase (scrubbed, validated, with seq and launch; nothing when switched off or keyless).
     func event(_ name: String, _ props: [String: DiagValue] = [:], time: Date = Date()) {
-        queue.async { self.enqueue(name, props, time: time) }
+        queue.async { self.record(name, props, time: time) }
     }
 
-    func enqueue(_ name: String, _ props: [String: DiagValue], time: Date) {
+    /// `event` on the queue. `sid`: another session's id (the previous session's summary, sent late).
+    func record(_ name: String, _ props: [String: DiagValue], time: Date, session sid: String? = nil) {
+        appendToLog(eventLogLine(name, props, time: time))
+        enqueue(name, props, time: time, session: sid)
+    }
+
+    func enqueue(_ name: String, _ props: [String: DiagValue], time: Date, session sid: String? = nil) {
         guard enabled, appKey != nil else { return }
         seq += 1
         // log_chunk text is scrubbed whole before it's cut up (see `incident`).
         var p = name == "log_chunk" ? props
             : props.mapValues { v -> DiagValue in if case .string(let s) = v { return .string(scrub(s, scrubContext)) }; return v }
         p["seq"] = .int(seq)
-        p["launch"] = .string(session)
-        let e = validDiagEvent(DiagEvent(id: UUID().uuidString, time: time.timeIntervalSince1970, name: name, session: session,
+        p["launch"] = .string(sid ?? session)
+        let e = validDiagEvent(DiagEvent(id: UUID().uuidString, time: time.timeIntervalSince1970, name: name, session: sid ?? session,
                                          system: systemProps, props: p))
         guard var line = try? JSONEncoder().encode(e) else { return }
         line.append(0x0A)
@@ -6131,6 +6529,9 @@ final class Diagnostics {
                                     + "\nLeft in the queue: \(left)" + (outcome == .retry ? ". Trying again in \(Int(backoff / 60)) min or with Send now." : ""),
                                  status: outcome == .sent ? 0 : 1))
             if body.count <= 16_000 { appendToLog("\(diskTime(Date()))  Diagnostics body sent:\n" + indentLines(String(decoding: body, as: UTF8.self), "    ")) }
+            // The answer on disk too (at quit, the Log's own entry never reaches the disk).
+            appendToLog("\(diskTime(Date()))  Diagnostics answer: " + (failure.map { "network error: \($0)" } ?? "HTTP \(status ?? 0) \(capText(reply, maxBytes: 300))")
+                        + " \u{2192} \(outcome == .sent ? "sent" : outcome == .drop ? "dropped" : "kept") \(batch.count) events (\(what))\n")
             if outcome == .retry { break }
         }
         return logs
@@ -6195,7 +6596,120 @@ extension Booth {
         if changes.count > 500 { changes.removeLast(changes.count - 500) }
     }
 
-    func diagEvent(_ name: String, _ props: [String: DiagValue] = [:]) { diag.event(name, props) }
+    func diagEvent(_ name: String, _ props: [String: DiagValue] = [:]) {
+        diag.event(name, props)
+        // Booth Check fixing a row by itself: if the row turns green, it's put down to that.
+        if name == "self_repair", case .string(let what)? = props["what"] {
+            for row in selfRepairRows(what) { tallyAction(&tally, row: row, what: "self_repair:\(what)", at: sessionNow) }
+        }
+    }
+
+    // The session log (1.30) ---------------------------------------------------------------------------
+
+    /// Session seconds, monotonic (stops while the Mac sleeps).
+    var sessionNow: Double { ProcessInfo.processInfo.systemUptime - sessionUptime0 }
+
+    /// A person did something, or had to: one `person` event, with the row it was for (id, title, its
+    /// status then) and whether a start-up or a shutdown was running.
+    func person(_ action: String, row: (id: String, title: String, status: String)? = nil, _ extra: [String: DiagValue] = [:]) {
+        var p = extra
+        p["action"] = .string(action)
+        if let row {
+            p["check"] = .string(row.id)
+            p["title"] = .string(row.title)
+            p["row_status"] = .string(row.status)
+        }
+        p["during"] = .string(starting ? "startup" : shuttingDown ? "shutdown" : "service")
+        tally.people += 1
+        if starting { bootPeople += 1 }
+        diagEvent("person", p)
+    }
+
+    /// This Mac settings changed: gathered for 2 seconds (a toggle, a time picker), then one
+    /// settings_changed with the keys and whether This Mac was open (a person) or not (Booth Check itself).
+    func noteSettings(_ keys: [String]) {
+        guard !keys.isEmpty else { return }
+        settingKeysPending.formUnion(keys)
+        guard settingKeysWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let keys = self.settingKeysPending.sorted()
+            self.settingKeysPending = []
+            self.settingKeysWork = nil
+            self.diagEvent("settings_changed", ["keys": .string(keys.joined(separator: ",")), "this_mac_open": .int(self.showSetup ? 1 : 0)])
+        }
+        settingKeysWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+
+    /// Lightkey's Authenticate, as last seen (start-up only): the wait starts when it's first seen asking
+    /// and ends when it's gone (`endAuthWait`).
+    func noteAuthAsking(_ asking: Bool, during: String) {
+        if asking {
+            if authAskingSince == nil { authAskingSince = ProcessInfo.processInfo.systemUptime }
+        } else {
+            endAuthWait("answered", during: during)
+        }
+    }
+
+    func endAuthWait(_ result: String, during: String) {
+        guard let since = authAskingSince else { return }
+        authAskingSince = nil
+        let waited = ProcessInfo.processInfo.systemUptime - since
+        authWaitTotal += waited
+        person("authenticate", ["result": .string(result), "wait_s": .double((waited * 10).rounded() / 10), "step": .string(during)])
+    }
+
+    /// Saves the tallies to session.json, off the main thread. On a change of a row, at the end of a
+    /// start-up, and every 5 minutes, so a power cut loses at most 5 minutes of the session's length.
+    func persistTally() {
+        guard !sessionEnded else { return }
+        tally.elapsed = sessionNow
+        tally.savedWall = Date().timeIntervalSince1970
+        guard let data = try? JSONEncoder().encode(tally) else { return }
+        diag.queue.async { self.diag.writeSession(data) }
+    }
+
+    /// The session ends (quit, shutdown, update): app_quit, session_summary and one session_row per row
+    /// that was ever warn or fail, to the log on disk and the queue. session.json says how it ended at
+    /// once, on this thread, so if the queue never gets to it, the next launch still sends it. Once
+    /// per session; returns whether it ran now.
+    @discardableResult
+    func endSession(_ ended: String) -> Bool {
+        guard !sessionEnded else { return false }
+        let at = sessionNow
+        tally.elapsed = at
+        tally.savedWall = Date().timeIntervalSince1970
+        tally.ended = ended
+        tally.sent = false
+        sessionEnded = true
+        let enc = JSONEncoder()
+        if let data = try? enc.encode(tally) { diag.writeSession(data) }
+        var sent = tally
+        sent.sent = true
+        let sentData = try? enc.encode(sent)
+        let quit: [String: DiagValue] = ["reason": .string(ended), "session_s": .int(Int(at.rounded())),
+                                         "startup": .string(tally.startupReady.map { $0 ? "ready" : "not_ready" } ?? "none"),
+                                         "problems_now": .int(problemCount), "people": .int(tally.people)]
+        let events = sessionEvents(tally, at: at, ended: ended)
+        let now = Date()
+        diag.queue.async {
+            self.diag.record("app_quit", quit, time: now)
+            for e in events { self.diag.record(e.name, e.props, time: now) }
+            if let sentData { self.diag.writeSession(sentData) }
+        }
+        return true
+    }
+
+    /// The shutdown stopped and the Mac stays on: the session goes on (its summary may have gone; the
+    /// next end sends another with the same session id, and the later one is the one to read).
+    func reopenSession() {
+        guard sessionEnded else { return }
+        sessionEnded = false
+        tally.ended = nil
+        tally.sent = false
+        persistTally()
+    }
 
     func diagDMXRecovery(_ rung: String, _ result: String) {
         diagEvent("dmx_recovery", ["rung": .string(rung), "result": .string(result)])
@@ -6203,7 +6717,7 @@ extension Booth {
 
     /// At launch: the header in the log, how the last run ended, the clean-exit marker, app_start, and
     /// an incident with the previous run's tail when it didn't end cleanly. Then the 5-minute flushes.
-    func diagLaunch(atLogin: Bool) {
+    func diagLaunch(atLogin: Bool, how: String) {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let macos = "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         let inApplications = Bundle.main.bundlePath.hasPrefix("/Applications/")
@@ -6216,15 +6730,35 @@ extension Booth {
         let uptime = Int(ProcessInfo.processInfo.systemUptime)
         let version = currentVersion, build = buildNumber, tag = setupTag(setup), diagOn = setup.diagnostics
         let keyed = diag.appKey != nil
+        tally = SessionTally(session: diag.session, version: version, launch: how, startedWall: Date().timeIntervalSince1970)
         diag.queue.async {
             let prev = self.diag.readPreviousRun(currentVersion: version)
-            self.diag.appendToLog("\n\(diskTime(Date()))  ==== Booth Check \(version) (build \(build)) \u{00B7} \(runArch) \u{00B7} macOS \(macos) \u{00B7} \(hardwareModel()) \u{00B7} up \(uptime) s \u{00B7} at login: \(atLogin ? "yes" : "no") \u{00B7} pid \(ProcessInfo.processInfo.processIdentifier)\n"
+            let prevSession = self.diag.readSession()
+            self.diag.appendToLog("\n\(diskTime(Date()))  ==== Booth Check \(version) (build \(build)) \u{00B7} \(runArch) \u{00B7} macOS \(macos) \u{00B7} \(hardwareModel()) \u{00B7} up \(uptime) s \u{00B7} at login: \(atLogin ? "yes" : "no") (\(how)) \u{00B7} pid \(ProcessInfo.processInfo.processIdentifier)\n"
                 + "    \(prev.detail)\n    Setup: \(tag). Diagnostics: " + (!diagOn ? "off" : keyed ? "on (session \(self.diag.session))" : "on, but this build has no key, so nothing is sent") + "\n")
+            // The previous session's summary, if it never went: the Mac lost power or Booth Check was
+            // killed (running.json left: ended = unclean or crash), or it quit before the queue got it.
+            if let p = prevSession, !p.sent {
+                let ended = prev.exit == "unclean" || prev.exit == "crash" ? prev.exit : (p.ended ?? "unknown")
+                let when = Date(timeIntervalSince1970: p.savedWall)
+                self.diag.appendToLog("\(diskTime(Date()))  The previous session (\(p.session)) never sent its summary; sending it now, ended \(ended), as of \(diskTime(when)):\n")
+                for e in sessionEvents(p, at: p.elapsed, ended: ended) {
+                    self.diag.record(e.name, e.props.merging(["late": .int(1)]) { a, _ in a }, time: when, session: p.session)
+                }
+            }
+            try? FileManager.default.removeItem(atPath: self.diag.files.session)
             self.diag.writeMarker(version: version)
             DispatchQueue.main.async {
-                self.diagEvent("app_start", ["version": .string(version), "build": .string(build), "arch": .string(runArch),
-                                             "macos": .string(macos), "uptime_s": .int(uptime), "at_login": .int(atLogin ? 1 : 0),
-                                             "setup": .string(tag), "prev_exit": .string(prev.exit)])
+                var start: [String: DiagValue] = ["version": .string(version), "build": .string(build), "arch": .string(runArch),
+                                                  "macos": .string(macos), "uptime_s": .int(uptime), "at_login": .int(atLogin ? 1 : 0),
+                                                  "how": .string(how), "setup": .string(tag), "prev_exit": .string(prev.exit)]
+                if let p = prevSession {
+                    start["prev_ran_at"] = .string(aptabaseTimestamp(Date(timeIntervalSince1970: p.savedWall)))
+                    start["prev_session_s"] = .int(Int(p.elapsed.rounded()))
+                    start["prev_ended"] = .string(prev.exit == "unclean" || prev.exit == "crash" ? prev.exit : (p.ended ?? "unknown"))
+                    start["since_prev_h"] = .double(((Date().timeIntervalSince1970 - p.savedWall) / 360).rounded() / 10)
+                }
+                self.diagEvent("app_start", start)
                 if prev.exit == "unclean" || prev.exit == "crash" { self.diag.incident("prev_\(prev.exit)", prev.tail) }
                 if !keyed {
                     self.changes.insert(LogEntry(title: "Diagnostics: this build sends nothing", language: "Booth Check", code: "Info.plist AptabaseAppKey",
@@ -6235,7 +6769,10 @@ extension Booth {
         }
         // The first flush comes after the start-up (or 2 minutes in), then every 5 minutes.
         DispatchQueue.main.asyncAfter(deadline: .now() + 121) { self.diagFlushIfAllowed() }
-        let t = Timer(timeInterval: 300, repeats: true) { [weak self] _ in self?.diagFlushIfAllowed() }
+        let t = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
+            self?.persistTally()        // the session's length so far, in case the power goes
+            self?.diagFlushIfAllowed()
+        }
         RunLoop.main.add(t, forMode: .common)
     }
 
@@ -6289,17 +6826,28 @@ extension Booth {
         guard !starting else { return }
         let t = checkTransitions(old: diagBaseline ?? [], new: new)
         diagBaseline = t.baseline
+        // The session's tallies (not while the shutdown closes the apps: rows go red on purpose then).
+        let cleared = closingApps ? [] : tallyPass(&tally, new, at: sessionNow)
         for c in t.changes {
             if c.failed {
                 if diagFailingSince[c.id] == nil { diagFailingSince[c.id] = now }
-                diagEvent("check_failed", ["check": .string(c.id), "title": .string(c.title), "status": .string(c.status), "detail": .string(c.detail)])
+                diagEvent("check_failed", ["check": .string(c.id), "title": .string(c.title), "status": .string(c.status), "detail": .string(c.detail),
+                                           "spell": .int(tally.rows[c.id]?.spells ?? 0)])
             } else {
                 let since = diagFailingSince.removeValue(forKey: c.id)
                 diagIncidentSent.remove(c.id)
+                let spell = cleared.first { $0.id == c.id }
                 diagEvent("check_recovered", ["check": .string(c.id), "title": .string(c.title), "status": .string(c.status), "detail": .string(c.detail),
-                                              "for_s": .int(Int(now.timeIntervalSince(since ?? now)))])
+                                              "for_s": .int(spell.map { Int($0.seconds.rounded()) } ?? Int(now.timeIntervalSince(since ?? now))),
+                                              "cleared_by": .string(spell?.by ?? "by_itself")])
             }
         }
+        // A row muted or switched off while not OK: its spell ended without check_recovered.
+        for c in cleared where c.by == "muted" || c.by == "gone" {
+            diagFailingSince.removeValue(forKey: c.id)
+            diagEvent("check_cleared", ["check": .string(c.id), "title": .string(tally.rows[c.id]?.title ?? c.id), "for_s": .int(Int(c.seconds.rounded())), "cleared_by": .string(c.by)])
+        }
+        if !t.changes.isEmpty || !cleared.isEmpty { persistTally() }
         for c in t.baseline where (c.status == .fail || c.status == .warn) && !diagIncidentSent.contains(c.id) {
             guard let since = diagFailingSince[c.id], now.timeIntervalSince(since) > 60 else { continue }
             diagIncidentSent.insert(c.id)
@@ -6908,7 +7456,7 @@ struct ChangeSheet: View {
             HStack {
                 Spacer()
                 if result == nil {
-                    Button("Cancel") { booth.finishChange() }.keyboardShortcut(.cancelAction)
+                    Button("Cancel") { booth.cancelChange(change) }.keyboardShortcut(.cancelAction)
                     Button("Run") { result = booth.run(change) }.keyboardShortcut(.defaultAction)
                 } else {
                     Button("Done") { booth.finishChange() }.keyboardShortcut(.defaultAction)
@@ -7082,7 +7630,7 @@ struct ContentView: View {
                         if !rows.isEmpty {
                             section(group) {
                                 ForEach(rows) { check in
-                                    CheckRow(check: check, perform: booth.perform, mute: booth.mute)
+                                    CheckRow(check: check, perform: { booth.rowAction(check, $0) }, mute: booth.mute)
                                     if check.id != rows.last?.id { Divider() }
                                 }
                             }
@@ -7133,7 +7681,7 @@ struct ContentView: View {
                 Button("Update to \(release.version)") { booth.showUpdate = true }
             }
             if booth.canStartShow {
-                Button { booth.startShow() } label: {
+                Button { booth.startShowByHand() } label: {
                     if booth.starting {
                         HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Starting\u{2026}") }
                     } else {
@@ -7149,7 +7697,7 @@ struct ContentView: View {
                 .help("Which apps this Mac runs, how it starts, and which checks are muted")
             Button { showLog = true } label: { Label("Log", systemImage: "list.bullet.rectangle") }
                 .keyboardShortcut("l")
-            Button("Check again") { booth.refresh() }.keyboardShortcut("r")
+            Button("Check again") { booth.checkAgain() }.keyboardShortcut("r")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
@@ -7874,7 +8422,7 @@ struct MenuPanel: View {
             }
             Divider()
             if booth.canStartShow {
-                Button { booth.startShow() } label: {
+                Button { booth.startShowByHand() } label: {
                     Label(booth.starting ? "Starting\u{2026}" : "Get the show started", systemImage: "play.fill")
                         .frame(maxWidth: .infinity)
                 }
@@ -7892,11 +8440,11 @@ struct MenuPanel: View {
             .disabled(booth.shuttingDown || booth.starting)
             HStack {
                 Button("Open Booth Check") { booth.showWindow() }
-                Button("Check again") { booth.refresh() }
+                Button("Check again") { booth.checkAgain() }
                 Spacer()
                 // 1.30: Quit shows only while Option is held, so a volunteer can't close the watch by accident.
                 if option.down {
-                    Button("Quit") { NSApp.terminate(nil) }
+                    Button("Quit") { booth.quitReason = "menu_quit"; NSApp.terminate(nil) }
                 }
             }
             .controlSize(.small)
@@ -7927,14 +8475,19 @@ var napActivity: NSObjectProtocol?
 
 /// True when macOS opened Booth Check as a login item, rather than someone opening it by hand.
 /// `--login` forces it, for testing.
-func launchedAsLoginItem() -> Bool {
-    if CommandLine.arguments.contains("--login") { return true }
+func launchedAsLoginItem() -> Bool { currentLaunchKind() != "by_hand" }
+
+/// How this launch came about (see `launchKind`); read in applicationDidFinishLaunching, while macOS's
+/// open event is still the current one.
+func currentLaunchKind() -> String {
+    var loginItem = false
     if let event = NSAppleEventManager.shared().currentAppleEvent,
        event.eventID == AEEventID(kAEOpenApplication),
        event.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue == OSType(keyAELaunchedAsLogInItem) {
-        return true
+        loginItem = true
     }
-    return ProcessInfo.processInfo.systemUptime < 180      // just after a restart
+    return launchKind(flag: CommandLine.arguments.contains("--login"), loginItemEvent: loginItem,
+                      uptime: ProcessInfo.processInfo.systemUptime)   // under 3 minutes: just after a restart
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -7943,8 +8496,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         napActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
                                                             reason: "Booth Check watches the booth in the background")
         let booth = Booth.shared
-        let atLogin = launchedAsLoginItem()
-        booth.diagLaunch(atLogin: atLogin)
+        let how = currentLaunchKind()
+        let atLogin = how != "by_hand"
+        booth.diagLaunch(atLogin: atLogin, how: how)
+        // A logout, restart or shutdown from the Apple menu: say so when Booth Check is quit by it.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { _ in
+            if booth.quitReason == nil { booth.quitReason = "mac_logout_or_shutdown" }
+        }
         booth.logMenuIconLaunch()
         if atLogin { booth.logAppsOpenAtLogin() }
         booth.start()
@@ -7968,11 +8526,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Quitting on purpose (Quit, an update, the Mac shutting down): the clean-exit marker goes.
     func applicationWillTerminate(_ notification: Notification) {
-        Diagnostics.shared.markCleanExit("quit")
-        // Let the last lines reach the disk, but never wait more than a second (a send may be under way).
+        let booth = Booth.shared
+        let why = booth.quitReason ?? "quit"
+        // app_quit and the session summary (unless the shutdown already sent them), then one short send.
+        let ended = booth.endSession(why)
+        Diagnostics.shared.markCleanExit(why)
+        // Let the last lines reach the disk and, with a new summary, try to send it: never more than
+        // 2 seconds (a send may be under way). Anything not sent stays queued, and session.json says
+        // how the session ended, so the next launch sends it.
         let written = DispatchSemaphore(value: 0)
-        Diagnostics.shared.queue.async { written.signal() }
-        _ = written.wait(timeout: .now() + 1)
+        let deadline = Date().addingTimeInterval(1.5)
+        let send = ended && booth.setup.diagnostics
+        Diagnostics.shared.queue.async {
+            if send { _ = Diagnostics.shared.flushSync(deadline: deadline) }
+            written.signal()
+        }
+        _ = written.wait(timeout: .now() + (send ? 2 : 1))
     }
 }
 

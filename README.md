@@ -417,7 +417,41 @@ in This Mac. Both keep every step in the Log.
   folder becomes `~`, the user's and the Mac's names are removed, USB serial numbers are hashed,
   emails and IP addresses removed; passwords are never in it. Events wait in
   `aptabase-queue.jsonl` (sent after the start-up, then every 5 minutes, and before a shutdown);
-  each send is in the Log with the server's answer.
+  each send is in the Log with the server's answer. Every event is also one line in the log on disk
+  (`event <name>: key=value …`), diagnostics on or off.
+- **The session** is one run of Booth Check, from launch to quit or shutdown. Every event carries its
+  id as the Aptabase session and the `launch` prop. Durations use the Mac's monotonic clock, which
+  stops while it sleeps; times are UTC. The running tallies are saved in
+  `~/Library/Application Support/Booth Check/session.json` (on a row change, after a start-up and
+  every 5 minutes), so if the Mac loses power, the next launch sends that session's summary with
+  `ended: unclean` and `late: 1`. A normal Sunday (one start-up, a 3-hour service, one shutdown) is
+  roughly 50 to 120 events; nothing is sent per 15-second pass unless a check changed.
+
+| Event | When | Main props |
+|---|---|---|
+| `app_start` | Booth Check starts | `how` (login_item, login_flag, after_restart, by_hand), `at_login`, `uptime_s`, `version`, `setup`, `prev_exit` (clean, update, unclean, crash, first), `prev_ran_at`, `prev_session_s`, `prev_ended`, `since_prev_h` |
+| `apps_open_at_login` | login start-up | apps already open, `lightkey_reopened` |
+| `startup_step` | each start-up step ends | `step`, `n`, `result` (done, warn, failed), `seconds`, `at_s` (since the start-up began), `detail` |
+| `startup_done` | the start-up ends | `ready` (1 = "Ready for the service"), `total_s`, `how` (login, by_hand, check_only, restart_lightkey), `steps`, `steps_ok`/`_warn`/`_failed`/`_not_run`, `problems`, `dmx_rungs`, `dmx_recovery`, `replug_shown`, `auth_wait_s`, `people` (person events during it), `started` |
+| `check_failed` | a row goes warn or fail (not during a start-up) | `check`, `title`, `status`, `detail`, `spell` (how many times this session) |
+| `check_recovered` | it's OK again | `check`, `title`, `for_s`, `cleared_by`: `by_itself`, `fix:<button>`, `run:<change>`, `self_repair:<what>`, `startup` (Get the show started) |
+| `check_cleared` | a row muted or switched off while not OK | `check`, `for_s`, `cleared_by` (muted, gone) |
+| `person` | someone acted, or had to | `action`, `during` (startup, service, shutdown), and for a row `check`, `title`, `row_status`. Actions: `fix` (a row's button, `button`), `run` / `cancel` (the change sheet, `key`: e.g. `dmxReconnect` is Reconnect the lights…, `dmxRestart` Restart Lightkey…), `check_again`, `start_show`, `mute`, `unmute`, `not_yet` (`trigger`, `left_s`), `update`, `replug` (the replug card: `result` found, skipped or timeout, `wait_s`), `authenticate` (Lightkey asked for the password: `wait_s`, `result`) |
+| `settings_changed` | This Mac settings changed | `keys`, `this_mac_open` (0 = Booth Check changed it itself) |
+| `setting` | a logged setting (mute, show, profile…) | `key`, `value` |
+| `self_repair`, `dmx_recovery`, `dmx_snapshot`, `deck_profile`, `power_change` | Booth Check fixing or recording something | `what`/`rung`, `result` |
+| `shutdown` | each shutdown step | `reason`, `step`, `detail` |
+| `shutdown_blackout`, `apps_quit_at_shutdown` | the Blackout, other apps closing | `sends`, `on`; `apps`, `stayed` |
+| `shutdown_done` | the apps closed (or it stayed on) | `trigger` (menu, weekly_time, power_off), `result` (shutting_down, stayed_on), `countdown_s`, `other_apps_s`, `blackout_s`, `stream_deck_s`, `lightkey_s`, `total_s`, `lightkey_forced`, `lightkey_quit_pressed`, `stream_deck_forced` |
+| `update` | each update step | `from`, `to`, `step`, `result` |
+| `app_quit` | the session ends | `reason` (quit, menu_quit, update, mac_logout_or_shutdown, shutdown_menu/_weekly_time/_power_off), `session_s`, `startup`, `problems_now`, `people` |
+| `session_summary` | with app_quit (or at the next launch) | `ended`, `session_s`, `launch_how`, `started`, `startup` (ready, not_ready, none), `startup_s`, `startups`, `rows`, `rows_ok` (never warn or fail), `rows_bad`, `bad_at_end`, `bad_rows`, `people`, `passes`, `version` |
+| `session_row` | one per row that was ever warn or fail | `check`, `title`, `worst`, `bad_s`, `share_pct` (of the session), `whole` (never OK all session), `bad_at_end`, `spells`, `first_bad_s`, `fix_clicks`, `muted`, `cleared_by` (`still_bad` if so), `ended` |
+| `log_chunk` | an incident's scrubbed log | `incident`, `part`, `parts`, `t00`… |
+
+  Start-ups aren't counted in the session's rows (rows are red while apps open), nor the shutdown
+  once it closes the apps. A shutdown that stops and leaves the Mac on can send a second summary for
+  the same session; the later one counts.
 - **Switch it off** in This Mac → Booth Check → **Send diagnostics to the developer** (that also
   deletes the queue; the log on disk is still written). **Send now** sends the queue straight away.
 - **Save diagnostics…** in the Log window zips scrubbed copies of the logs, the DMX snapshots, the
