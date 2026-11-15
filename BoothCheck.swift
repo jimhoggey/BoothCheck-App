@@ -1822,13 +1822,254 @@ func streamDeckBusy(starting: Bool, shuttingDown: Bool, closedOnPurpose: Bool) -
 
 /// Whether to restart a running Stream Deck so its keys start clean. A latch key (a colour, a house
 /// level) lights when Lightkey says a cue is on but ignores "off", so a key left lit stays lit after
-/// Lightkey restarts (church Mac, 9 Oct 2026: Lavender lit, Lightkey fresh). A freshly started
-/// Stream Deck has every key dark: it saves no key state (checked on the dev Mac). So: when the
-/// start-up reaches Stream Deck and it's already running, and when Lightkey starts outside a start-up.
+/// Lightkey restarts (church Mac, 9 Oct 2026: Lavender lit, Lightkey fresh). So: when the start-up
+/// reaches Stream Deck and it's already running, and when Lightkey starts outside a start-up.
+/// A restart alone isn't enough: Stream Deck 7 saves each key's state (`"State": 1`) in the profile's
+/// page manifests, and a key saved lit comes up lit (church Mac, 15 Nov 2026, at boot). So while it's
+/// closed, Booth Check also resets the MIDI keys' saved state (`clearDeckPageStates`, Nov 2026).
 func shouldRestartStreamDeck(enabled: Bool, deckRunning: Bool, startUpDeckStep: Bool,
                              lightkeyJustLaunched: Bool, busy: Bool) -> Bool {
     guard enabled && deckRunning else { return false }
     return startUpDeckStep || (lightkeyJustLaunched && !busy)
+}
+
+// MARK: Stream Deck's saved key lights (15 Nov 2026)
+//
+// Each page's manifest.json keeps, per action, "State" (the state it shows, 0 = the first) next to its
+// "States" array. A Trevliga MIDI key has two states, and Stream Deck saves the lit one (1) as it was
+// when it last ran, so the key comes up lit before Lightkey has said anything. Booth Check sets those
+// back to 0, only while Stream Deck is closed, by replacing just the digits of each such "State" value
+// in the file's bytes: everything else stays byte for byte as Stream Deck wrote it. The edit is then
+// proven by parsing the result and comparing it with the original, with only those States changed.
+
+/// One key whose saved state was (or would be) reset: its position ("col,row"), title and old state.
+struct DeckKeyReset: Equatable {
+    let position: String
+    let title: String
+    let from: Int
+}
+
+/// Where each `Controllers[c].Actions[pos].State` value sits in a page manifest's bytes. Only that exact
+/// path counts (a "State" deeper down, in a multi-action's settings, is left alone). nil when the bytes
+/// aren't JSON this simple scanner follows, or an action has "State" twice.
+func deckStateValueRanges(_ bytes: [UInt8]) -> [(controller: Int, position: String, range: Range<Int>)]? {
+    enum Step: Equatable { case key(String), index(Int) }
+    var i = 0
+    var found: [(controller: Int, position: String, range: Range<Int>)] = []
+    func ws() { while i < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[i]) { i += 1 } }
+    func string() -> String? {
+        guard i < bytes.count, bytes[i] == 0x22 else { return nil }
+        let start = i
+        i += 1
+        while i < bytes.count {
+            if bytes[i] == 0x5C { i += 2; continue }            // backslash: skip the escaped byte
+            if bytes[i] == 0x22 { i += 1; break }
+            i += 1
+        }
+        guard i <= bytes.count, bytes[i - 1] == 0x22, i - start >= 2 else { return nil }
+        return (try? JSONSerialization.jsonObject(with: Data(bytes[start..<i]), options: .fragmentsAllowed)) as? String
+    }
+    func value(_ path: [Step], depth: Int) -> Bool {
+        guard depth < 64 else { return false }
+        ws()
+        guard i < bytes.count else { return false }
+        let start = i
+        switch bytes[i] {
+        case 0x7B:                                              // {
+            i += 1; ws()
+            if i < bytes.count, bytes[i] == 0x7D { i += 1; return true }
+            while true {
+                ws()
+                guard let k = string() else { return false }
+                ws()
+                guard i < bytes.count, bytes[i] == 0x3A else { return false }
+                i += 1
+                guard value(path + [.key(k)], depth: depth + 1) else { return false }
+                ws()
+                guard i < bytes.count else { return false }
+                if bytes[i] == 0x2C { i += 1; continue }
+                if bytes[i] == 0x7D { i += 1; return true }
+                return false
+            }
+        case 0x5B:                                              // [
+            i += 1; ws()
+            if i < bytes.count, bytes[i] == 0x5D { i += 1; return true }
+            var n = 0
+            while true {
+                guard value(path + [.index(n)], depth: depth + 1) else { return false }
+                n += 1
+                ws()
+                guard i < bytes.count else { return false }
+                if bytes[i] == 0x2C { i += 1; continue }
+                if bytes[i] == 0x5D { i += 1; return true }
+                return false
+            }
+        default:                                                // string, number, true, false, null
+            if bytes[i] == 0x22 {
+                guard string() != nil else { return false }
+            } else {
+                while i < bytes.count, !([0x2C, 0x7D, 0x5D, 0x20, 0x09, 0x0A, 0x0D].contains(bytes[i])) { i += 1 }
+                guard i > start else { return false }
+            }
+            if path.count == 5, path[0] == .key("Controllers"), case .index(let c) = path[1], path[2] == .key("Actions"),
+               case .key(let pos) = path[3], path[4] == .key("State") {
+                found.append((c, pos, start..<i))
+            }
+            return true
+        }
+    }
+    guard value([], depth: 0) else { return nil }
+    ws()
+    guard i == bytes.count else { return nil }
+    // A key with "State" twice: which one Stream Deck reads is anyone's guess, so don't edit.
+    guard Set(found.map { "\($0.controller)/\($0.position)" }).count == found.count else { return nil }
+    return found
+}
+
+/// What resetting one page's saved key lights would do. `data`: the new file, nil when nothing needs
+/// changing or something was unexpected (`problem` says what; the page is then left alone).
+struct DeckPageClear {
+    var data: Data?
+    var resets: [DeckKeyReset] = []
+    var problem: String?
+}
+
+/// For one page manifest: every MIDI plugin key (`deckMIDIKey`) with two or more states whose saved
+/// State isn't 0 gets State 0. Text keys, page keys and keys already at 0 aren't touched. The result
+/// is proven: it parses, and it equals the original parsed with only those States set to 0 (compared
+/// through JSONSerialization with sorted keys, so a number turned into a bool or a lost null shows).
+func clearDeckPageStates(_ input: Data) -> DeckPageClear {
+    guard let parsed = (try? JSONSerialization.jsonObject(with: input, options: [.mutableContainers])) as? NSMutableDictionary else {
+        return DeckPageClear(problem: "isn\u{2019}t a JSON object")
+    }
+    let bytes = [UInt8](input)
+    guard let ranges = deckStateValueRanges(bytes) else { return DeckPageClear(problem: "isn\u{2019}t JSON in the shape Booth Check can edit safely") }
+    var resets: [DeckKeyReset] = []
+    var edits: [Range<Int>] = []
+    for r in ranges {
+        guard let controllers = parsed["Controllers"] as? NSArray, r.controller < controllers.count,
+              let actions = (controllers[r.controller] as? NSDictionary)?["Actions"] as? NSMutableDictionary,
+              let action = actions[r.position] as? NSMutableDictionary else {
+            return DeckPageClear(problem: "the scan and the parse disagree about key \(r.position)")
+        }
+        guard deckMIDIKey(action as? [String: Any] ?? [:]) != nil, let states = action["States"] as? NSArray, states.count >= 2 else { continue }
+        let token = bytes[r.range]
+        // The digits in the file are the proof it's a number, not true/false (NSNumber can't tell).
+        guard let state = action["State"] as? NSNumber, !token.isEmpty, token.allSatisfy({ (0x30...0x39).contains($0) }), Int(String(decoding: token, as: UTF8.self)) == state.intValue else {
+            return DeckPageClear(problem: "key \(r.position)\u{2019}s State isn\u{2019}t a plain whole number")
+        }
+        guard state.intValue != 0 else { continue }
+        let titles = states.compactMap { ($0 as? NSDictionary)?["Title"] as? String }
+        let pick = state.intValue < titles.count && !titles[state.intValue].isEmpty ? titles[state.intValue] : titles.first { !$0.isEmpty } ?? ""
+        let title = pick.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        resets.append(DeckKeyReset(position: r.position, title: title.isEmpty ? "(no title)" : title, from: state.intValue))
+        edits.append(r.range)
+        action["State"] = NSNumber(value: 0)
+    }
+    guard !edits.isEmpty else { return DeckPageClear() }
+    var out = bytes
+    for r in edits.sorted(by: { $0.lowerBound > $1.lowerBound }) { out.replaceSubrange(r, with: [0x30]) }
+    let data = Data(out)
+    guard let reparsed = try? JSONSerialization.jsonObject(with: data),
+          let a = try? JSONSerialization.data(withJSONObject: reparsed, options: [.sortedKeys]),
+          let b = try? JSONSerialization.data(withJSONObject: parsed, options: [.sortedKeys]), a == b else {
+        return DeckPageClear(problem: "the edited file didn\u{2019}t check out, so it was left as it was")
+    }
+    return DeckPageClear(data: data, resets: resets.sorted { $0.position < $1.position })
+}
+
+/// One page's outcome, for the log.
+struct DeckPageClearResult: Equatable {
+    let page: String            // the page folder's name
+    var resets: [DeckKeyReset] = []
+    var written = false
+    var skipped: String?        // why it was left alone; nil when it was written or needed nothing
+}
+
+/// Resets the saved key lights on every page of one profile folder (`clearDeckPageStates`). Each page
+/// that changes is first copied to `backupDir/<profile folder>/<page>/manifest.json` (overwriting the
+/// last copy), then written atomically, with its permissions kept. Before each write it checks
+/// `deckRunning` (Stream Deck would write its own copy back) and that the file is still what was read.
+/// Anything unexpected leaves that page as it was and says why.
+func clearDeckKeyStates(profileDir: String, backupDir: String, deckRunning: () -> Bool) -> [DeckPageClearResult] {
+    let fm = FileManager.default
+    let profileName = (profileDir as NSString).lastPathComponent
+    let pagesDir = profileDir + "/Profiles"
+    let pages = ((try? fm.contentsOfDirectory(atPath: pagesDir)) ?? []).filter { !$0.hasPrefix(".") }.sorted()
+    var results: [DeckPageClearResult] = []
+    for page in pages {
+        let path = pagesDir + "/" + page + "/manifest.json"
+        var r = DeckPageClearResult(page: page)
+        guard let original = fm.contents(atPath: path) else {
+            if fm.fileExists(atPath: pagesDir + "/" + page + "/manifest.json") { r.skipped = "couldn\u{2019}t read its manifest.json" ; results.append(r) }
+            continue
+        }
+        let plan = clearDeckPageStates(original)
+        r.resets = plan.resets
+        if let p = plan.problem { r.skipped = p; results.append(r); continue }
+        guard let new = plan.data else { results.append(r); continue }
+        if deckRunning() { r.skipped = "Stream Deck is running"; results.append(r); continue }
+        let backupFolder = backupDir + "/" + profileName + "/" + page
+        let backup = backupFolder + "/manifest.json"
+        do {
+            try fm.createDirectory(atPath: backupFolder, withIntermediateDirectories: true)
+            try original.write(to: URL(fileURLWithPath: backup), options: .atomic)
+        } catch {
+            r.skipped = "couldn\u{2019}t keep a backup first (\(error.localizedDescription))"; results.append(r); continue
+        }
+        guard fm.contents(atPath: path) == original else { r.skipped = "the file changed while Booth Check read it"; results.append(r); continue }
+        if deckRunning() { r.skipped = "Stream Deck started"; results.append(r); continue }
+        let perms = (try? fm.attributesOfItem(atPath: path))?[.posixPermissions]
+        do {
+            try new.write(to: URL(fileURLWithPath: path), options: .atomic)
+            if let perms { try? fm.setAttributes([.posixPermissions: perms], ofItemAtPath: path) }
+        } catch {
+            r.skipped = "couldn\u{2019}t write it (\(error.localizedDescription))"; results.append(r); continue
+        }
+        if fm.contents(atPath: path) == new {
+            r.written = true
+        } else {
+            r.skipped = "it didn\u{2019}t read back as written; the backup is in \(backup)"
+        }
+        results.append(r)
+    }
+    return results
+}
+
+/// Which profiles to reset at a start-up: the one chosen in This Mac (when it's clearly one installed
+/// profile) and each deck's preferred profile, the one it will show, once each. With a profile chosen
+/// and the switch made, they're the same; when the switch couldn't be made, the deck shows the
+/// preferred one, so that's cleared too. `missing`: preferred UUIDs with no profile folder.
+func deckProfilesToClear(choice: DeckProfileChoice?, read: DeckProfilesRead, preferred: [String: String]) -> (profiles: [DeckProfile], missing: [String]) {
+    var out: [DeckProfile] = []
+    if let choice, case .found(let p, _) = matchDeckProfile(choice, in: read.profiles) { out.append(p) }
+    var missing: [String] = []
+    for uuid in Set(preferred.values).sorted() {
+        if let p = read.profiles.first(where: { $0.uuid == uuid }) {
+            if !out.contains(where: { $0.uuid == p.uuid }) { out.append(p) }
+        } else {
+            missing.append(uuid)
+        }
+    }
+    return (out, missing)
+}
+
+/// The log's text for one profile's reset.
+func deckClearText(profile: DeckProfile, results: [DeckPageClearResult], backupFolder: String) -> String {
+    let changed = results.filter(\.written)
+    let n = changed.reduce(0) { $0 + $1.resets.count }
+    var lines = ["\u{201C}\(profile.name)\u{201D} (\(profile.uuid)), \(results.count) page\(results.count == 1 ? "" : "s") read: "
+                 + (n == 0 ? "no MIDI key had a lit state saved" : "\(n) key\(n == 1 ? "" : "s") reset to dark on \(changed.count) page\(changed.count == 1 ? "" : "s")") + "."]
+    for r in results {
+        if r.written {
+            lines.append("  Page \(r.page): " + r.resets.map { "\($0.title) (\($0.position), was \($0.from))" }.joined(separator: ", "))
+        } else if let why = r.skipped {
+            lines.append("  Page \(r.page): left as it was: \(why)."
+                         + (r.resets.isEmpty ? "" : " It has \(r.resets.count) key\(r.resets.count == 1 ? "" : "s") saved lit: " + r.resets.map(\.title).joined(separator: ", ") + "."))
+        }
+    }
+    if !changed.isEmpty { lines.append("  The files as they were, one copy per page (overwritten each time): \(backupFolder)/<page>/manifest.json") }
+    return lines.joined(separator: "\n")
 }
 
 /// Whether a start-up gets the hands-off sign: only the one that runs by itself at login (the user
@@ -4231,9 +4472,10 @@ extension Booth {
             if shouldRestartStreamDeck(enabled: true, deckRunning: isRunning(IDs.streamDeck), startUpDeckStep: true,
                                        lightkeyJustLaunched: false, busy: false) {
                 setStep(i, .running, "Restarting it so every key starts clean\u{2026}")
-                restartStreamDeck(during: "Start-up", whileClosed: write, then: finish)
+                restartStreamDeck(during: "Start-up", whileClosed: write, clearKeys: true, then: finish)
             } else {
                 write()
+                if !isRunning(IDs.streamDeck) { clearDeckKeyLights(during: "Start-up") }
                 finish(openStreamDeckInBackground(during: "Start-up"))
             }
 
@@ -4330,7 +4572,9 @@ extension Booth {
     /// it again in the background, so every key starts dark (see `shouldRestartStreamDeck`). Logged.
     /// `whileClosed` runs in the gap, once Stream Deck has quit and before it opens again (1.32: the
     /// profile switch, see `setPreferredProfile`).
-    func restartStreamDeck(during what: String, whileClosed: (() -> Void)? = nil,
+    /// `clearKeys`: also reset the keys' saved lit state in the gap, after `whileClosed` (so the profile
+    /// it resets is the one the deck will show). Only the start-up and the restart after Lightkey starts.
+    func restartStreamDeck(during what: String, whileClosed: (() -> Void)? = nil, clearKeys: Bool = false,
                            then finished: @escaping ((state: StepState, detail: String, opened: Bool)) -> Void) {
         // While it's closed on purpose, the 15-second checks mustn't reopen it (`keepStreamDeckOpen`).
         deckRestartsRunning += 1
@@ -4346,9 +4590,11 @@ extension Booth {
             if apps.allSatisfy(\.isTerminated) && !isRunning(IDs.streamDeck) {
                 changes.insert(LogEntry(title: "\(what): restarted Stream Deck so its keys start clean", language: "macOS API",
                                         code: "NSRunningApplication.terminate (Stream Deck), then open it again",
-                                        output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off. A freshly opened Stream Deck has every key dark.",
+                                        output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off."
+                                            + (clearKeys ? " Its saved key lights are reset while it's closed (next entry), since Stream Deck brings a key back lit if it was saved lit." : ""),
                                         status: 0), at: 0)
                 whileClosed?()
+                if clearKeys { clearDeckKeyLights(during: what) }
                 let result = openStreamDeckInBackground(during: what)
                 return done((result.state, "Restarted it so every key starts clean. " + result.detail, result.opened))
             }
@@ -4357,6 +4603,48 @@ extension Booth {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { look() }
         }
         look()
+    }
+
+    /// With Stream Deck closed: resets the saved lit state of the MIDI keys on every page of the profile
+    /// the deck will show (`deckProfilesToClear`), so no key comes up lit from the last service and
+    /// Lightkey drives them from then on. One backup per page, overwritten each time. Logged, with a
+    /// `deck_keys_cleared` event. Never stops the start-up: anything unexpected is skipped and logged.
+    func clearDeckKeyLights(during what: String) {
+        let backupDir = DiagFiles.standard.supportDir + "/deck-backups"
+        var lines: [String] = []
+        var keys = 0, pages = 0, profilesDone = 0, skipped = 0
+        var ok = true
+        if isRunning(IDs.streamDeck) {
+            lines.append("Stream Deck is running, so nothing was changed (it keeps its own copy and would write it back).")
+            ok = false
+        } else {
+            let read = readDeckProfiles()
+            let prefs = deckPreferredProfiles(readStreamDeckDevices())
+            let targets = deckProfilesToClear(choice: setup.deckProfile, read: read, preferred: prefs.preferred)
+            if let p = read.problem { lines.append("Can\u{2019}t read the profiles: \(p) Nothing changed."); ok = false }
+            else if targets.profiles.isEmpty {
+                lines.append("No profile to reset: none is chosen in This Mac and " + (prefs.problem ?? "no deck\u{2019}s preferred profile is installed") + ". Nothing changed.")
+            }
+            for uuid in targets.missing { lines.append("A deck\u{2019}s preferred profile \(uuid) isn\u{2019}t installed; skipped.") }
+            for p in targets.profiles {
+                guard let dir = deckProfileFolder(uuid: p.uuid, in: read.folder) else {
+                    lines.append("\u{201C}\(p.name)\u{201D}: its folder wasn\u{2019}t found; skipped."); ok = false; continue
+                }
+                let results = clearDeckKeyStates(profileDir: dir, backupDir: backupDir, deckRunning: { self.isRunning(IDs.streamDeck) })
+                lines.append(deckClearText(profile: p, results: results, backupFolder: backupDir + "/" + (dir as NSString).lastPathComponent))
+                profilesDone += 1
+                for r in results where r.written { keys += r.resets.count; pages += 1 }
+                let left = results.filter { $0.skipped != nil }.count
+                skipped += left
+                if left > 0 { ok = false }
+            }
+        }
+        changes.insert(LogEntry(title: "\(what): reset Stream Deck\u{2019}s saved key lights" + (keys > 0 ? " (\(keys) key\(keys == 1 ? "" : "s"))" : ""),
+                                language: "macOS API",
+                                code: "In each page\u{2019}s manifest.json of the profile the deck will show: \"State\": 1 \u{2192} 0 on MIDI keys only, nothing else in the file changed; backup first, atomic write, only while Stream Deck is closed",
+                                output: lines.joined(separator: "\n"), status: ok ? 0 : 1), at: 0)
+        diagEvent("deck_keys_cleared", ["why": .string(what), "keys": .int(keys), "pages": .int(pages),
+                                        "profiles": .int(profilesDone), "skipped": .int(skipped), "result": .string(ok ? "ok" : "skipped")])
     }
 
     /// Lightkey started outside a start-up (by hand, or after a crash) while Stream Deck is open: once
@@ -4376,7 +4664,7 @@ extension Booth {
             }) { _ in
                 guard !self.starting, !self.shuttingDown, !self.streamDeckClosedOnPurpose, self.isRunning(IDs.streamDeck) else { return }
                 self.showWorkingSign(.deckRestarting)
-                self.restartStreamDeck(during: "Lightkey started") { result in
+                self.restartStreamDeck(during: "Lightkey started", clearKeys: true) { result in
                     let ok = result.state == .done
                     self.diagEvent("self_repair", ["what": .string("streamdeck_restart"), "why": .string("Lightkey started"), "result": .string(ok ? "ok" : "failed")])
                     self.endWorkingSign(ok ? .deckRestarted : .deckFailed, ok: ok)

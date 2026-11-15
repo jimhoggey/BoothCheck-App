@@ -65,11 +65,24 @@ its window once so whoever sits down sees what to fix.
 
   **Stream Deck's keys start clean.** A latch key (a colour, a house level) lights when Lightkey says
   its cue is on but ignores "off", so a key left lit stays lit after Lightkey restarts (Lavender lit
-  on the church Mac, 9 Oct 2026). A freshly opened Stream Deck has every key dark: it saves no key
-  state. So when the start-up finds Stream Deck already open it restarts it, and when Lightkey is
-  started any other way (by hand, after a crash) Booth Check restarts Stream Deck once Lightkey is
-  ready (tested: 3 seconds after Lightkey reopened). Quitting Stream Deck yourself does the same:
-  Booth Check reopens it clean.
+  on the church Mac, 9 Oct 2026). So when the start-up finds Stream Deck already open it restarts it,
+  and when Lightkey is started any other way (by hand, after a crash) Booth Check restarts Stream Deck
+  once Lightkey is ready (tested: 3 seconds after Lightkey reopened).
+  A restart alone isn't a clean slate: Stream Deck 7 saves each key's state in its profile
+  (`ProfilesV3/<profile>.sdProfile/Profiles/<page>/manifest.json`, `"State": 1` = the lit image) and
+  a key saved lit comes back lit (church Mac, 15 Nov 2026: several keys on at boot with only Default
+  on in Lightkey). So in those two places, while Stream Deck is closed, Booth Check also **resets the
+  saved state to 0 on every MIDI key** (Trevliga plugin, two or more states) on every page of the
+  profile the deck will show: the one chosen in This Mac and each deck's preferred profile. Then
+  Lightkey drives the keys from the show's start states on. Only those digits in the file change;
+  text and page keys and everything else stay byte for byte, the result is re-read and compared
+  with the original before it's written (atomically), and the original of each changed page is kept
+  in `~/Library/Application Support/Booth Check/deck-backups/<profile>/<page>/manifest.json` (one
+  copy, overwritten each time). If Stream Deck is running, a file doesn't read as expected, or it
+  changes meanwhile, that page is left alone and the start-up carries on. The Log says which profile
+  and pages, which keys (by title) and where the backup is. There's no switch: it's part of "keys
+  start clean". Quitting Stream Deck yourself mid-service doesn't reset anything; Booth Check just
+  reopens it.
 
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
   the service" and hides itself; if not it stays, with **Open Booth Check**. A step that warned on the
