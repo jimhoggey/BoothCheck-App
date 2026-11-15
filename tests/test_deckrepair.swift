@@ -153,6 +153,14 @@ expect("an empty manifest.json is broken", { if case .broken = deckProfileHealth
 // --- the bounds -----------------------------------------------------------------------------------------
 expect("automatic restores stop after 3 a session", { if case .leave = deckMendDecision(health: .missing, hasCopy: true, deckRunning: false, automatic: true, restoresSoFar: 3) { return true }; return false }())
 expect("…a person's button still can", deckMendDecision(health: .missing, hasCopy: true, deckRunning: false, automatic: false, restoresSoFar: 3) == .restore)
+// A tech deleted the service profile in Stream Deck and imported another: Stream Deck no longer names
+// it, so it doesn't come back by itself (the row offers Restore…); a lost one it still names does.
+expect("missing and Stream Deck still names it → restore", deckStillPreferred(uuid.uppercased(), preferred: ["d": uuid])
+       && deckMendDecision(health: .missing, hasCopy: true, deckRunning: false, automatic: true, restoresSoFar: 0, stillPreferred: true) == .restore)
+expect("missing and no longer named → left for a person", !deckStillPreferred(uuid, preferred: ["d": "cccc"])
+       && { if case .leave = deckMendDecision(health: .missing, hasCopy: true, deckRunning: false, automatic: true, restoresSoFar: 0, stillPreferred: false) { return true }; return false }())
+expect("…the Restore… button still can", deckMendDecision(health: .missing, hasCopy: true, deckRunning: false, automatic: false, restoresSoFar: 0, stillPreferred: false) == .restore)
+expect("…and a damaged one that's there still comes back", deckMendDecision(health: .broken("x"), hasCopy: true, deckRunning: false, automatic: true, restoresSoFar: 0, stillPreferred: false) == .restore)
 expect("no copy → noCopy", deckMendDecision(health: .missing, hasCopy: false, deckRunning: false, automatic: true, restoresSoFar: 0) == .noCopy)
 expect("one retry after launch when it broke again", deckRelaunchRetryAllowed(attempt: 0, health: .broken("x"), hasCopy: true))
 expect("…never a second", !deckRelaunchRetryAllowed(attempt: 1, health: .broken("x"), hasCopy: true))

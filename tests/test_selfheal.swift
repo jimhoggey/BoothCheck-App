@@ -23,6 +23,8 @@ for n in 0...7 {
     }
 }
 expect("1 thing, not 1 things", thingsToFix(1) == "1 thing to fix" && thingsToFix(3) == "3 things to fix")
+let inWindow = windowStepWords([BootStep(id: "check", title: "Check everything", state: .warn, detail: checkStepWords(problems: 2).detail)])
+expect("the main window, where the rows are, doesn't say Open Booth Check", inWindow.first?.detail == "2 things to fix. See the rows below.", inWindow.first?.detail ?? "")
 expect("still running: Starting the show", bootHeadline(finished: false, ready: false, problems: 3) == "Starting the show")
 expect("a step warned, nothing to fix now, something unknown: with warnings",
        bootHeadline(finished: true, ready: false, problems: 0) == "Started, with warnings")
@@ -105,7 +107,7 @@ let sys: [String: DiagValue] = ["isDebug": .bool(true), "osName": .string("macOS
                                 "appVersion": .string("1.31"), "sdkVersion": .string("boothcheck@1"), "locale": .string("en-AU")]
 let err = DiagError(id: "x", time: 1_763_000_000, session: "s-1", errorType: String(repeating: "T", count: 150),
                     errorMessage: String(repeating: "m", count: 6000), stackTrace: String(repeating: "s", count: 12000), severity: "error", kind: "handled")
-let eb = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(err, system: sys))) as? [String: Any] ?? [:]
+let eb = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(err, system: sys, now: Date(timeIntervalSince1970: 1_763_000_600)))) as? [String: Any] ?? [:]
 expect("one JSON object with the spec's keys",
        Set(eb.keys) == ["errorMessage", "errorType", "stackTrace", "timestamp", "platform", "osName", "osVersion", "appVersion", "sdkVersion", "sessionId", "severity", "kind", "isDebug"],
        "\(eb.keys.sorted())")
@@ -113,7 +115,14 @@ expect("limits: message 5000, type 100, trace 10000", (eb["errorMessage"] as? St
        && (eb["stackTrace"] as? String)?.count == 10000)
 expect("platform macOS, the events' sdkVersion, isDebug a bool, session", eb["platform"] as? String == "macOS" && eb["sdkVersion"] as? String == "boothcheck@1"
        && eb["isDebug"] as? Bool == true && eb["sessionId"] as? String == "s-1" && eb["timestamp"] as? String == aptabaseTimestamp(Date(timeIntervalSince1970: 1_763_000_000)))
-let noTrace = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(DiagError(id: "y", time: 0, session: "s", errorType: "T", errorMessage: "m", stackTrace: nil, severity: "fatal", kind: "crash"), system: [:]))) as? [String: Any] ?? [:]
+let noTrace = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(DiagError(id: "y", time: 0, session: "s", errorType: "T", errorMessage: "m", stackTrace: nil, severity: "fatal", kind: "crash"), system: [:], now: Date(timeIntervalSince1970: 60)))) as? [String: Any] ?? [:]
+// Last week's crash (the booth Mac is off all week): sent as now, when it happened in the message.
+let weekOld = Date(timeIntervalSince1970: 1_763_000_000), sendNow = weekOld.addingTimeInterval(7 * 86400)
+let late = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(DiagError(id: "z", time: weekOld.timeIntervalSince1970, session: "s", errorType: "UncleanExit", errorMessage: "quit unexpectedly", stackTrace: nil, severity: "fatal", kind: "crash"), system: [:], now: sendNow))) as? [String: Any] ?? [:]
+expect("a week-old error report goes with now's timestamp", late["timestamp"] as? String == aptabaseTimestamp(sendNow), "\(late["timestamp"] ?? "")")
+expect("…and says when it happened", late["errorMessage"] as? String == "quit unexpectedly (happened \(diskTime(weekOld)))", "\(late["errorMessage"] ?? "")")
+let longLate = (try? JSONSerialization.jsonObject(with: aptabaseErrorBody(err, system: sys, now: sendNow))) as? [String: Any] ?? [:]
+expect("…kept within 5000 even when the message is cut", (longLate["errorMessage"] as? String).map { $0.count == 5000 && $0.hasSuffix("(happened \(diskTime(weekOld)))") } == true)
 expect("no trace, no system props: left out", noTrace["stackTrace"] == nil && noTrace["osName"] == nil && noTrace["isDebug"] == nil)
 expect("202: sent", aptabaseErrorOutcome(status: 202) == .sent)
 expect("403 (quota used up): dropped, not retried", aptabaseErrorOutcome(status: 403) == .drop)
@@ -181,6 +190,10 @@ expect("scrubbed before it's queued", !(queued.first?.errorMessage ?? "").contai
 expect("the session is this launch's", queued.first?.session == d.session)
 let disk1 = (try? String(contentsOfFile: files.log, encoding: .utf8)) ?? ""
 expect("the log on disk says it wasn't sent again", disk1.contains("error report CheckFailed:dmx: not sent again"), disk1)
+// Stream Deck's restore dialog up for an hour: the log says "not sent again" once, not every pass.
+for _ in 0..<5 { d.recordError("CheckFailed:dmx", "and again", stack: "", severity: "error", kind: "handled", session: nil, time: Date()) }
+let disk1b = (try? String(contentsOfFile: files.log, encoding: .utf8)) ?? ""
+expect("…and says it once a type, however often it comes", disk1b.components(separatedBy: "error report CheckFailed:dmx: not sent again").count == 2)
 answers = [503]
 _ = d.flushSync()
 expect("one request to the error API, one object, the key", requests.count == 1 && requests[0].url == aptabaseErrorURL

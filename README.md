@@ -14,7 +14,9 @@ its window once so whoever sits down sees what to fix.
   put straight back, and each check makes sure it's showing (logged only when that changes; missing
   twice running, it's put back once more).
 - **At login** it runs the start-up in a fixed order, shown as numbered steps in a small panel at
-  the top right that floats over everything, full-screen Lightkey included, without taking focus:
+  the top right that floats over everything, full-screen Lightkey included, without taking focus
+  (it grows with what the steps say; on a small screen only the steps scroll, so its heading and
+  buttons always show):
 
   1. Wait for the DMX interface to appear on USB, so Lightkey can attach to it (either USB plane
      counts: `ioreg -p IOUSB` or `ioreg -r -c IOUSBHostDevice`). Usually it's found at
@@ -109,7 +111,9 @@ its window once so whoever sits down sees what to fix.
   profile): its folder is there, its manifests are JSON, every page it lists is there, and it still
   has MIDI keys if Booth Check's copy had some. If it's **broken or gone** and Booth Check has a copy,
   it **puts the copy back by itself** before Stream Deck opens (the sign says "Putting the Stream
-  Deck's keys back…"): the copy goes into a hidden folder next to the profile, is checked identical,
+  Deck's keys back…"). A profile that's **gone and no longer named in Stream Deck's settings** for
+  any deck was removed there (say a tech deleted it and imported another), so it doesn't come back by
+  itself: the row goes red and offers **Restore the Stream Deck's keys…** (since 1.32). The copy goes into a hidden folder next to the profile, is checked identical,
   swaps places with the broken one in one step, and the broken one is kept in Booth Check's folder
   (`deck-backups/<profile>/set-aside/<date>`, newest 3; never deleted). About 10 seconds after Stream
   Deck opens, Booth Check checks the profile again; if it broke again, it tries once more (quit,
@@ -527,7 +531,10 @@ in This Mac. Both keep every step in the Log.
   202 = accepted; kept for later on no answer, 408, 429 or 5xx; dropped on 403, the month's error
   quota, and any other 4xx). Each type goes once a session, at most 10 a session; message and trace
   are scrubbed like everything else; they wait in `aptabase-errors.jsonl`, sent with the events.
-  Every report is also a line in the log on disk (`error report <type> …`), diagnostics on or off.
+  One over 20 hours old (last week's crash) is sent with the time it goes, like the events, and the
+  time it happened at the end of its message ("… (happened 2026-11-09 12:41:00)").
+  Every report is also a line in the log on disk (`error report <type> …`), diagnostics on or off;
+  one held back as a repeat is noted there once a type (`not sent again`), not each time.
 
 | errorType | severity, kind | When | stackTrace |
 |---|---|---|---|
@@ -599,9 +606,9 @@ Check, or open Booth Check again from Applications.
 ## Updates
 
 Booth Check asks GitHub for the newest release when it starts, every six hours, and when you click
-**Check for updates** at the bottom of the window. When there's a newer version, an **Update to x.y**
-button appears in the window and the menu bar dropdown. It shows what's new and every step before
-anything happens:
+**Check for updates** at the bottom of the window. When there's a newer version, that button becomes
+**See update…**, and the menu bar dropdown says "Booth Check x.y is available…". It shows what's new
+and every step before anything happens:
 
 1. Download the release zip from GitHub.
 2. Check it against the SHA-256 checksum GitHub publishes for it.

@@ -280,7 +280,7 @@ func shell(_ path: String, _ args: [String], timeout: TimeInterval = 20) -> (out
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
-    do { try p.run() } catch { return ("Couldn't start \(path): \(error.localizedDescription)", -1) }
+    do { try p.run() } catch { return ("Couldn\u{2019}t start \(path): \(error.localizedDescription)", -1) }
     let lock = NSLock()
     var data = Data()
     let read = DispatchSemaphore(value: 0)
@@ -867,7 +867,24 @@ func thingsToFix(_ n: Int) -> String { "\(n) thing\(n == 1 ? "" : "s") to fix" }
 /// the step is kept in step with each pass while the panel is up (`syncCheckStep`), so the two always
 /// say the same number (the owner saw "3 things to fix" over a step saying 2, Nov 2026).
 func checkStepWords(problems n: Int) -> (state: StepState, detail: String) {
-    n == 0 ? (.done, "Everything is green.") : (.warn, thingsToFix(n) + ". Open Booth Check to see what.")
+    n == 0 ? (.done, "Everything is green.") : (.warn, thingsToFix(n) + ". " + openToSeeWhat)
+}
+let openToSeeWhat = "Open Booth Check to see what."
+
+/// The steps as the main window shows them: there, the rows are right below.
+func windowStepWords(_ steps: [BootStep]) -> [BootStep] {
+    steps.map { s in
+        var s = s
+        s.detail = s.detail?.replacingOccurrences(of: openToSeeWhat, with: "See the rows below.")
+        return s
+    }
+}
+
+/// What the start-up's Stream Deck step adds about its profile: switched, or what to do when it
+/// couldn't be (the write failed, or Stream Deck didn't quit, so nothing could be written).
+func deckProfileStepNote(_ name: String, switched: Bool) -> String {
+    switched ? " Put it on the \u{201C}\(name)\u{201D} profile."
+             : " Couldn\u{2019}t put it on \u{201C}\(name)\u{201D}: choose it at the top of Stream Deck\u{2019}s window."
 }
 
 /// The start-up panel's heading (see `BootView`).
@@ -2658,16 +2675,27 @@ enum DeckMendAction: Equatable {
 /// Automatic restores of a Stream Deck profile a session, at most.
 let deckMaxAutomaticRestores = 3
 
-/// Automatic restores only while Stream Deck is closed, only for a profile that's objectively broken
-/// or missing, at most `maxAutomatic` a session (the post-launch retry counts too). A person's
-/// Restore… button (`automatic` false) is only held back by Stream Deck running.
+/// Whether Stream Deck's settings still name the profile as a deck's own. A missing profile that's
+/// still named was lost; one that isn't was removed in Stream Deck, maybe on purpose (another one
+/// imported in its place), so it doesn't come back by itself.
+func deckStillPreferred(_ uuid: String, preferred: [String: String]) -> Bool {
+    preferred.values.contains(uuid.lowercased())
+}
+
+/// Automatic restores only while Stream Deck is closed, only for a profile that's objectively broken,
+/// or missing while Stream Deck still names it (`stillPreferred`), at most `maxAutomatic` a session
+/// (the post-launch retry counts too). A person's Restore… button (`automatic` false) is only held
+/// back by Stream Deck running.
 func deckMendDecision(health: DeckProfileHealth, hasCopy: Bool, deckRunning: Bool, automatic: Bool,
-                      restoresSoFar: Int, maxAutomatic: Int = deckMaxAutomaticRestores) -> DeckMendAction {
+                      restoresSoFar: Int, maxAutomatic: Int = deckMaxAutomaticRestores, stillPreferred: Bool = true) -> DeckMendAction {
     if deckRunning { return .leave("Stream Deck is running") }
     switch health {
     case .healthy: return .keep
     case .unknownShape(let w): return .leave("\(w), so Booth Check leaves it alone")
     case .missing, .broken:
+        if automatic && health == .missing && !stillPreferred {
+            return .leave("Stream Deck no longer names it as a deck\u{2019}s profile, so it was removed there; it\u{2019}s left for a person")
+        }
         guard hasCopy else { return .noCopy }
         if automatic && restoresSoFar >= maxAutomatic {
             return .leave("Booth Check already put it back \(restoresSoFar) times this session, so it leaves it for a person")
@@ -3312,7 +3340,7 @@ let replugDMXWords = "Unplug the blue DMX box\u{2019}s USB cable and plug it bac
 func appNapCheck(appNapOff: Bool, switchedOffAt: Date?, deckLaunched: Date?) -> Check {
     if !appNapOff {
         return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .fail,
-                     detail: "macOS can put the Stream Deck app to sleep — that's what freezes the keys.",
+                     detail: "macOS can put the Stream Deck app to sleep — that\u{2019}s what freezes the keys.",
                      fix: "Click Turn App Nap off\u{2026} (no password).", action: .fixAppNap)
     }
     if let switchedOffAt, let deckLaunched, deckLaunched < switchedOffAt {
@@ -3321,7 +3349,7 @@ func appNapCheck(appNapOff: Bool, switchedOffAt: Date?, deckLaunched: Date?) -> 
                      fix: quitStreamDeckWords)
     }
     return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .ok,
-                 detail: "macOS won't put the Stream Deck app to sleep.")
+                 detail: "macOS won\u{2019}t put the Stream Deck app to sleep.")
 }
 
 /// macOS reopening the apps that were open at shutdown (see `reopensAppsAtLogin`): they open before
@@ -3367,6 +3395,7 @@ final class Booth: ObservableObject {
     var diagBaseline: [Check]?
     var diagFailingSince: [String: Date] = [:]
     var diagIncidentSent: Set<String> = []
+    var deckRestoreDialogReported = false
     var lastPassSignature: String?
     var lastFullPass: Date?
     var diagReplugShown = false
@@ -3828,7 +3857,7 @@ final class Booth: ObservableObject {
         out.append(lightkey != nil
             ? Check(id: "lk", group: "Lighting", title: "Lightkey is running", status: .ok, detail: "Lightkey is open.")
             : Check(id: "lk", group: "Lighting", title: "Lightkey is running", status: .fail,
-                    detail: "Lightkey isn't open.",
+                    detail: "Lightkey isn\u{2019}t open.",
                     fix: showPath != nil ? "Click Open the show." : "Click Open Lightkey.",
                     action: showPath != nil ? .openShow : .openApp(IDs.lightkey, "Lightkey")))
 
@@ -3887,10 +3916,10 @@ final class Booth: ObservableObject {
                              status: .unknown, detail: "Waiting for Lightkey to open."))
         } else if midi.contains(where: { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }) {
             out.append(Check(id: "midi", group: "Lighting", title: "Lightkey is listening for the Stream Deck",
-                             status: .ok, detail: "Lightkey's MIDI input is ready."))
+                             status: .ok, detail: "Lightkey\u{2019}s MIDI input is ready."))
         } else {
             out.append(Check(id: "midi", group: "Lighting", title: "Lightkey is listening for the Stream Deck",
-                             status: .fail, detail: "Lightkey is open but its MIDI input isn't there, so the Stream Deck's keys do nothing.",
+                             status: .fail, detail: "Lightkey is open but its MIDI input isn\u{2019}t there, so the Stream Deck\u{2019}s keys do nothing.",
                              fix: "Click Restart Lightkey\u{2026} (the lights go dark for about 20 seconds).",
                              action: .restartLightkeyForDMX))
         }
@@ -3915,7 +3944,7 @@ final class Booth: ObservableObject {
                              detail: "The Stream Deck app is open."))
         } else if deckInstalled {
             out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
-                             detail: "The Stream Deck app isn't open, so the keys do nothing.", action: .launchStreamDeck))
+                             detail: "The Stream Deck app isn\u{2019}t open, so the keys do nothing.", action: .launchStreamDeck))
         } else {
             // Not installed at all is the one case where "this Mac doesn't use one" is a safe guess.
             out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
@@ -3995,7 +4024,7 @@ final class Booth: ObservableObject {
         // Changing sleep needs the admin password, so these send you to System Settings instead.
         if s.ac.isEmpty {
             out.append(Check(id: "sleep", group: "Power & sleep", title: "Never sleeps on the charger",
-                             status: .unknown, detail: "Couldn't read the power settings.",
+                             status: .unknown, detail: "Couldn\u{2019}t read the power settings.",
                              action: .open(Settings.battery, "Open Battery settings")))
         } else if s.ac["sleep"] != "0" {
             out.append(Check(id: "sleep", group: "Power & sleep", title: "Never sleeps on the charger", status: .fail,
@@ -4100,7 +4129,7 @@ final class Booth: ObservableObject {
                                          output: msg, status: 1))
             loginItems = []
             out.append(Check(id: "loginShow", group: "Start at login", title: "The right show opens at login",
-                             status: .unknown, detail: "Couldn't read the login items: \(msg)",
+                             status: .unknown, detail: "Couldn\u{2019}t read the login items: \(msg)",
                              action: .open(Settings.loginItems, "Open Login Items")))
         }
         out.append(reopenAppsCheck(s.reopensApps))
@@ -4108,16 +4137,16 @@ final class Booth: ObservableObject {
         // Updates ------------------------------------------------------------------------------
         switch s.autoInstall {
         case "0":
-            out.append(Check(id: "upd", group: "Updates", title: "macOS won't update by itself", status: .ok,
+            out.append(Check(id: "upd", group: "Updates", title: "macOS won\u{2019}t update by itself", status: .ok,
                              detail: "Automatic macOS installs are off."))
         case "1":
-            out.append(Check(id: "upd", group: "Updates", title: "macOS won't update by itself", status: .warn,
+            out.append(Check(id: "upd", group: "Updates", title: "macOS won\u{2019}t update by itself", status: .warn,
                              detail: "macOS may install an update by itself, which can reset the USB and MIDI setup.",
                              fix: "Under Automatic Updates, turn off \u{201C}Install macOS updates\u{201D}.",
                              action: .open(Settings.softwareUpdate, "Open Software Update")))
         default:
-            out.append(Check(id: "upd", group: "Updates", title: "macOS won't update by itself", status: .unknown,
-                             detail: "Couldn't read the setting.",
+            out.append(Check(id: "upd", group: "Updates", title: "macOS won\u{2019}t update by itself", status: .unknown,
+                             detail: "Couldn\u{2019}t read the setting.",
                              fix: "Check that \u{201C}Install macOS updates\u{201D} is off under Automatic Updates.",
                              action: .open(Settings.softwareUpdate, "Open Software Update")))
         }
@@ -4141,9 +4170,12 @@ final class Booth: ObservableObject {
         diagPass(pass.entries, checks)
         lastPass = pass.entries
         lastChecked = Date()
-        if deckApp != nil && s.deckAsksToRestore {
+        // Once while it's up, not every pass (each type goes once a session anyway, and each refusal is logged).
+        let deckAsks = deckApp != nil && s.deckAsksToRestore
+        if deckAsks && !deckRestoreDialogReported {
             reportError("StreamDeckRestoreDialog", "Stream Deck is asking whether to restore its backup from today (its log: \u{201C}Detected data loss - propose restore backup to user\u{201D}); its keys don\u{2019}t work until someone answers.")
         }
+        deckRestoreDialogReported = deckAsks
         confirmLoginRepairs(pass: number)
         settleStartUp()         // first, so turning green is still logged as a step
         syncCheckStep()
@@ -4178,7 +4210,7 @@ final class Booth: ObservableObject {
         let title = "The right show is open"
         guard let showPath, let showName else {
             return Check(id: "show", group: "Lighting", title: title, status: .warn,
-                         detail: "Booth Check doesn't know which show this Mac should run yet.", action: .chooseShow)
+                         detail: "Booth Check doesn\u{2019}t know which show this Mac should run yet.", action: .chooseShow)
         }
         // A show that was moved or renamed can't be opened at all, so this comes before anything else.
         let exists = FileManager.default.fileExists(atPath: showPath)
@@ -4193,13 +4225,13 @@ final class Booth: ObservableObject {
                          detail: "Waiting for Lightkey to open.")
         }
         guard AXIsProcessTrusted() else {
-            pass.api("Which show Lightkey has open", "Accessibility: read Lightkey's window titles",
-                     "Not allowed yet — Booth Check isn't turned on under Accessibility.")
+            pass.api("Which show Lightkey has open", "Accessibility: read Lightkey\u{2019}s window titles",
+                     "Not allowed yet — Booth Check isn\u{2019}t turned on under Accessibility.")
             // macOS ties the permission to the app's signature. Builds before 1.21 were signed ad hoc, a
             // new signature every time, so after an update the old entry stayed switched on in the list
             // but didn't count (church Mac, 9 Oct 2026).
             return Check(id: "show", group: "Lighting", title: title, status: .unknown,
-                         detail: "Booth Check needs permission to read Lightkey's window title.",
+                         detail: "Booth Check needs permission to read Lightkey\u{2019}s window title.",
                          fix: "Ask a tech: click Allow access\u{2026} and switch Booth Check on in the list (README, \u{201C}Putting it on the booth Mac\u{201D}, step 5).",
                          action: .allowAccessibility)
         }
@@ -4260,7 +4292,7 @@ final class Booth: ObservableObject {
             let args = ["write", "-g", "NSAppSleepDisabled", "-bool", "true"]
             pending = PendingChange(
                 key: "appnap", title: "Turn App Nap off",
-                explanation: "Stops macOS putting apps in the background to sleep, which is what freezes the Stream Deck. It applies to every app on this Mac, from the next time each app opens, so quit and reopen Stream Deck once if it's already open. No password needed. Get the show started also does this automatically before opening Stream Deck.",
+                explanation: "Stops macOS putting apps in the background to sleep, which is what freezes the Stream Deck. It applies to every app on this Mac, from the next time each app opens, so quit and reopen Stream Deck once if it\u{2019}s already open. No password needed. Get the show started also does this automatically before opening Stream Deck.",
                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                 undo: commandLine("/usr/bin/defaults", ["delete", "-g", "NSAppSleepDisabled"]),
                 run: { shell("/usr/bin/defaults", args) })
@@ -4334,7 +4366,7 @@ final class Booth: ObservableObject {
             return
         case .addStreamDeckToLogin:
             guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) else {
-                message = "The Stream Deck app isn't installed on this Mac."
+                message = "The Stream Deck app isn\u{2019}t installed on this Mac."
                 return
             }
             let script = addLoginItemScript(url.path)
@@ -4413,7 +4445,7 @@ final class Booth: ObservableObject {
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) {
                 NSWorkspace.shared.openApplication(at: url, configuration: .init())
             } else {
-                message = "The Stream Deck app isn't installed on this Mac."
+                message = "The Stream Deck app isn\u{2019}t installed on this Mac."
             }
         case .allowAccessibility:
             let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
@@ -4982,7 +5014,7 @@ extension Booth {
         if atLogin { putBackNoPasswordSetting() }
         lightkeyMayAsk = setup.lightkey && setup.dmx && !lightkeyNoPasswordSettingOn()
         ReplugOverlay.shared.onHide = { [weak self] in self?.updateSign() }
-        BootPanel.shared.show(steps: bootSteps.count)
+        BootPanel.shared.show()
         runStep(0)
     }
 
@@ -5261,7 +5293,9 @@ extension Booth {
             // (`mendDeckProfiles`), so the switch is worked out on the profile as it now is.
             var profileFix: (device: String, target: String, name: String)?
             var wrote: (ok: Bool, text: String)?
+            var gapRan = false
             let write = {
+                gapRan = true
                 profileFix = self.deckProfileFixNeeded(during: "Start-up")
                 guard let f = profileFix else { return }
                 self.showWorkingSign(.deckProfileSwitching(f.name))
@@ -5269,10 +5303,15 @@ extension Booth {
             }
             let finish: ((state: StepState, detail: String, opened: Bool)) -> Void = { incoming in
                 var result = incoming
+                if !gapRan, self.isRunning(IDs.streamDeck),
+                   let f = self.deckProfileFixNeeded(during: "Start-up (Stream Deck didn\u{2019}t quit, so nothing is switched)") {
+                    // Stream Deck stayed open, so the profile couldn't be switched: only say what to do.
+                    result.detail += deckProfileStepNote(f.name, switched: false)
+                    if result.state == .done { result.state = .warn }
+                }
                 if let f = profileFix {
                     let ok = wrote?.ok == true
-                    result.detail += ok ? " Put it on the \u{201C}\(f.name)\u{201D} profile."
-                                        : " Couldn\u{2019}t put it on \u{201C}\(f.name)\u{201D}: choose it at the top of Stream Deck\u{2019}s window."
+                    result.detail += deckProfileStepNote(f.name, switched: ok)
                     if !ok && result.state == .done { result.state = .warn }
                     self.endWorkingSign(ok ? .deckProfileSwitched(f.name) : .deckProfileFailed(f.name), ok: ok)
                     if ok {
@@ -5441,8 +5480,8 @@ extension Booth {
             if apps.allSatisfy(\.isTerminated) && !isRunning(IDs.streamDeck) {
                 changes.insert(LogEntry(title: "\(what): restarted Stream Deck so its keys start clean", language: "macOS API",
                                         code: "NSRunningApplication.terminate (Stream Deck), then open it again",
-                                        output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off."
-                                            + (clearKeys ? " Its saved key lights are reset while it's closed (next entry), since Stream Deck brings a key back lit if it was saved lit." : ""),
+                                        output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can\u{2019}t be told a cue is off."
+                                            + (clearKeys ? " Its saved key lights are reset while it\u{2019}s closed (next entry), since Stream Deck brings a key back lit if it was saved lit." : ""),
                                         status: 0), at: 0)
                 // A broken or missing profile is put back first, then the gap's own work,
                 // then the last-good copy and the key reset (`clearDeckKeyLights`).
@@ -5531,7 +5570,8 @@ extension Booth {
             let d = deckDiskState(uuid: t.uuid, read: read)
             let store = DeckCopyStore(root: deckBackupsRoot, uuid: t.uuid)
             switch deckMendDecision(health: d.health, hasCopy: d.copy != nil, deckRunning: isRunning(IDs.streamDeck),
-                                    automatic: true, restoresSoFar: deckAutoRestores) {
+                                    automatic: true, restoresSoFar: deckAutoRestores,
+                                    stillPreferred: deckStillPreferred(t.uuid, preferred: prefs.preferred)) {
             case .keep:
                 lines.append("\u{201C}\(t.name)\u{201D} (\(d.dir)): healthy, left as it is.")
             case .leave(let why):
@@ -5584,7 +5624,9 @@ extension Booth {
             for t in targets {
                 let d = deckDiskState(uuid: t.uuid, read: read)
                 lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why).")
-                if d.health.isBroken, broken == nil { broken = (t.uuid, t.name, d.health, d.copy != nil) }
+                // Gone and no longer named in Stream Deck: removed there, left for a person (the row says so).
+                let removed = d.health == .missing && !deckStillPreferred(t.uuid, preferred: prefs.preferred)
+                if d.health.isBroken, !removed, broken == nil { broken = (t.uuid, t.name, d.health, d.copy != nil) }
                 if let p = read.profiles.first(where: { $0.uuid == t.uuid }) {
                     let on = prefs.preferred[p.device]
                     lines.append(on == nil ? "Its deck isn\u{2019}t in Stream Deck\u{2019}s settings." : on == p.uuid ? "The deck is on it." : "The deck is on \(on!), not on it.")
@@ -5752,7 +5794,7 @@ extension Booth {
                 let g = deckPrefsWriteGuard(devices: devices, device: target.device, target: target.uuid,
                                             targetFolderExists: deckProfileFolder(uuid: target.uuid, in: read.folder) != nil)
                 if g.ok {
-                    out = "On \(current.map { c in read.profiles.first { $0.uuid == c }.map { "\u{201C}\($0.name)\u{201D}" } ?? c } ?? "nothing"), the service needs \u{201C}\(target.name)\u{201D}: switching it while Stream Deck is closed."
+                    out = "On \(current.map { c in read.profiles.first { $0.uuid == c }.map { "\u{201C}\($0.name)\u{201D}" } ?? c } ?? "nothing"), the service needs \u{201C}\(target.name)\u{201D}."
                     fix = (target.device, target.uuid, target.name)
                 } else {
                     out = "On the wrong profile, but Booth Check won\u{2019}t write: \(g.why) Nothing changed."
@@ -6286,9 +6328,9 @@ extension Booth {
         let show = showName.map { ($0 as NSString).deletingPathExtension } ?? "the show"
         return """
         1. Quit Lightkey (press Quit if it asks; Force Quit after 15 seconds)
-        2. /bin/kill -TERM <olad pid>   (only if Lightkey's olad is still running; -KILL after 3 s)
+        2. /bin/kill -TERM <olad pid>   (only if Lightkey\u{2019}s olad is still running; -KILL after 3 s)
         3. Get the show started: open Lightkey, wait for its MIDI input, restart Stream Deck, open \(show)
-        4. Check Lightkey takes the DMX interface (if not, the start-up's own reconnect steps)
+        4. Check Lightkey takes the DMX interface (if not, the start-up\u{2019}s own reconnect steps)
         """
     }
 
@@ -6842,7 +6884,7 @@ extension Booth {
         }
         let folder = app.deletingLastPathComponent().path
         if !FileManager.default.isWritableFile(atPath: folder) {
-            return "Booth Check can't write to \(folder). Move it into Applications first."
+            return "Booth Check can\u{2019}t write to \(folder). Move it into Applications first."
         }
         return nil
     }
@@ -7344,15 +7386,21 @@ struct DiagError: Codable, Equatable {
 /// The POST body for one report, in Aptabase's error API shape (docs/error-api-openapi.yaml): the
 /// required errorMessage (≤ 5000) and errorType (≤ 100), the rest optional, each cut to its limit, with
 /// the app's own system props (the same sdkVersion and isDebug rule as the events).
-func aptabaseErrorBody(_ e: DiagError, system: [String: DiagValue]) -> Data {
+func aptabaseErrorBody(_ e: DiagError, system: [String: DiagValue], now: Date) -> Data {
     func sys(_ key: String, _ max: Int) -> DiagValue? {
         if case .string(let s)? = system[key], !s.isEmpty { return .string(truncateUTF16(s, max)) }
         return nil
     }
+    // Same rule as the events (`sendStamp`): an old one (last week's crash) goes as now, with when it
+    // happened in the message, kept even when the message is cut.
+    let time = Date(timeIntervalSince1970: e.time)
+    let stamp = sendStamp(eventTime: time, now: now)
+    let happened = stamp.extra.isEmpty ? "" : " (happened \(diskTime(time)))"
+    let message = e.errorMessage.isEmpty ? e.errorType : e.errorMessage
     var body: [String: DiagValue] = [
-        "errorMessage": .string(truncateUTF16(e.errorMessage.isEmpty ? e.errorType : e.errorMessage, 5000)),
+        "errorMessage": .string(truncateUTF16(message, 5000 - happened.utf16.count) + happened),
         "errorType": .string(truncateUTF16(e.errorType, 100)),
-        "timestamp": .string(aptabaseTimestamp(Date(timeIntervalSince1970: e.time))),
+        "timestamp": .string(stamp.timestamp),
         "platform": .string("macOS"),
         "sessionId": .string(truncateUTF16(e.session, 100)),
         "severity": .string(e.severity), "kind": .string(e.kind)]
@@ -7778,6 +7826,7 @@ final class Diagnostics {
     private var lastRequest = Date.distantPast
     /// Error report types queued this session (on `queue`; see `errorReportAllowed`).
     private var errorTypesSent: Set<String> = []
+    private var errorTypesHeld: Set<String> = []
     /// On the main thread: incidents sent this launch (at most 6), and where the Network Log entries go.
     var incidents = 0
     var onLog: ((LogEntry) -> Void)?
@@ -7939,7 +7988,10 @@ final class Diagnostics {
     /// diagnostics are on with a key, each errorType once a session and at most 10 (`errorReportAllowed`).
     func recordError(_ type: String, _ message: String, stack: String, severity: String, kind: String, session sid: String?, time: Date) {
         guard errorReportAllowed(type, sent: errorTypesSent) else {
-            appendToLog("\(diskTime(Date()))  error report \(type): not sent again (each type once a session, at most 10)\n")
+            // Said once a type, so a report that keeps coming doesn't fill the log.
+            if errorTypesHeld.insert(type).inserted {
+                appendToLog("\(diskTime(Date()))  error report \(type): not sent again (each type once a session, at most 10)\n")
+            }
             return
         }
         errorTypesSent.insert(type)
@@ -8016,7 +8068,7 @@ final class Diagnostics {
         while !retry {
             let all: [DiagError] = loadLines(files.errors)
             guard let e = all.first else { break }
-            guard let answer = post(aptabaseErrorURL, aptabaseErrorBody(e, system: systemProps), key: key, deadline: deadline) else { break }
+            guard let answer = post(aptabaseErrorURL, aptabaseErrorBody(e, system: systemProps, now: Date()), key: key, deadline: deadline) else { break }
             let (status, reply, failure) = answer
             let outcome = aptabaseErrorOutcome(status: failure == nil ? status : nil)
             if outcome != .retry { saveLines(all.filter { $0.id != e.id }, to: files.errors) }
@@ -8498,7 +8550,7 @@ struct UpdateSheet: View {
                             "/usr/bin/codesign --verify --deep --strict <new app>")
                     stepRow(5, "Move this copy to the Trash and put the new one in its place:",
                             Bundle.main.bundleURL.path)
-                    stepRow(6, "Reopen Booth Check. macOS asks for the System Events and Accessibility permissions again, because it\u{2019}s a new build.", nil)
+                    stepRow(6, "Reopen Booth Check. It keeps its System Events and Accessibility permissions (each version is signed the same way); only if macOS does ask, allow them again.", nil)
                     Text("If any check fails, nothing is changed.").font(.system(size: 11)).foregroundStyle(.secondary)
 
                     if !booth.updateSteps.isEmpty {
@@ -8756,6 +8808,7 @@ struct SetupSheet: View {
             .frame(maxWidth: 440, alignment: .leading)
             Text(booth.deckProfiles.problem.map { "Can\u{2019}t list the profiles: \($0)" }
                  ?? (tag.isEmpty ? "Pick the profile that goes with the show, and Booth Check checks Stream Deck is on it."
+                     : tag == "missing" ? "It isn\u{2019}t installed on this Mac: import its .streamDeckProfile file in Stream Deck, or pick another one."
                                  : "Booth Check checks Stream Deck is on it, and switches it at the start-up, while Stream Deck is closed."))
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -8936,17 +8989,40 @@ struct SettingRow: View {
     }
 }
 
+/// How a change sheet names what it runs ("Booth Check will run these steps:"), and whether that is
+/// prose to wrap (Booth Check's own steps) rather than a command to show exactly, line for line.
+func changeCodeWords(_ language: String) -> (noun: String, prose: Bool) {
+    switch language {
+    case "Booth Check steps": return ("these steps", true)
+    case "AppleScript": return ("this AppleScript", false)
+    case "Terminal command (as administrator)": return ("this command, as administrator", false)
+    default: return ("this command", false)
+    }
+}
+
 struct CodeBlock: View {
     let text: String
+    /// Prose wraps; a command keeps its lines and scrolls sideways, with the scroller showing.
+    var wraps = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
+            if wraps {
                 Text(text)
                     .font(.system(size: 11.5, design: .monospaced))
                     .textSelection(.enabled)
-                    .fixedSize(horizontal: true, vertical: true)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
+            } else {
+                ScrollView(.horizontal) {
+                    Text(text)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .padding(10)
+                }
+                .scrollIndicators(.visible)
             }
             Button("Copy") {
                 NSPasteboard.general.clearContents()
@@ -8971,15 +9047,17 @@ struct OutputBlock: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(status == 0 ? Color.green : Color.red)
             }
-            ScrollView {
-                Text(entry.output.count > 6000 ? String(entry.output.prefix(6000)) + "\n\u{2026}" : entry.output)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
+            if !entry.output.isEmpty {
+                ScrollView {
+                    Text(entry.output.count > 6000 ? String(entry.output.prefix(6000)) + "\n\u{2026}" : entry.output)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .frame(maxHeight: 180)
+                .background(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
             }
-            .frame(maxHeight: 180)
-            .background(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
         }
     }
 }
@@ -8996,12 +9074,13 @@ struct ChangeSheet: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(result == nil ? "Booth Check will run this \(change.language):" : "Ran this \(change.language):")
+            let words = changeCodeWords(change.language)
+            Text(result == nil ? "Booth Check will run \(words.noun):" : "Ran \(words.noun):")
                 .font(.system(size: 12, weight: .semibold))
-            CodeBlock(text: change.code)
+            CodeBlock(text: change.code, wraps: words.prose)
             if let undo = change.undo {
-                Text("To undo it later, run:").font(.system(size: 11)).foregroundStyle(.secondary)
-                CodeBlock(text: undo)
+                Text(words.prose ? "To undo it later:" : "To undo it later, run:").font(.system(size: 11)).foregroundStyle(.secondary)
+                CodeBlock(text: undo, wraps: words.prose)
             }
             if let result { OutputBlock(entry: result) }
             HStack {
@@ -9216,6 +9295,7 @@ struct ContentView: View {
             Image(systemName: symbol).font(.system(size: 30)).foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 20, weight: .bold))
+                    .fixedSize(horizontal: true, vertical: false)
                 Text(booth.lastChecked.map { "Checked at \($0.formatted(date: .omitted, time: .shortened))" } ?? "Booth Check")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -9224,13 +9304,13 @@ struct ContentView: View {
                         Label(off, systemImage: "slider.horizontal.3").font(.system(size: 11))
                     }
                     .buttonStyle(.link)
+                    .fixedSize()
                     .help("Change what this Mac is set up for")
                 }
             }
-            Spacer()
-            if booth.updateAvailable, let release = booth.latest {
-                Button("Update to \(release.version)") { booth.showUpdate = true }
-            }
+            .layoutPriority(1)
+            Spacer(minLength: 0)
+            // An update is offered at the foot of the window and in the menu, so the buttons here fit.
             if booth.canStartShow {
                 Button { booth.startShowByHand() } label: {
                     if booth.starting {
@@ -9242,6 +9322,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
                 .disabled(booth.starting)
+                .fixedSize()
                 .help(booth.startOrder)
             }
             Button { booth.showSetup = true } label: { Label("This Mac", systemImage: "gearshape") }
@@ -9281,7 +9362,7 @@ struct ContentView: View {
                     Button("Dismiss") { booth.bootSteps = [] }.controlSize(.small)
                 }
             }
-            BootStepsList(steps: booth.bootSteps)
+            BootStepsList(steps: windowStepWords(booth.bootSteps))
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.1)))
@@ -9350,6 +9431,8 @@ struct BootStepsList: View {
                         Text(step.title)
                             .font(.system(size: 12, weight: live && step.state == .running ? .semibold : .regular))
                             .foregroundStyle(live && step.state == .waiting ? .secondary : .primary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                         if live, let detail = step.detail {
                             Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -9387,7 +9470,13 @@ struct BootView: View {
                 Text(title).font(.system(size: 15, weight: .bold))
                 Spacer(minLength: 0)
             }
-            BootStepsList(steps: booth.bootSteps)
+            .fixedSize(horizontal: false, vertical: true)
+            // The panel is sized to fit (`BootPanel.fit`); on a small screen only the steps scroll, so
+            // the heading and the buttons always show.
+            ViewThatFits(in: .vertical) {
+                BootStepsList(steps: booth.bootSteps)
+                ScrollView { BootStepsList(steps: booth.bootSteps).frame(maxWidth: .infinity, alignment: .leading) }
+            }
             Spacer(minLength: 0)
             HStack {
                 Button("Open Booth Check") { booth.showWindow() }
@@ -9400,6 +9489,8 @@ struct BootView: View {
             .controlSize(.small)
         }
         .padding(16)
+        .onChange(of: booth.bootSteps) { _ in DispatchQueue.main.async { BootPanel.shared.fit() } }
+        .onChange(of: title) { _ in DispatchQueue.main.async { BootPanel.shared.fit() } }
     }
 }
 
@@ -9410,10 +9501,11 @@ final class BootPanel {
     static let shared = BootPanel()
     private var panel: NSPanel?
 
-    func show(steps: Int) {
-        let size = NSSize(width: 360, height: 104 + CGFloat(steps) * 44)
+    static let width: CGFloat = 360
+
+    func show() {
         if panel == nil {
-            let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+            let p = NSPanel(contentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: 300)),
                             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView],
                             backing: .buffered, defer: false)
             p.titleVisibility = .hidden
@@ -9425,16 +9517,31 @@ final class BootPanel {
             p.isMovableByWindowBackground = true
             p.isReleasedWhenClosed = false
             let host = NSHostingController(rootView: BootView(booth: Booth.shared))
-            host.sizingOptions = []            // the panel's size is set here, from the number of steps
+            host.sizingOptions = []            // the panel's size is set here (`fit`), never by SwiftUI
             p.contentViewController = host
             panel = p
         }
         guard let panel else { return }
-        panel.setContentSize(size)
+        fit()
         if let screen = NSScreen.main?.visibleFrame {
             panel.setFrameTopLeftPoint(NSPoint(x: screen.maxX - panel.frame.width - 16, y: screen.maxY - 16))
         }
         panel.orderFrontRegardless()
+    }
+
+    /// Sizes the panel to its content's height at its width, at most the visible screen (then only
+    /// the steps scroll), keeping its top edge where it is (it can be dragged) unless that would put
+    /// its bottom off the screen. Again whenever the steps or the heading change.
+    func fit() {
+        guard let panel else { return }
+        let probe = NSHostingView(rootView: BootView(booth: Booth.shared)
+            .frame(width: Self.width).fixedSize(horizontal: false, vertical: true))
+        let screen = (panel.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let height = min(probe.fittingSize.height.rounded(.up), screen.height - 32)
+        guard abs(panel.frame.height - height) > 0.5 else { return }
+        let top = panel.frame.maxY, left = panel.frame.minX
+        panel.setContentSize(NSSize(width: Self.width, height: height))
+        panel.setFrameTopLeftPoint(NSPoint(x: left, y: max(top, screen.minY + 16 + panel.frame.height)))
     }
 
     func hide() { panel?.orderOut(nil) }
@@ -9521,7 +9628,8 @@ struct ReplugAnimation: View {
                     }
                     .frame(width: 150, height: 112)
             }
-            .frame(width: 570, height: 120, alignment: .leading)
+            // As wide as box and plug half-way out, so the picture sits in the middle of the card.
+            .frame(width: 490, height: 120, alignment: .leading)
             HStack(spacing: 36) {
                 step(1, "Unplug", lit: frame.step == 1)
                 step(2, "Plug back in", lit: frame.step == 2)
@@ -9701,7 +9809,8 @@ struct SignCard: View {
                     badge(look.symbol, look.color, size: 80)
                     VStack(alignment: .leading, spacing: 8) {
                         Text(look.title).font(.system(size: 30, weight: .bold))
-                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.6)
                         Text(look.text).font(.system(size: 18)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         if showsStep { stepLine(size: 14) }
@@ -9714,9 +9823,11 @@ struct SignCard: View {
                 VStack(spacing: 20) {
                     Spacer(minLength: 0)
                     badge(look.symbol, look.color, size: 120)
+                    // A long profile or show name shrinks the title, so the badge and the words below still show.
                     Text(look.title).font(.system(size: 42, weight: .bold).monospacedDigit())
                         .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(3)
+                        .minimumScaleFactor(0.6)
                     Text(look.text).font(.system(size: 20)).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
@@ -9948,6 +10059,7 @@ struct MenuPanel: View {
                         Button { booth.showWindow() } label: {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: check.status.symbol).foregroundStyle(check.status.color)
+                                    .frame(width: 16)          // a triangle is wider than a cross: titles line up
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(check.title).font(.system(size: 12, weight: .semibold))
                                     Text(check.detail).font(.system(size: 11)).foregroundStyle(.secondary)

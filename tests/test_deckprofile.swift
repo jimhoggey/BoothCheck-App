@@ -242,6 +242,11 @@ FileManager.default.createFile(atPath: root + "/Show_v1.deck.json", contents: Da
 expect("a file next to the show is read", loadDeckShowFile(forShow: showPath)?.file.helperArgs == nil)
 expect("the log line says the helper isn't used", deckShowFileText(loadDeckShowFile(forShow: showPath)).contains("doesn\u{2019}t use"))
 
+// The start-up's Stream Deck step: switched, or (write failed, or Stream Deck didn't quit) what to do.
+expect("profile switched: says so", deckProfileStepNote("Service", switched: true) == " Put it on the \u{201C}Service\u{201D} profile.")
+expect("couldn't switch (Stream Deck stayed open too): says where to choose it",
+       deckProfileStepNote("Service", switched: false) == " Couldn\u{2019}t put it on \u{201C}Service\u{201D}: choose it at the top of Stream Deck\u{2019}s window.")
+
 try? FileManager.default.removeItem(atPath: root)
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
