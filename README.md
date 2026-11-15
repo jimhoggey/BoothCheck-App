@@ -75,14 +75,41 @@ its window once so whoever sits down sees what to fix.
   saved state to 0 on every MIDI key** (Trevliga plugin, two or more states) on every page of the
   profile the deck will show: the one chosen in This Mac and each deck's preferred profile. Then
   Lightkey drives the keys from the show's start states on. Only those digits in the file change;
-  text and page keys and everything else stay byte for byte, the result is re-read and compared
-  with the original before it's written (atomically), and the original of each changed page is kept
-  in `~/Library/Application Support/Booth Check/deck-backups/<profile>/<page>/manifest.json` (one
-  copy, overwritten each time). If Stream Deck is running, a file doesn't read as expected, or it
+  text and page keys and everything else stay byte for byte, and the result is re-read and compared
+  with the original before it's written (atomically). A profile is only reset once Booth Check holds
+  a copy of it as it is (below). If Stream Deck is running, a file doesn't read as expected, or it
   changes meanwhile, that page is left alone and the start-up carries on. The Log says which profile
-  and pages, which keys (by title) and where the backup is. There's no switch: it's part of "keys
-  start clean". Quitting Stream Deck yourself mid-service doesn't reset anything; Booth Check just
-  reopens it.
+  and pages and which keys (by title). There's no switch: it's part of "keys start clean". Quitting
+  Stream Deck yourself mid-service doesn't reset anything; Booth Check just reopens it.
+
+  **The Stream Deck profile mends itself.** In the same two places, while Stream Deck is closed,
+  Booth Check first checks the service profile on disk (the one chosen in This Mac, else each deck's
+  profile): its folder is there, its manifests are JSON, every page it lists is there, and it still
+  has MIDI keys if Booth Check's copy had some. If it's **broken or gone** and Booth Check has a copy,
+  it **puts the copy back by itself** before Stream Deck opens (the sign says "Putting the Stream
+  Deck's keys back…"): the copy goes into a hidden folder next to the profile, is checked identical,
+  swaps places with the broken one in one step, and the broken one is kept in Booth Check's folder
+  (`deck-backups/<profile>/set-aside/<date>`, newest 3; never deleted). About 10 seconds after Stream
+  Deck opens, Booth Check checks the profile again; if it broke again, it tries once more (quit,
+  put back, reopen), then stops and the row asks a person. A healthy profile is never "repaired": if
+  the tech changed it, the changed one simply becomes the new copy. JSON in a shape Booth Check
+  doesn't know (a new Stream Deck version) is left alone.
+  **The copy:** one per profile, `~/Library/Application Support/Booth Check/deck-backups/<profile
+  uuid>/good/` (about 3 MB) plus `good.json`, made only while the profile is healthy, and only when it
+  changed (a hash that counts saved key lights as dark, so the reset alone isn't a change). Stream
+  Deck's own daily backups (`com.elgato.StreamDeck/BackupV3`) are the longer history.
+  **Why before Stream Deck opens:** Stream Deck 7.6 compares its action count with the last session's
+  when it starts, and if it's lower (a manifest that isn't JSON, a profile folder gone) it asks
+  "Stream Deck detected an error restoring the last session… restore the backup from today?" and does
+  nothing, keys included, until someone answers (tested on the dev Mac, 15 Nov 2026). The key reset
+  and the swap of an identical folder don't raise it, nor does a force-quit (after one, Stream Deck
+  skips that check). If the question is up anyway, the "Stream Deck app running" row goes red with
+  **In Stream Deck's window, click Restore** (Booth Check reads it from Stream Deck's log; Restore puts
+  back Stream Deck's backup of every profile from that morning).
+  **During a service** Booth Check never quits Stream Deck to mend a profile: the "Stream Deck is on
+  the right profile" row goes red ("The service profile '…' is damaged…") with **Restore the Stream
+  Deck's keys…**, which shows the steps, the copy's date and the undo first. With no copy yet, the
+  row says to import the `.streamDeckProfile` file again or pick the profile in This Mac.
 
   Only the steps for apps switched on in This Mac appear. If all are green the panel says "Ready for
   the service" and hides itself; if not it stays, with **Open Booth Check**. A step that warned on the
@@ -452,7 +479,10 @@ in This Mac. Both keep every step in the Log.
 | `person` | someone acted, or had to | `action`, `during` (startup, service, shutdown), and for a row `check`, `title`, `row_status`. Actions: `fix` (a row's button, `button`), `run` / `cancel` (the change sheet, `key`: e.g. `dmxReconnect` is Reconnect the lights…, `dmxRestart` Restart Lightkey…), `check_again`, `start_show`, `mute`, `unmute`, `not_yet` (`trigger`, `left_s`), `update`, `replug` (the replug card: `result` found, skipped or timeout, `wait_s`), `authenticate` (Lightkey asked for the password: `wait_s`, `result`) |
 | `settings_changed` | This Mac settings changed | `keys`, `this_mac_open` (0 = Booth Check changed it itself) |
 | `setting` | a logged setting (mute, show, profile…) | `key`, `value` |
-| `self_repair`, `dmx_recovery`, `dmx_snapshot`, `deck_profile`, `power_change` | Booth Check fixing or recording something | `what`/`rung`, `result` |
+| `self_repair`, `dmx_recovery`, `dmx_snapshot`, `deck_profile`, `power_change` | Booth Check fixing or recording something | `what`/`rung`, `result` (`what` `deck_profile_restore`: `broke_again`, `no_copy`, `asks_restore` = Stream Deck's own restore question is up) |
+| `deck_keys_cleared` | the saved key lights reset, Stream Deck closed | `why`, `keys`, `pages`, `profiles`, `skipped`, `result` |
+| `deck_profile_copy` | a new last-good copy of a profile | `why`, `pages`, `keys`, `kb`, `first` |
+| `deck_profile_restored` | a broken or missing profile put back from the copy | `why` (what was wrong), `during`, `how` (automatic, button), `result`, `identical`, `pages`, `keys`, `copy_age_h` |
 | `shutdown` | each shutdown step | `reason`, `step`, `detail` |
 | `shutdown_blackout`, `apps_quit_at_shutdown` | the Blackout, other apps closing | `sends`, `on`; `apps`, `stayed` |
 | `shutdown_done` | the apps closed (or it stayed on) | `trigger` (menu, weekly_time, power_off), `result` (shutting_down, stayed_on), `countdown_s`, `other_apps_s`, `blackout_s`, `stream_deck_s`, `lightkey_s`, `total_s`, `lightkey_forced`, `lightkey_quit_pressed`, `stream_deck_forced` |

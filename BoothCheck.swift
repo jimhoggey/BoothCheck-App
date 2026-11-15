@@ -973,6 +973,7 @@ enum SelfRepair: Equatable {
     case deckReopening, deckReopened, deckRestarting, deckRestarted, deckFailed
     case helperRestarting, helperRestarted, helperFailed
     case deckProfileSwitching(String), deckProfileSwitched(String), deckProfileFailed(String)
+    case deckKeysRestoring, deckKeysRestored, deckKeysRestoreFailed
 }
 
 /// The sign's words for each self-repair: a title and one plain line.
@@ -999,6 +1000,9 @@ func selfRepairWords(_ r: SelfRepair) -> (title: String, detail: String) {
     case .deckProfileSwitching(let name): return ("Putting Stream Deck on the \u{201C}\(name)\u{201D} profile", "Its keys go dark for a few seconds.")
     case .deckProfileSwitched(let name): return ("Stream Deck is on \u{201C}\(name)\u{201D}", "Its keys work again.")
     case .deckProfileFailed(let name): return ("Couldn\u{2019}t switch Stream Deck\u{2019}s profile", "In Stream Deck, choose \u{201C}\(name)\u{201D} at the top of its window.")
+    case .deckKeysRestoring: return ("Putting the Stream Deck\u{2019}s keys back\u{2026}", "Its keys go dark for a few seconds.")
+    case .deckKeysRestored: return ("The Stream Deck\u{2019}s keys are back", "They work again.")
+    case .deckKeysRestoreFailed: return ("Couldn\u{2019}t put the Stream Deck\u{2019}s keys back", "Open Booth Check to see what to press.")
     }
 }
 
@@ -1756,12 +1760,26 @@ func deckProfileWarnings(_ p: DeckProfile) -> [String] {
 
 /// "Stream Deck is on the right profile". `writeFailed`: Booth Check's switch didn't stick, so the row
 /// says how to choose it by hand instead of offering the switch again.
+/// `disk`: the service profile's folder as checked on disk (`deckProfileHealth`) and its last-good copy;
+/// broken or missing, the row offers the copy back (`repairFailed`: Booth Check's own restore didn't hold).
 func deckProfileCheck(choice: DeckProfileChoice, read: DeckProfilesRead, preferred: [String: String], prefsProblem: String?,
-                      writeFailed: Bool = false) -> Check {
+                      writeFailed: Bool = false, disk: (uuid: String, health: DeckProfileHealth, copy: DeckCopyInfo?)? = nil,
+                      repairFailed: Bool = false) -> Check {
     let title = "Stream Deck is on the right profile"
     let want = "\u{201C}\(choice.name)\u{201D}"
     func row(_ status: Status, _ detail: String, fix: String? = nil, action: Action? = nil) -> Check {
         Check(id: "deckProfile", group: "Stream Deck", title: title, status: status, detail: detail, fix: fix, action: action)
+    }
+    if let disk, disk.health.isBroken {
+        let detail = "The service profile \(want) " + (disk.health == .missing ? "isn\u{2019}t in Stream Deck any more." : "is damaged: \(disk.health.why).")
+            + (repairFailed ? " Booth Check put it back by itself, but it was damaged again after Stream Deck opened." : "")
+        if let copy = disk.copy {
+            return row(.fail, detail, fix: "Click Restore the Stream Deck\u{2019}s keys\u{2026} to put back Booth Check\u{2019}s copy from \(deckCopyDateText(copy.savedAt)) (Stream Deck closes for a few seconds).",
+                       action: .restoreDeckProfile(uuid: disk.uuid, name: choice.name))
+        }
+        return row(.fail, detail + " Booth Check has no copy of it to put back yet.",
+                   fix: "Import it again in Stream Deck (double-click its .streamDeckProfile file), or pick the profile for the service in This Mac.",
+                   action: .openSetup)
     }
     if let problem = read.problem {
         return row(.unknown, "Can\u{2019}t tell which profile it\u{2019}s on: \(problem)", fix: "Check Stream Deck shows \(want) at the top of its window.")
@@ -1987,13 +2005,13 @@ struct DeckPageClearResult: Equatable {
 }
 
 /// Resets the saved key lights on every page of one profile folder (`clearDeckPageStates`). Each page
-/// that changes is first copied to `backupDir/<profile folder>/<page>/manifest.json` (overwriting the
-/// last copy), then written atomically, with its permissions kept. Before each write it checks
-/// `deckRunning` (Stream Deck would write its own copy back) and that the file is still what was read.
-/// Anything unexpected leaves that page as it was and says why.
-func clearDeckKeyStates(profileDir: String, backupDir: String, deckRunning: () -> Bool) -> [DeckPageClearResult] {
+/// that changes is written atomically, with its permissions kept. The backup is the whole profile's
+/// last-good copy (`snapshotDeckProfile`), which the caller makes first: Booth Check doesn't reset a
+/// profile it has no copy of as it is now. Before each write it checks `deckRunning` (Stream Deck would
+/// write its own copy back) and that the file is still what was read. Anything unexpected leaves that
+/// page as it was and says why.
+func clearDeckKeyStates(profileDir: String, deckRunning: () -> Bool) -> [DeckPageClearResult] {
     let fm = FileManager.default
-    let profileName = (profileDir as NSString).lastPathComponent
     let pagesDir = profileDir + "/Profiles"
     let pages = ((try? fm.contentsOfDirectory(atPath: pagesDir)) ?? []).filter { !$0.hasPrefix(".") }.sorted()
     var results: [DeckPageClearResult] = []
@@ -2009,14 +2027,6 @@ func clearDeckKeyStates(profileDir: String, backupDir: String, deckRunning: () -
         if let p = plan.problem { r.skipped = p; results.append(r); continue }
         guard let new = plan.data else { results.append(r); continue }
         if deckRunning() { r.skipped = "Stream Deck is running"; results.append(r); continue }
-        let backupFolder = backupDir + "/" + profileName + "/" + page
-        let backup = backupFolder + "/manifest.json"
-        do {
-            try fm.createDirectory(atPath: backupFolder, withIntermediateDirectories: true)
-            try original.write(to: URL(fileURLWithPath: backup), options: .atomic)
-        } catch {
-            r.skipped = "couldn\u{2019}t keep a backup first (\(error.localizedDescription))"; results.append(r); continue
-        }
         guard fm.contents(atPath: path) == original else { r.skipped = "the file changed while Booth Check read it"; results.append(r); continue }
         if deckRunning() { r.skipped = "Stream Deck started"; results.append(r); continue }
         let perms = (try? fm.attributesOfItem(atPath: path))?[.posixPermissions]
@@ -2029,7 +2039,7 @@ func clearDeckKeyStates(profileDir: String, backupDir: String, deckRunning: () -
         if fm.contents(atPath: path) == new {
             r.written = true
         } else {
-            r.skipped = "it didn\u{2019}t read back as written; the backup is in \(backup)"
+            r.skipped = "it didn\u{2019}t read back as written (the last-good copy has it as it was)"
         }
         results.append(r)
     }
@@ -2068,8 +2078,426 @@ func deckClearText(profile: DeckProfile, results: [DeckPageClearResult], backupF
                          + (r.resets.isEmpty ? "" : " It has \(r.resets.count) key\(r.resets.count == 1 ? "" : "s") saved lit: " + r.resets.map(\.title).joined(separator: ", ") + "."))
         }
     }
-    if !changed.isEmpty { lines.append("  The files as they were, one copy per page (overwritten each time): \(backupFolder)/<page>/manifest.json") }
+    if !changed.isEmpty { lines.append("  The profile as it was is in Booth Check\u{2019}s last-good copy: \(backupFolder)") }
     return lines.joined(separator: "\n")
+}
+
+// MARK: Stream Deck profile: last-good copy and self-repair (Nov 2026)
+//
+// The owner: "the app should mend itself". Whenever Booth Check has Stream Deck closed (the start-up,
+// the restart after Lightkey starts), it keeps a complete copy of each profile it looks after, as long
+// as that profile is healthy on disk, and puts the copy back if the profile is objectively broken
+// (gone, a file missing or not JSON, a page folder gone, no MIDI keys left when the copy had some).
+// A healthy profile is never "repaired": an edit the tech made becomes the new last-good copy instead.
+// JSON in a shape Booth Check doesn't know (a new Stream Deck version) is never touched. While Stream
+// Deck runs, nothing is written; mid-service the row offers the restore instead.
+//
+// Stream Deck's own guard (tested on the dev Mac, 15 Nov 2026, Stream Deck 7.6): at launch, after a
+// clean last session, it compares its action count with the last session's, and when it's lower (a
+// page manifest that isn't JSON, a profile folder gone) it puts up "Stream Deck detected an error
+// restoring the last session… restore the backup from today?" and does nothing until someone answers.
+// Putting a broken profile back BEFORE Stream Deck opens is what keeps that question away; the key
+// reset (State digits only) and swapping in an identical folder don't raise it. Booth Check never
+// removes a profile. Its daily backups (BackupV3/*.streamDeckProfilesBackup, all profiles at once,
+// only at the first launch of a day after a clean quit) are what its Restore button uses.
+//
+// One scheme, in `~/Library/Application Support/Booth Check/deck-backups/<profile uuid>/`:
+//   good/<UUID>.sdProfile, good.json         the last good copy and what it is (one copy; Stream
+//                                            Deck's daily backups are the history)
+//   set-aside/<yyyy-MM-dd HHmmss>/<UUID>.sdProfile  what a restore replaced (the newest 3; older ones go to the Trash)
+
+/// What a profile folder on disk looks like.
+enum DeckProfileHealth: Equatable {
+    case healthy(DeckProfile)
+    case missing                    // its folder isn't there
+    case broken(String)             // objectively damaged; the reason, in plain words
+    case unknownShape(String)       // JSON, but not the shape Booth Check knows: never repaired
+    var isBroken: Bool {
+        switch self { case .missing, .broken: return true; default: return false }
+    }
+    var why: String {
+        switch self {
+        case .healthy: return "it\u{2019}s healthy"
+        case .missing: return "its folder is gone"
+        case .broken(let w), .unknownShape(let w): return w
+        }
+    }
+}
+
+/// Checks one `.sdProfile` folder: its manifest is JSON with Name, Device and Pages; every page it lists
+/// (and its Default page) has a folder with a manifest that's JSON; every other page manifest there is
+/// JSON too; it parses as a profile (`parseDeckProfile`). `expectKeys`: its last-good copy had MIDI
+/// keys, so a profile with none left counts as broken. Reads only.
+func deckProfileHealth(dir: String, expectKeys: Bool) -> DeckProfileHealth {
+    let fm = FileManager.default
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { return .missing }
+    guard let manifest = fm.contents(atPath: dir + "/manifest.json") else { return .broken("its manifest.json is missing") }
+    guard let m = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any] else {
+        return .broken("its manifest.json can\u{2019}t be read (it isn\u{2019}t JSON)")
+    }
+    guard let pagesInfo = m["Pages"] as? [String: Any], let listed = pagesInfo["Pages"] as? [String] else {
+        return .unknownShape("its manifest.json has no Pages list Booth Check knows")
+    }
+    let pagesDir = dir + "/Profiles"
+    let folders = ((try? fm.contentsOfDirectory(atPath: pagesDir)) ?? []).filter { !$0.hasPrefix(".") }
+    var wanted = listed
+    if let d = pagesInfo["Default"] as? String, !wanted.contains(where: { $0.lowercased() == d.lowercased() }) { wanted.append(d) }
+    if wanted.isEmpty { return .broken("it has no pages") }
+    for id in wanted where !folders.contains(where: { $0.lowercased() == id.lowercased() }) {
+        return .broken("its page \(id.uppercased().prefix(8)) is missing")
+    }
+    var pages: [Data] = []
+    for f in folders.sorted() {
+        let path = pagesDir + "/" + f + "/manifest.json"
+        let isListed = wanted.contains { $0.lowercased() == f.lowercased() }
+        guard let data = fm.contents(atPath: path) else {
+            if isListed { return .broken("its page \(f.prefix(8)) has no manifest.json") }
+            continue
+        }
+        guard (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else {
+            return .broken("its page \(f.prefix(8))\u{2019}s manifest.json can\u{2019}t be read (it isn\u{2019}t JSON)")
+        }
+        pages.append(data)
+    }
+    let name = (dir as NSString).lastPathComponent
+    guard name.lowercased().hasSuffix(".sdprofile"),
+          let p = parseDeckProfile(uuid: String(name.dropLast(".sdProfile".count)), manifest: manifest, pages: pages) else {
+        return .unknownShape("its files aren\u{2019}t the shape Booth Check knows")
+    }
+    if expectKeys && p.keys.isEmpty { return .broken("it has no MIDI keys left") }
+    return .healthy(p)
+}
+
+/// Every regular file under `dir`, as sorted paths relative to it (`.DS_Store` left out).
+func deckTreeFiles(_ dir: String) -> [String]? {
+    let fm = FileManager.default
+    guard let e = fm.enumerator(atPath: dir) else { return nil }
+    var out: [String] = []
+    while let rel = e.nextObject() as? String {
+        if (rel as NSString).lastPathComponent == ".DS_Store" { continue }
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: dir + "/" + rel, isDirectory: &isDir), !isDir.boolValue { out.append(rel) }
+    }
+    return out.sorted()
+}
+
+/// A profile folder's content hash: every file's path and bytes, with each page manifest's saved key
+/// lights counted as dark (`clearDeckPageStates`), so the reset alone isn't a change. Nil if unreadable.
+func deckProfileContentHash(dir: String) -> (hash: String, bytes: Int, files: Int)? {
+    guard let files = deckTreeFiles(dir) else { return nil }
+    var h = SHA256()
+    var bytes = 0
+    for rel in files {
+        guard var data = FileManager.default.contents(atPath: dir + "/" + rel) else { return nil }
+        let parts = rel.split(separator: "/")
+        if parts.count == 3, parts[0] == "Profiles", parts[2] == "manifest.json", let dark = clearDeckPageStates(data).data { data = dark }
+        bytes += data.count
+        h.update(data: Data(rel.utf8 + [0]))
+        h.update(data: Data(String(data.count).utf8 + [0]))
+        h.update(data: data)
+    }
+    return (h.finalize().map { String(format: "%02x", $0) }.joined(), bytes, files.count)
+}
+
+/// Whether two folders hold exactly the same files, byte for byte.
+func deckTreesIdentical(_ a: String, _ b: String) -> Bool {
+    guard let fa = deckTreeFiles(a), let fb = deckTreeFiles(b), fa == fb else { return false }
+    let fm = FileManager.default
+    return fa.allSatisfy { rel in
+        guard let x = fm.contents(atPath: a + "/" + rel), let y = fm.contents(atPath: b + "/" + rel) else { return false }
+        return x == y
+    }
+}
+
+/// What the kept copy is: written next to it as good.json.
+struct DeckCopyInfo: Codable, Equatable {
+    var uuid: String            // lowercased
+    var name: String
+    var folder: String          // the .sdProfile folder's own name, as Stream Deck spelled it
+    var sigHash: String
+    var hash: String            // `deckProfileContentHash`
+    var keys: Int
+    var pages: Int
+    var bytes: Int
+    var savedAt: Date
+}
+
+/// Where a profile's copy lives.
+struct DeckCopyStore {
+    let root: String            // …/Booth Check/deck-backups
+    let uuid: String
+    var dir: String { root + "/" + uuid.lowercased() }
+    var goodDir: String { dir + "/good" }
+    var goodInfo: String { dir + "/good.json" }
+    var setAside: String { dir + "/set-aside" }
+
+    /// The copy, when both its info and its folder are there.
+    var good: DeckCopyInfo? {
+        guard let data = FileManager.default.contents(atPath: goodInfo) else { return nil }
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        guard let c = try? d.decode(DeckCopyInfo.self, from: data),
+              FileManager.default.fileExists(atPath: goodDir + "/" + c.folder + "/manifest.json") else { return nil }
+        return c
+    }
+    var goodFolder: String? { good.map { goodDir + "/" + $0.folder } }
+}
+
+func writeDeckCopyInfo(_ c: DeckCopyInfo, to path: String) -> Bool {
+    let e = JSONEncoder()
+    e.dateEncodingStrategy = .iso8601
+    e.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? e.encode(c) else { return false }
+    return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
+}
+
+/// The log's line for a snapshot.
+func deckSnapshotText(name: String, _ r: DeckSnapshotResult, store: DeckCopyStore) -> String {
+    switch r {
+    case .unchanged(let c):
+        return "\u{201C}\(name)\u{201D}: healthy, unchanged since Booth Check\u{2019}s copy from \(deckCopyDateText(c.savedAt)) (\(store.goodDir)); no new copy."
+    case .saved(let c, let old):
+        return "\u{201C}\(name)\u{201D}: healthy" + (old == nil ? "; Booth Check\u{2019}s first copy of it" : ", changed since the copy from \(deckCopyDateText(old!.savedAt)); a new copy replaces it")
+            + " (\(c.pages) pages, \(c.keys) MIDI keys, \(c.bytes / 1024) KB) in \(store.goodDir)."
+    case .skipped(let why):
+        return "\u{201C}\(name)\u{201D}: no new copy: \(why)."
+    }
+}
+
+/// "15 Nov, 09:12": when a copy was made, for the row.
+func deckCopyDateText(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_GB")
+    f.dateFormat = "d MMM, HH:mm"
+    return f.string(from: d)
+}
+
+enum DeckSnapshotResult: Equatable {
+    case unchanged(DeckCopyInfo)
+    case saved(DeckCopyInfo, replaced: DeckCopyInfo?)
+    case skipped(String)
+    var copy: DeckCopyInfo? {
+        switch self { case .unchanged(let c), .saved(let c, _): return c; case .skipped: return nil }
+    }
+}
+
+/// Keeps a last-good copy of a healthy profile folder: nothing when its content hash is the copy's
+/// (nothing changed), else a fresh copy, checked (healthy, same hash) before it replaces the old one.
+/// A healthy profile that changed (the tech edited it) simply becomes the new copy. Only reads Stream
+/// Deck's files, and only while it's closed. Anything unexpected keeps the old copy as it was.
+func snapshotDeckProfile(dir: String, store: DeckCopyStore, deckRunning: () -> Bool, now: Date = Date()) -> DeckSnapshotResult {
+    let fm = FileManager.default
+    if deckRunning() { return .skipped("Stream Deck is running") }
+    let old = store.good
+    let health = deckProfileHealth(dir: dir, expectKeys: (old?.keys ?? 0) > 0)
+    guard case .healthy(let p) = health else { return .skipped("it isn\u{2019}t healthy (\(health.why))") }
+    guard let h = deckProfileContentHash(dir: dir) else { return .skipped("its files couldn\u{2019}t all be read") }
+    if let old, old.hash == h.hash { return .unchanged(old) }
+    let folder = (dir as NSString).lastPathComponent
+    let tmp = store.dir + "/incoming"
+    try? fm.removeItem(atPath: tmp)                 // Booth Check's own half-made copy, if any
+    do {
+        try fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        try fm.copyItem(atPath: dir, toPath: tmp + "/" + folder)
+    } catch {
+        try? fm.removeItem(atPath: tmp)
+        return .skipped("the copy failed (\(error.localizedDescription))")
+    }
+    guard case .healthy = deckProfileHealth(dir: tmp + "/" + folder, expectKeys: false),
+          deckProfileContentHash(dir: tmp + "/" + folder)?.hash == h.hash, !deckRunning() else {
+        try? fm.removeItem(atPath: tmp)
+        return .skipped("it changed while it was copied")
+    }
+    let info = DeckCopyInfo(uuid: p.uuid, name: p.name, folder: folder, sigHash: p.sigHash, hash: h.hash, keys: p.keys.count,
+                            pages: p.pages, bytes: h.bytes, savedAt: now)
+    // The new copy swaps places with the old one in one step, then the old one (Booth Check's own) goes.
+    let swapped = fm.fileExists(atPath: store.goodDir)
+        ? renamex_np(tmp, store.goodDir, UInt32(RENAME_SWAP)) == 0
+        : rename(tmp, store.goodDir) == 0
+    guard swapped, writeDeckCopyInfo(info, to: store.goodInfo) else {
+        try? fm.removeItem(atPath: tmp)
+        return .skipped("the copy couldn\u{2019}t be put in place")
+    }
+    try? fm.removeItem(atPath: tmp)
+    return .saved(info, replaced: old)
+}
+
+struct DeckRestoreResult: Equatable {
+    var ok = false
+    var text: String
+    var setAside: String?       // where the folder it replaced went
+    var identical = false       // the profile is now byte for byte the copy
+}
+
+/// Puts a profile's last-good copy back, only while Stream Deck is closed: the copy goes into a hidden
+/// folder next to the profile, is checked identical, then swaps places with it in one step
+/// (`renamex_np` RENAME_SWAP; a plain rename when it's gone). What it replaced is moved aside into
+/// Booth Check's folder, never deleted. Then the profile is re-checked against the copy.
+func restoreDeckProfile(uuid: String, profilesFolder: String, store: DeckCopyStore, deckRunning: () -> Bool,
+                        now: Date = Date()) -> DeckRestoreResult {
+    let fm = FileManager.default
+    guard let copy = store.good, let source = store.goodFolder else { return DeckRestoreResult(text: "Booth Check has no copy of it.") }
+    if deckRunning() { return DeckRestoreResult(text: "Stream Deck is running, so nothing was changed.") }
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: profilesFolder, isDirectory: &isDir), isDir.boolValue else {
+        return DeckRestoreResult(text: "Stream Deck\u{2019}s profiles folder isn\u{2019}t there (\(profilesFolder)), so nothing was changed.")
+    }
+    let target = deckProfileFolder(uuid: uuid, in: profilesFolder) ?? profilesFolder + "/" + copy.folder
+    if deckTreesIdentical(target, source) {
+        return DeckRestoreResult(ok: true, text: "It already matches the copy from \(deckCopyDateText(copy.savedAt)) byte for byte; nothing changed.", identical: true)
+    }
+    let tmp = profilesFolder + "/." + (target as NSString).lastPathComponent + ".boothcheck-restore"
+    try? fm.removeItem(atPath: tmp)                 // Booth Check's own, from a restore that stopped half-way
+    do { try fm.copyItem(atPath: source, toPath: tmp) } catch {
+        try? fm.removeItem(atPath: tmp)
+        return DeckRestoreResult(text: "Couldn\u{2019}t copy it next to the profile (\(error.localizedDescription)). Nothing was changed.")
+    }
+    guard deckTreesIdentical(tmp, source) else {
+        try? fm.removeItem(atPath: tmp)
+        return DeckRestoreResult(text: "The copy didn\u{2019}t come out identical, so nothing was changed.")
+    }
+    if deckRunning() {
+        try? fm.removeItem(atPath: tmp)
+        return DeckRestoreResult(text: "Stream Deck started, so nothing was changed.")
+    }
+    var r = DeckRestoreResult(text: "")
+    if fm.fileExists(atPath: target) {
+        guard renamex_np(tmp, target, UInt32(RENAME_SWAP)) == 0 else {
+            let e = String(cString: strerror(errno))
+            try? fm.removeItem(atPath: tmp)
+            return DeckRestoreResult(text: "Couldn\u{2019}t swap it in (\(e)). Nothing was changed.")
+        }
+        // `tmp` now holds what was there: aside into Booth Check's folder.
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HHmmss"
+        var aside = store.setAside + "/" + f.string(from: now)
+        var n = 2
+        while fm.fileExists(atPath: aside) { aside = store.setAside + "/" + f.string(from: now) + " \(n)"; n += 1 }
+        do {
+            try fm.createDirectory(atPath: aside, withIntermediateDirectories: true)
+            try fm.moveItem(atPath: tmp, toPath: aside + "/" + (target as NSString).lastPathComponent)
+            r.setAside = aside + "/" + (target as NSString).lastPathComponent
+        } catch {
+            r.setAside = tmp
+        }
+        pruneDeckSetAside(store.setAside, keep: 3)
+    } else {
+        guard rename(tmp, target) == 0 else {
+            let e = String(cString: strerror(errno))
+            try? fm.removeItem(atPath: tmp)
+            return DeckRestoreResult(text: "Couldn\u{2019}t move it into place (\(e)). Nothing was changed.")
+        }
+    }
+    r.identical = deckTreesIdentical(target, source)
+    let health = deckProfileHealth(dir: target, expectKeys: copy.keys > 0)
+    if case .healthy = health { r.ok = r.identical } else { r.ok = false }
+    r.text = "Put back the copy from \(deckCopyDateText(copy.savedAt)) (\(copy.pages) pages, \(copy.keys) MIDI keys) into \(target)."
+        + (r.identical ? " It now matches the copy byte for byte." : " It doesn\u{2019}t match the copy afterwards.")
+        + (r.ok ? "" : " Re-check: \(health.why).")
+        + (r.setAside.map { " What was there is kept in \($0)." } ?? "")
+    return r
+}
+
+/// Keeps the newest `keep` set-aside folders; older ones go to the Trash (they came from Stream Deck's folder).
+func pruneDeckSetAside(_ dir: String, keep: Int) {
+    let fm = FileManager.default
+    let names = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { !$0.hasPrefix(".") }.sorted()
+    for n in names.dropLast(keep) { try? fm.trashItem(at: URL(fileURLWithPath: dir + "/" + n), resultingItemURL: nil) }
+}
+
+var deckBackupsRoot: String { DiagFiles.standard.supportDir + "/deck-backups" }
+var streamDeckLogPath: String { NSHomeDirectory() + "/Library/Logs/ElgatoStreamDeck/StreamDeck.log" }
+
+/// Whether Stream Deck is stuck on its own launch question ("Stream Deck detected an error restoring the
+/// last session… restore the backup from today?"): its current log proposed the restore and its event
+/// loop hasn't started since (it only starts once someone answers; dev Mac, 15 Nov 2026).
+func streamDeckAsksToRestore(log: String) -> Bool {
+    guard let r = log.range(of: "propose restore backup to user", options: .backwards) else { return false }
+    return !log[r.upperBound...].contains("Application event loop start")
+}
+
+/// One profile's folder (where it is, or where it would be), its health and its last-good copy.
+func deckDiskState(uuid: String, read: DeckProfilesRead, root: String = deckBackupsRoot)
+    -> (uuid: String, dir: String, health: DeckProfileHealth, copy: DeckCopyInfo?) {
+    let store = DeckCopyStore(root: root, uuid: uuid)
+    let copy = store.good
+    let dir = deckProfileFolder(uuid: uuid, in: read.folder)
+        ?? (read.folder ?? streamDeckSupportDir + "/ProfilesV3") + "/" + (copy?.folder ?? uuid.uppercased() + ".sdProfile")
+    return (uuid.lowercased(), dir, deckProfileHealth(dir: dir, expectKeys: (copy?.keys ?? 0) > 0), copy)
+}
+
+/// Which profiles Booth Check looks after: the one chosen in This Mac (by `matchDeckProfile`; its own
+/// UUID when it's missing, so its copy can come back; none when it's ambiguous), else each deck's
+/// preferred profile that is there or has a copy (`hasCopy`).
+func deckProfilesToMend(choice: DeckProfileChoice?, read: DeckProfilesRead, preferred: [String: String],
+                        hasCopy: (String) -> Bool) -> [(uuid: String, name: String)] {
+    if let choice {
+        // Its own folder is there but can't be read: that's the one, even when another profile has the
+        // same keys (dev Mac, 15 Nov 2026: a broken copy's keys matched another profile, which was
+        // then taken for it). Matching by keys or name is for a re-import under a new UUID.
+        let own = choice.uuid.lowercased()
+        if deckProfileFolder(uuid: own, in: read.folder) != nil, !read.profiles.contains(where: { $0.uuid == own }) {
+            return [(own, choice.name)]
+        }
+        switch matchDeckProfile(choice, in: read.profiles) {
+        case .found(let p, _): return [(p.uuid, p.name)]
+        case .missing: return [(choice.uuid.lowercased(), choice.name)]
+        case .ambiguous: return []
+        }
+    }
+    return Set(preferred.values).sorted().compactMap { uuid in
+        let folder = deckProfileFolder(uuid: uuid, in: read.folder)
+        guard folder != nil || hasCopy(uuid) else { return nil }
+        return (uuid, read.profiles.first { $0.uuid == uuid }?.name ?? "the deck\u{2019}s profile")
+    }
+}
+
+/// What to do for one profile, before Stream Deck opens.
+enum DeckMendAction: Equatable {
+    case keep                   // healthy: (copy it if it changed)
+    case restore                // broken or missing, and there's a copy
+    case noCopy                 // broken or missing, and no copy to put back
+    case leave(String)          // don't touch it, and why
+}
+
+/// Automatic restores only while Stream Deck is closed, only for a profile that's objectively broken
+/// or missing, at most `maxAutomatic` a session (the post-launch retry counts too). A person's
+/// Restore… button (`automatic` false) is only held back by Stream Deck running.
+func deckMendDecision(health: DeckProfileHealth, hasCopy: Bool, deckRunning: Bool, automatic: Bool,
+                      restoresSoFar: Int, maxAutomatic: Int = 3) -> DeckMendAction {
+    if deckRunning { return .leave("Stream Deck is running") }
+    switch health {
+    case .healthy: return .keep
+    case .unknownShape(let w): return .leave("\(w), so Booth Check leaves it alone")
+    case .missing, .broken:
+        guard hasCopy else { return .noCopy }
+        if automatic && restoresSoFar >= maxAutomatic {
+            return .leave("Booth Check already put it back \(restoresSoFar) times this session, so it leaves it for a person")
+        }
+        return .restore
+    }
+}
+
+/// After Stream Deck opens: one more automatic try (quit, restore, reopen) when the profile broke again,
+/// never more (attempt 0 is the first launch).
+func deckRelaunchRetryAllowed(attempt: Int, health: DeckProfileHealth, hasCopy: Bool) -> Bool {
+    attempt == 0 && health.isBroken && hasCopy
+}
+
+/// The steps the Restore sheet shows.
+func deckRestoreSteps(name: String, copy: DeckCopyInfo, profilesFolder: String, store: DeckCopyStore) -> String {
+    """
+    1. Quit Stream Deck (NSRunningApplication.terminate; made to quit after 5 s)
+    2. With Stream Deck closed, put back Booth Check\u{2019}s copy of \u{201C}\(name)\u{201D} from \(deckCopyDateText(copy.savedAt)) (\(copy.pages) pages, \(copy.keys) MIDI keys):
+       copy \(store.goodDir)/\(copy.folder)
+         \u{2192} \(profilesFolder)/.\(copy.folder).boothcheck-restore, check it\u{2019}s identical
+       renamex_np(RENAME_SWAP) it with \(profilesFolder)/\(copy.folder)
+       move what was there to \(store.setAside)/<date and time>/\(copy.folder)
+    3. Reset its saved key lights, then open Stream Deck in the background
+    4. About 10 s later, check the profile is still healthy and Stream Deck is on it
+    """
 }
 
 /// Whether a start-up gets the hands-off sign: only the one that runs by itself at login (the user
@@ -2538,6 +2966,7 @@ enum Action {
     case noStreamDeck
     case switchDeckProfile(device: String, to: String, from: String, name: String)
     case acceptDeckProfile
+    case restoreDeckProfile(uuid: String, name: String)
     case openApp(String, String)        // bundle ID, name
     case openSetup
     case open(URL, String)
@@ -2563,6 +2992,7 @@ enum Action {
         case .noStreamDeck: return "No Stream Deck on this Mac"
         case .switchDeckProfile: return "Switch Stream Deck to it\u{2026}"
         case .acceptDeckProfile: return "Use it as it is now"
+        case .restoreDeckProfile: return "Restore the Stream Deck\u{2019}s keys\u{2026}"
         case .openApp(_, let name): return "Open \(name)"
         case .openSetup: return "This Mac\u{2026}"
         case .open(_, let label): return label
@@ -2646,7 +3076,10 @@ struct Snapshot {
     var deckProfiles: DeckProfilesRead?     // Stream Deck's profiles (nil: Stream Deck is off here)
     var deckPreferred: [String: String] = [:]   // each deck's preferred profile, from its preferences
     var deckPrefsProblem: String?
-    var bootValue: String?                 // the firmware setting; nil = not set = factory setting
+    /// The service profile on disk and its last-good copy (Nov 2026), when a profile is chosen.
+    var deckDisk: (uuid: String, health: DeckProfileHealth, copy: DeckCopyInfo?)?
+    var deckAsksToRestore = false           // Stream Deck's "restore the backup from today?" is up (its log)
+    var bootValue: String?                // the firmware setting; nil = not set = factory setting
     var bootReadFailed = false
 }
 
@@ -2814,12 +3247,18 @@ final class Booth: ObservableObject {
     var deckProfileWriteFailed = false
     var lastDeckProfileDiag: String?
     var deckProfileSwitching = false
+    /// Automatic restores of a Stream Deck profile this session (`deckMendDecision` caps them), whether
+    /// the last automatic one didn't hold after Stream Deck opened (the row says so), and a restore by
+    /// the button under way.
+    var deckAutoRestores = 0
+    var deckRepairFailed = false
+    var deckRestoring = false
     /// Stream Deck restarts under way (`restartStreamDeck`: the start-up, a Lightkey launch, the helper
     /// install, a profile switch). See `streamDeckClosedOnPurpose`.
     var deckRestartsRunning = 0
     /// Booth Check has closed Stream Deck on purpose (or is about to): a restart or a profile switch
     /// under way. The shutdown has `shuttingDown`. Nothing may reopen it meanwhile.
-    var streamDeckClosedOnPurpose: Bool { deckRestartsRunning > 0 || deckProfileSwitching }
+    var streamDeckClosedOnPurpose: Bool { deckRestartsRunning > 0 || deckProfileSwitching || deckRestoring }
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
@@ -2969,6 +3408,7 @@ final class Booth: ObservableObject {
         let lightkeyPID = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
         let deckHelperSwitchedOn = setup.lightkey && setup.streamDeck && setup.deckLights != false
         let deckOn = setup.streamDeck
+        let deckChoice = setup.deckProfile
         let show = showPath
         DispatchQueue.global(qos: .userInitiated).async {
             let pass = Pass()
@@ -2993,6 +3433,22 @@ final class Booth: ObservableObject {
                          prefs.problem ?? (prefs.preferred.isEmpty ? "(no decks listed)" : prefs.preferred.sorted { $0.key < $1.key }.map { k, v in
                             "\(k): \(v)" + (read.profiles.first { $0.uuid == v }.map { " (\u{201C}\($0.name)\u{201D})" } ?? "")
                          }.joined(separator: "\n")))
+                // Stream Deck's own "restore the backup?" question, from its log (Nov 2026). Read only.
+                if let log = try? String(contentsOfFile: streamDeckLogPath, encoding: .utf8) {
+                    s.deckAsksToRestore = streamDeckAsksToRestore(log: log)
+                    if s.deckAsksToRestore {
+                        pass.api("Stream Deck's question at launch", "FileManager: read \(streamDeckLogPath)",
+                                 "Its log says \u{201C}Detected data loss - propose restore backup to user\u{201D} and it hasn\u{2019}t started since: its window asks whether to restore its backup from today.")
+                    }
+                }
+                // The service profile's files and Booth Check's last-good copy of it (Nov 2026). Read only.
+                if let choice = deckChoice, read.folder != nil,
+                   let t = deckProfilesToMend(choice: choice, read: read, preferred: prefs.preferred, hasCopy: { _ in true }).first {
+                    let d = deckDiskState(uuid: t.uuid, read: read)
+                    s.deckDisk = (d.uuid, d.health, d.copy)
+                    pass.api("The service profile on disk", "FileManager: read \(d.dir)/manifest.json and Profiles/*/manifest.json; \(DeckCopyStore(root: deckBackupsRoot, uuid: t.uuid).goodInfo)",
+                             "\u{201C}\(t.name)\u{201D}: \(d.health.why)." + (d.copy.map { " Last-good copy from \(deckCopyDateText($0.savedAt)) (\($0.pages) pages, \($0.keys) MIDI keys)." } ?? " No last-good copy yet."))
+                }
             }
             // The deck lights helper: switched on here, or not decided yet (then it's looked for).
             if deckHelperOn {
@@ -3208,7 +3664,12 @@ final class Booth: ObservableObject {
                     detail: "No Stream Deck found on USB.", fix: "Check the Stream Deck's USB cable."))
 
         let deckInstalled = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) != nil
-        if deckApp != nil {
+        if deckApp != nil && s.deckAsksToRestore {
+            // Nov 2026: Stream Deck's own question at launch blocks it (and its keys) until answered.
+            out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .fail,
+                             detail: "Stream Deck is waiting for an answer: it asks whether to restore its backup from today, and its keys don\u{2019}t work until someone answers.",
+                             fix: "In Stream Deck\u{2019}s window, click Restore."))
+        } else if deckApp != nil {
             out.append(Check(id: "deckapp", group: "Stream Deck", title: "Stream Deck app running", status: .ok,
                              detail: "The Stream Deck app is open."))
         } else if deckInstalled {
@@ -3241,9 +3702,11 @@ final class Booth: ObservableObject {
         }
         if let read = s.deckProfiles {
             if read != deckProfiles { deckProfiles = read }
+            // Plain values set here, in the pass's finish, never from a view (see the MenuBarExtra gotcha).
+            if let d = s.deckDisk, !d.health.isBroken { deckRepairFailed = false }
             if let choice = setup.deckProfile {
                 let check = deckProfileCheck(choice: choice, read: read, preferred: s.deckPreferred, prefsProblem: s.deckPrefsProblem,
-                                             writeFailed: deckProfileWriteFailed)
+                                             writeFailed: deckProfileWriteFailed, disk: s.deckDisk, repairFailed: deckRepairFailed)
                 out.append(check)
                 diagDeckProfile(choice: choice, read: read, preferred: s.deckPreferred, check: check)
             }
@@ -3662,6 +4125,23 @@ final class Booth: ObservableObject {
             setup.deckProfile = DeckProfileChoice(p)
             logSetting("This Mac: \u{201C}\(p.name)\u{201D} kept as it is now",
                        "Its keys changed since it was chosen (keys \(choice.sigHash) \u{2192} \(p.sigHash)); Booth Check now expects them as they are.")
+        case .restoreDeckProfile(let uuid, let name):
+            let store = DeckCopyStore(root: deckBackupsRoot, uuid: uuid)
+            guard let copy = store.good else {
+                message = "Booth Check has no copy of \u{201C}\(name)\u{201D} yet: import its .streamDeckProfile file again in Stream Deck."
+                return
+            }
+            let folder = deckProfiles.folder ?? streamDeckSupportDir + "/ProfilesV3"
+            pending = PendingChange(
+                key: "deckRestore", title: "Put back the Stream Deck\u{2019}s keys (\u{201C}\(name)\u{201D})",
+                explanation: "Stream Deck closes for a few seconds and its keys go dark meanwhile. Booth Check puts back its copy of \u{201C}\(name)\u{201D} from \(deckCopyDateText(copy.savedAt)), the last time it found the profile healthy, resets its saved key lights and opens Stream Deck again in the background; about 10 seconds later it checks the profile is still healthy. Nothing is deleted: the profile as it is now is moved aside into Booth Check\u{2019}s folder. No password needed. Each step goes in the Log.",
+                language: "Booth Check steps", code: deckRestoreSteps(name: name, copy: copy, profilesFolder: folder, store: store),
+                undo: "Quit Stream Deck, then move the folder kept in \(store.setAside)/<date and time>/\(copy.folder) back into \(folder) in place of the restored one, and open Stream Deck.",
+                run: {
+                    DispatchQueue.main.async { self.restoreDeckProfileByHand(uuid: uuid, name: name) }
+                    return ("Putting the keys back now. Each step goes in the Log.", 0)
+                })
+            return
         case .noStreamDeck:
             setup.streamDeck = false
             logSetting("This Mac has no Stream Deck", "Stream Deck checks switched off; Get the show started no longer opens it.")
@@ -4433,13 +4913,16 @@ extension Booth {
 
         case "deck":
             // 1.32: the profile that goes with the show, switched in the gap while Stream Deck is closed.
-            let profileFix = deckProfileFixNeeded()
+            // Nov 2026: first a broken or missing profile is put back from its last-good copy
+            // (`mendDeckProfiles`), so the switch is worked out on the profile as it now is.
+            var profileFix: (device: String, target: String, name: String)?
             var wrote: (ok: Bool, text: String)?
             let write = {
+                profileFix = self.deckProfileFixNeeded(during: "Start-up")
                 guard let f = profileFix else { return }
+                self.showWorkingSign(.deckProfileSwitching(f.name))
                 wrote = self.setPreferredProfile(device: f.device, to: f.target, name: f.name, during: "Start-up")
             }
-            if let f = profileFix { showWorkingSign(.deckProfileSwitching(f.name)) }
             let finish: ((state: StepState, detail: String, opened: Bool)) -> Void = { incoming in
                 var result = incoming
                 if let f = profileFix {
@@ -4457,14 +4940,25 @@ extension Booth {
                         self.diagEvent("self_repair", ["what": .string("deck_profile"), "why": .string("Start-up"), "result": .string("failed")])
                     }
                 }
-                self.setStep(i, result.state, result.detail)
                 // When the show comes next, give the plugin a few seconds to connect to Lightkey first,
-                // so it's listening when Lightkey sends every cue's state as the show opens.
+                // so it's listening when Lightkey sends every cue's state as the show opens. Meanwhile
+                // (Nov 2026) Booth Check checks the profile is still healthy once Stream Deck is up
+                // (`confirmDeckAfterLaunch`, one automatic retry if it isn't).
                 let showNext = self.bootSteps.indices.contains(i + 1) && self.bootSteps[i + 1].id == "lightkey"
-                if result.opened && showNext {
-                    self.setStep(i, result.state, result.detail + " Giving it a few seconds to connect before the show opens.")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { next() }
+                guard result.opened else {
+                    self.setStep(i, result.state, result.detail)
+                    return next()
+                }
+                if showNext {
+                    self.setStep(i, .running, result.detail + " Giving it a few seconds to connect before the show opens.")
                 } else {
+                    self.setStep(i, result.state, result.detail)
+                    next()
+                }
+                self.confirmDeckAfterLaunch(during: "Start-up") { ok in
+                    guard showNext else { return }
+                    self.setStep(i, ok ? result.state : .warn, result.detail
+                                 + (ok ? "" : " Its keys may not work: open Booth Check, the Stream Deck row says what to press."))
                     next()
                 }
             }
@@ -4474,8 +4968,10 @@ extension Booth {
                 setStep(i, .running, "Restarting it so every key starts clean\u{2026}")
                 restartStreamDeck(during: "Start-up", whileClosed: write, clearKeys: true, then: finish)
             } else {
+                let closed = !isRunning(IDs.streamDeck)
+                if closed { mendDeckProfiles(during: "Start-up") }
                 write()
-                if !isRunning(IDs.streamDeck) { clearDeckKeyLights(during: "Start-up") }
+                if closed { clearDeckKeyLights(during: "Start-up") }
                 finish(openStreamDeckInBackground(during: "Start-up"))
             }
 
@@ -4593,6 +5089,9 @@ extension Booth {
                                         output: "A key left lit (a colour, a house level) stays lit when Lightkey restarts: the deck can't be told a cue is off."
                                             + (clearKeys ? " Its saved key lights are reset while it's closed (next entry), since Stream Deck brings a key back lit if it was saved lit." : ""),
                                         status: 0), at: 0)
+                // Nov 2026: a broken or missing profile is put back first, then the gap's own work,
+                // then the last-good copy and the key reset (`clearDeckKeyLights`).
+                if clearKeys { mendDeckProfiles(during: what) }
                 whileClosed?()
                 if clearKeys { clearDeckKeyLights(during: what) }
                 let result = openStreamDeckInBackground(during: what)
@@ -4605,12 +5104,12 @@ extension Booth {
         look()
     }
 
-    /// With Stream Deck closed: resets the saved lit state of the MIDI keys on every page of the profile
-    /// the deck will show (`deckProfilesToClear`), so no key comes up lit from the last service and
-    /// Lightkey drives them from then on. One backup per page, overwritten each time. Logged, with a
-    /// `deck_keys_cleared` event. Never stops the start-up: anything unexpected is skipped and logged.
+    /// With Stream Deck closed: keeps a last-good copy of each profile the deck will show
+    /// (`deckProfilesToClear`, `snapshotDeckProfile`: only when it's healthy and changed), then resets
+    /// the saved lit state of its MIDI keys, so no key comes up lit from the last service and Lightkey
+    /// drives them from then on. A profile Booth Check has no copy of as it is now isn't reset. Logged,
+    /// with a `deck_keys_cleared` event. Never stops the start-up: anything unexpected is skipped and logged.
     func clearDeckKeyLights(during what: String) {
-        let backupDir = DiagFiles.standard.supportDir + "/deck-backups"
         var lines: [String] = []
         var keys = 0, pages = 0, profilesDone = 0, skipped = 0
         var ok = true
@@ -4630,8 +5129,19 @@ extension Booth {
                 guard let dir = deckProfileFolder(uuid: p.uuid, in: read.folder) else {
                     lines.append("\u{201C}\(p.name)\u{201D}: its folder wasn\u{2019}t found; skipped."); ok = false; continue
                 }
-                let results = clearDeckKeyStates(profileDir: dir, backupDir: backupDir, deckRunning: { self.isRunning(IDs.streamDeck) })
-                lines.append(deckClearText(profile: p, results: results, backupFolder: backupDir + "/" + (dir as NSString).lastPathComponent))
+                let store = DeckCopyStore(root: deckBackupsRoot, uuid: p.uuid)
+                let snap = snapshotDeckProfile(dir: dir, store: store, deckRunning: { self.isRunning(IDs.streamDeck) })
+                lines.append(deckSnapshotText(name: p.name, snap, store: store))
+                if case .saved(let c, let old) = snap {
+                    diagEvent("deck_profile_copy", ["pages": .int(c.pages), "keys": .int(c.keys), "kb": .int(c.bytes / 1024),
+                                                    "why": .string(what), "first": .int(old == nil ? 1 : 0)])
+                }
+                guard snap.copy != nil else {
+                    lines.append("\u{201C}\(p.name)\u{201D}: its saved key lights weren\u{2019}t reset, since Booth Check has no copy of it as it is now.")
+                    ok = false; skipped += 1; continue
+                }
+                let results = clearDeckKeyStates(profileDir: dir, deckRunning: { self.isRunning(IDs.streamDeck) })
+                lines.append(deckClearText(profile: p, results: results, backupFolder: store.goodDir))
                 profilesDone += 1
                 for r in results where r.written { keys += r.resets.count; pages += 1 }
                 let left = results.filter { $0.skipped != nil }.count
@@ -4639,12 +5149,177 @@ extension Booth {
                 if left > 0 { ok = false }
             }
         }
-        changes.insert(LogEntry(title: "\(what): reset Stream Deck\u{2019}s saved key lights" + (keys > 0 ? " (\(keys) key\(keys == 1 ? "" : "s"))" : ""),
+        changes.insert(LogEntry(title: "\(what): kept a copy of the Stream Deck profile and reset its saved key lights" + (keys > 0 ? " (\(keys) key\(keys == 1 ? "" : "s"))" : ""),
                                 language: "macOS API",
-                                code: "In each page\u{2019}s manifest.json of the profile the deck will show: \"State\": 1 \u{2192} 0 on MIDI keys only, nothing else in the file changed; backup first, atomic write, only while Stream Deck is closed",
+                                code: "Copy the profile the deck will show to \(deckBackupsRoot)/<profile>/good when it\u{2019}s healthy and changed (one copy, replaced); then in each page\u{2019}s manifest.json: \"State\": 1 \u{2192} 0 on MIDI keys only, nothing else in the file changed; atomic write, only while Stream Deck is closed",
                                 output: lines.joined(separator: "\n"), status: ok ? 0 : 1), at: 0)
         diagEvent("deck_keys_cleared", ["why": .string(what), "keys": .int(keys), "pages": .int(pages),
                                         "profiles": .int(profilesDone), "skipped": .int(skipped), "result": .string(ok ? "ok" : "skipped")])
+    }
+
+    /// With Stream Deck closed (the start-up, the restart after Lightkey starts, the Restore button):
+    /// each profile Booth Check looks after (`deckProfilesToMend`) is checked on disk, and one that's
+    /// objectively broken or missing gets its last-good copy back (`deckMendDecision`,
+    /// `restoreDeckProfile`), with the sign saying so. A healthy one is left as it is. Logged, with a
+    /// `deck_profile_restored` event per restore. Returns the restored profiles' UUIDs.
+    @discardableResult
+    func mendDeckProfiles(during what: String) -> [String] {
+        guard setup.streamDeck else { return [] }
+        let read = readDeckProfiles()
+        guard let folder = read.folder else { return [] }      // no profiles folder: the row says so
+        let prefs = deckPreferredProfiles(readStreamDeckDevices())
+        let targets = deckProfilesToMend(choice: setup.deckProfile, read: read, preferred: prefs.preferred,
+                                         hasCopy: { DeckCopyStore(root: deckBackupsRoot, uuid: $0).good != nil })
+        guard !targets.isEmpty else { return [] }
+        var lines: [String] = [], restored: [String] = [], failed = false
+        for t in targets {
+            let d = deckDiskState(uuid: t.uuid, read: read)
+            let store = DeckCopyStore(root: deckBackupsRoot, uuid: t.uuid)
+            switch deckMendDecision(health: d.health, hasCopy: d.copy != nil, deckRunning: isRunning(IDs.streamDeck),
+                                    automatic: true, restoresSoFar: deckAutoRestores) {
+            case .keep:
+                lines.append("\u{201C}\(t.name)\u{201D} (\(d.dir)): healthy, left as it is.")
+            case .leave(let why):
+                lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why); left alone: \(why).")
+                if d.health.isBroken { failed = true }
+            case .noCopy:
+                lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why), and Booth Check has no copy of it yet, so it can\u{2019}t put it back. Import its .streamDeckProfile file again in Stream Deck.")
+                failed = true
+            case .restore:
+                showWorkingSign(.deckKeysRestoring)
+                let r = restoreDeckProfile(uuid: t.uuid, profilesFolder: folder, store: store, deckRunning: { self.isRunning(IDs.streamDeck) })
+                deckAutoRestores += 1
+                lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why). " + r.text)
+                if r.ok { restored.append(t.uuid) } else { failed = true }
+                diagEvent("deck_profile_restored", ["why": .string(d.health.why), "during": .string(what), "how": .string("automatic"),
+                                                    "result": .string(r.ok ? "ok" : "failed"), "identical": .int(r.identical ? 1 : 0),
+                                                    "pages": .int(d.copy?.pages ?? 0), "keys": .int(d.copy?.keys ?? 0),
+                                                    "copy_age_h": .int(Int(Date().timeIntervalSince(d.copy?.savedAt ?? Date()) / 3600))])
+                endWorkingSign(r.ok ? .deckKeysRestored : .deckKeysRestoreFailed, ok: r.ok)
+            }
+        }
+        changes.insert(LogEntry(title: "\(what): checked the Stream Deck profile on disk" + (restored.isEmpty ? "" : ", put it back from Booth Check\u{2019}s copy"),
+                                language: "macOS API",
+                                code: "FileManager: read the profile\u{2019}s manifest.json and Profiles/*/manifest.json; if it\u{2019}s gone, not JSON or a page is missing, and Stream Deck is closed: put back \(deckBackupsRoot)/<profile>/good (copy next to it, check identical, renamex_np RENAME_SWAP, the old one moved to set-aside)",
+                                output: lines.joined(separator: "\n"), status: failed ? 1 : 0), at: 0)
+        // The deck may have fallen back to another profile while the service one was gone.
+        if !restored.isEmpty, what != "Start-up", let f = deckProfileFixNeeded(during: what) {
+            setPreferredProfile(device: f.device, to: f.target, name: f.name, during: what)
+        }
+        return restored
+    }
+
+    /// About 10 s after Stream Deck opened (the start-up, the restarts): checks what can be checked
+    /// without a person (it's running, the deck is seen, the service profile is still healthy on disk,
+    /// the deck is still on it) and logs it. If the profile broke again, one more automatic try (quit,
+    /// restore, reopen: `deckRelaunchRetryAllowed`), never more; then the row offers the button.
+    func confirmDeckAfterLaunch(during what: String, attempt: Int = 0, then done: @escaping (Bool) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            guard !self.shuttingDown else { return done(true) }
+            let running = self.isRunning(IDs.streamDeck)
+            let deckSeen = self.checks.first { $0.id == "deck" }?.status == .ok
+            let read = readDeckProfiles()
+            let prefs = deckPreferredProfiles(readStreamDeckDevices())
+            let targets = deckProfilesToMend(choice: self.setup.deckProfile, read: read, preferred: prefs.preferred,
+                                             hasCopy: { DeckCopyStore(root: deckBackupsRoot, uuid: $0).good != nil })
+            var lines = ["Stream Deck " + (running ? "is running." : "isn\u{2019}t running."),
+                         "The deck " + (deckSeen ? "is plugged in (last check)." : "isn\u{2019}t seen on USB (last check).")]
+            var broken: (uuid: String, name: String, health: DeckProfileHealth, hasCopy: Bool)?
+            for t in targets {
+                let d = deckDiskState(uuid: t.uuid, read: read)
+                lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why).")
+                if d.health.isBroken, broken == nil { broken = (t.uuid, t.name, d.health, d.copy != nil) }
+                if let p = read.profiles.first(where: { $0.uuid == t.uuid }) {
+                    let on = prefs.preferred[p.device]
+                    lines.append(on == nil ? "Its deck isn\u{2019}t in Stream Deck\u{2019}s settings." : on == p.uuid ? "The deck is on it." : "The deck is on \(on!), not on it.")
+                }
+            }
+            if targets.isEmpty { lines.append("No profile chosen and no deck\u{2019}s profile to check.") }
+            let asks = running && streamDeckAsksToRestore(log: (try? String(contentsOfFile: streamDeckLogPath, encoding: .utf8)) ?? "")
+            if asks {
+                lines.append("Stream Deck is asking whether to restore its backup from today (its log: \u{201C}propose restore backup to user\u{201D}); its keys don\u{2019}t work until someone clicks Restore.")
+                self.changes.insert(LogEntry(title: "\(what): Stream Deck is asking to restore its backup", language: "macOS API",
+                                             code: "FileManager: read \(streamDeckLogPath)", output: lines.joined(separator: "\n"), status: 1), at: 0)
+                self.diagEvent("self_repair", ["what": .string("deck_profile_restore"), "why": .string("Stream Deck asks to restore its backup"),
+                                               "result": .string("asks_restore"), "attempt": .int(attempt)])
+                self.refresh()
+                return done(false)
+            }
+            let retry = broken.map { deckRelaunchRetryAllowed(attempt: attempt, health: $0.health, hasCopy: $0.hasCopy) } ?? false
+                && self.deckAutoRestores < 3 && !self.streamDeckClosedOnPurpose && !self.shuttingDown
+            if broken != nil {
+                lines.append(retry ? "The profile broke after Stream Deck opened: one more try (quit Stream Deck, put the copy back, open it again)."
+                                   : "The profile is still broken: Booth Check stops here; the row offers Restore the Stream Deck\u{2019}s keys\u{2026}")
+            }
+            self.changes.insert(LogEntry(title: "\(what): checked Stream Deck after it opened" + (broken == nil ? "" : ": the profile is damaged"),
+                                         language: "macOS API",
+                                         code: "NSRunningApplication (Stream Deck); the last USB check; FileManager: the profile\u{2019}s manifests; CFPreferencesCopyAppValue(\"Devices\", \"\(IDs.streamDeck)\"), 10 s after it opened",
+                                         output: lines.joined(separator: "\n"), status: broken == nil && running ? 0 : 1), at: 0)
+            guard let b = broken else { return done(true) }
+            if retry {
+                self.restartStreamDeck(during: "\(what), second try", clearKeys: true) { _ in
+                    self.confirmDeckAfterLaunch(during: "\(what), second try", attempt: attempt + 1, then: done)
+                }
+                return
+            }
+            self.deckRepairFailed = true
+            self.diagEvent("self_repair", ["what": .string("deck_profile_restore"), "why": .string(b.health.why),
+                                           "result": .string(b.hasCopy ? "broke_again" : "no_copy"), "attempt": .int(attempt)])
+            self.refresh()
+            done(false)
+        }
+    }
+
+    /// The row's Restore the Stream Deck's keys… button, after the change sheet's Run: Stream Deck closes, the copy
+    /// goes back (`restoreDeckProfile`, even over a healthy profile: a person asked), the key lights are
+    /// reset, Stream Deck opens, and `confirmDeckAfterLaunch` checks it. The sign says what's happening.
+    func restoreDeckProfileByHand(uuid: String, name: String) {
+        guard !streamDeckClosedOnPurpose, !shuttingDown, !starting else {
+            logSetting("Restore the Stream Deck\u{2019}s keys: not now", "Booth Check is already starting, shutting down or restarting Stream Deck, so nothing was changed. Try again in a minute.")
+            return
+        }
+        deckRestoring = true
+        showWorkingSign(.deckKeysRestoring)
+        var result = DeckRestoreResult(text: "Stream Deck didn\u{2019}t close, so nothing was changed.")
+        let put = {
+            let read = readDeckProfiles()
+            guard let folder = read.folder else {
+                result = DeckRestoreResult(text: "Stream Deck has no profiles folder here, so nothing was changed.")
+                return
+            }
+            let store = DeckCopyStore(root: deckBackupsRoot, uuid: uuid)
+            let copy = store.good
+            result = restoreDeckProfile(uuid: uuid, profilesFolder: folder, store: store, deckRunning: { self.isRunning(IDs.streamDeck) })
+            self.changes.insert(LogEntry(title: "Restore the Stream Deck\u{2019}s keys: put back \u{201C}\(name)\u{201D}", language: "Booth Check steps",
+                                         code: copy.map { deckRestoreSteps(name: name, copy: $0, profilesFolder: folder, store: store) } ?? "(no copy)",
+                                         output: result.text, status: result.ok ? 0 : 1), at: 0)
+            self.diagEvent("deck_profile_restored", ["why": .string(deckDiskState(uuid: uuid, read: read).health.why), "during": .string("service"),
+                                                     "how": .string("button"), "result": .string(result.ok ? "ok" : "failed"),
+                                                     "identical": .int(result.identical ? 1 : 0), "pages": .int(copy?.pages ?? 0), "keys": .int(copy?.keys ?? 0),
+                                                     "copy_age_h": .int(Int(Date().timeIntervalSince(copy?.savedAt ?? Date()) / 3600))])
+            if result.ok, let f = self.deckProfileFixNeeded(during: "Restore the Stream Deck\u{2019}s keys") {
+                self.setPreferredProfile(device: f.device, to: f.target, name: f.name, during: "Restore the Stream Deck\u{2019}s keys")
+            }
+            if result.ok { self.deckRepairFailed = false }
+        }
+        let opened = { (r: (state: StepState, detail: String, opened: Bool)) in
+            self.deckRestoring = false
+            guard result.ok else {
+                self.endWorkingSign(.deckKeysRestoreFailed, ok: false)
+                return self.refresh()
+            }
+            self.confirmDeckAfterLaunch(during: "Restore the Stream Deck\u{2019}s keys", attempt: 1) { ok in
+                self.endWorkingSign(ok ? .deckKeysRestored : .deckKeysRestoreFailed, ok: ok)
+                self.refresh()
+            }
+        }
+        if isRunning(IDs.streamDeck) {
+            restartStreamDeck(during: "Restore the Stream Deck\u{2019}s keys", whileClosed: put, clearKeys: true, then: opened)
+        } else {
+            put()
+            clearDeckKeyLights(during: "Restore the Stream Deck\u{2019}s keys")
+            opened(openStreamDeckInBackground(during: "Restore the Stream Deck\u{2019}s keys"))
+        }
     }
 
     /// Lightkey started outside a start-up (by hand, or after a crash) while Stream Deck is open: once
@@ -4668,6 +5343,7 @@ extension Booth {
                     let ok = result.state == .done
                     self.diagEvent("self_repair", ["what": .string("streamdeck_restart"), "why": .string("Lightkey started"), "result": .string(ok ? "ok" : "failed")])
                     self.endWorkingSign(ok ? .deckRestarted : .deckFailed, ok: ok)
+                    if result.opened { self.confirmDeckAfterLaunch(during: "Lightkey started") { _ in } }
                 }
             }
         }
@@ -4697,7 +5373,7 @@ extension Booth {
 
     /// At the start-up: the switch to make, if the deck isn't on the chosen profile and the settings are
     /// exactly the shape Booth Check knows. Logged either way.
-    func deckProfileFixNeeded() -> (device: String, target: String, name: String)? {
+    func deckProfileFixNeeded(during what: String) -> (device: String, target: String, name: String)? {
         guard setup.streamDeck, let choice = setup.deckProfile else { return nil }
         let read = readDeckProfiles()
         deckProfiles = read
@@ -4707,6 +5383,9 @@ extension Booth {
         var fix: (device: String, target: String, name: String)?
         if let p = read.problem {
             out = "Can\u{2019}t tell: \(p) Nothing changed."
+        } else if deckProfileFolder(uuid: choice.uuid, in: read.folder) != nil, !read.profiles.contains(where: { $0.uuid == choice.uuid.lowercased() }) {
+            // Nov 2026: its own folder is there but damaged; another profile with the same keys isn't it.
+            out = "\u{201C}\(choice.name)\u{201D}\u{2019}s own folder is there but damaged, so Booth Check doesn\u{2019}t switch the deck to another profile. Nothing changed."
         } else if case .found(let target, _) = matchDeckProfile(choice, in: read.profiles) {
             let current = preferred.preferred[target.device]
             let sameKeys = read.profiles.first { $0.uuid == current }?.sigHash == target.sigHash
@@ -4725,7 +5404,7 @@ extension Booth {
         } else {
             out = "\u{201C}\(choice.name)\u{201D} isn\u{2019}t clearly one installed profile (missing, or more than one). Nothing changed."
         }
-        changes.insert(LogEntry(title: "Start-up: Stream Deck\u{2019}s profile", language: "macOS API",
+        changes.insert(LogEntry(title: "\(what): Stream Deck\u{2019}s profile", language: "macOS API",
                                 code: "Read \(read.folder ?? streamDeckSupportDir) and CFPreferencesCopyAppValue(\"Devices\", \"\(IDs.streamDeck)\")",
                                 output: out, status: fix == nil && !out.hasPrefix("Already") ? 1 : 0), at: 0)
         return fix
@@ -6458,7 +7137,7 @@ func tallyAction(_ t: inout SessionTally, row: String, title: String? = nil, wha
 /// A self_repair's `what` → the rows it works on.
 func selfRepairRows(_ what: String) -> [String] {
     switch what {
-    case "deck_profile": return ["deckProfile"]
+    case "deck_profile", "deck_profile_restore": return ["deckProfile"]
     case "streamdeck_restart", "streamdeck_open": return ["deckapp", "deck"]
     case "helper_restart": return ["deckLights"]
     default: return []

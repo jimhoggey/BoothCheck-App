@@ -1,7 +1,7 @@
 import Foundation
 
 // Resetting Stream Deck's saved key lights (Nov 2026): which keys, the byte-for-byte edit and its proof,
-// the per-page write with its backup and guards, and which profiles. Run with tests/run.sh. The
+// the per-page write with its guards, and which profiles. Run with tests/run.sh. The
 // fixtures are synthetic, in the shape Stream Deck 7.6 writes its ProfilesV3 page manifests (compact,
 // sorted keys, "Resources":null), written to a temporary folder; nothing on this Mac is read or changed.
 var failures = 0
@@ -99,45 +99,36 @@ func read(_ id: String) -> String { String(decoding: fm.contents(atPath: profile
 put("P1", litPage); put("P2", darkPage); put("P3", "{broken")
 fm.createFile(atPath: profile + "/manifest.json", contents: Data(#"{"Name":"Test"}"#.utf8))
 
-// Stream Deck running: nothing is written, nor backed up.
-let running = clearDeckKeyStates(profileDir: profile, backupDir: backups, deckRunning: { true })
+// Stream Deck running: nothing is written. (Nov 2026: the backup is the profile's last-good copy,
+// made by the caller first; see tests/test_deckrepair.swift. No per-page backups any more.)
+let running = clearDeckKeyStates(profileDir: profile, deckRunning: { true })
 expect("Stream Deck running: page left alone, says why", running.first { $0.page == "P1" }?.skipped == "Stream Deck is running" && read("P1") == litPage)
-expect("Stream Deck running: no backup made", !fm.fileExists(atPath: backups))
 
-let res = clearDeckKeyStates(profileDir: profile, backupDir: backups, deckRunning: { false })
+let res = clearDeckKeyStates(profileDir: profile, deckRunning: { false })
 let p1 = res.first { $0.page == "P1" }
 expect("the lit page is written", p1?.written == true && p1?.resets.map(\.title) == ["Lavender"], "\(res)")
 expect("…with only its State changed", read("P1") == litPage.replacingOccurrences(of: #""State":1,"States":[{"FontSize""#, with: #""State":0,"States":[{"FontSize""#))
 expect("…its permissions kept", ((try? fm.attributesOfItem(atPath: profile + "/Profiles/P1/manifest.json"))?[.posixPermissions] as? Int) == 0o600)
-let backup = backups + "/AAAAAAAA-1111-4111-8111-111111111111.sdProfile/P1/manifest.json"
-expect("…and the original kept as the backup", String(decoding: fm.contents(atPath: backup) ?? Data(), as: UTF8.self) == litPage)
-expect("the dark page isn't written or backed up", res.first { $0.page == "P2" }.map { !$0.written && $0.skipped == nil } == true
-       && read("P2") == darkPage && !fm.fileExists(atPath: backups + "/AAAAAAAA-1111-4111-8111-111111111111.sdProfile/P2"))
+expect("…and no per-page backup is written any more", !fm.fileExists(atPath: backups))
+expect("the dark page isn't written", res.first { $0.page == "P2" }.map { !$0.written && $0.skipped == nil } == true && read("P2") == darkPage)
 expect("the broken page is left as it was, with a reason", res.first { $0.page == "P3" }?.skipped != nil && read("P3") == "{broken")
 expect("the profile's own manifest isn't touched", String(decoding: fm.contents(atPath: profile + "/manifest.json") ?? Data(), as: UTF8.self) == #"{"Name":"Test"}"#)
 
-// Run again: nothing left to do, the backup stays the original (not overwritten with the cleared file).
-let again = clearDeckKeyStates(profileDir: profile, backupDir: backups, deckRunning: { false })
+// Run again: nothing left to do.
+let again = clearDeckKeyStates(profileDir: profile, deckRunning: { false })
 expect("a second run writes nothing", again.allSatisfy { !$0.written })
-expect("…and the backup is still the original", String(decoding: fm.contents(atPath: backup) ?? Data(), as: UTF8.self) == litPage)
-
-// Lit again later: the next run overwrites the one backup with the newer original.
-let litPage2 = litPage.replacingOccurrences(of: "Lavender", with: "Blue")
-put("P1", litPage2)
-_ = clearDeckKeyStates(profileDir: profile, backupDir: backups, deckRunning: { false })
-expect("the next run keeps one backup, the newest original", String(decoding: fm.contents(atPath: backup) ?? Data(), as: UTF8.self) == litPage2)
 
 // Stream Deck starts between the plan and the write: the second look stops it.
 put("P1", litPage)
 var looks = 0
-let late = clearDeckKeyStates(profileDir: profile, backupDir: backups, deckRunning: { looks += 1; return looks > 1 })
+let late = clearDeckKeyStates(profileDir: profile, deckRunning: { looks += 1; return looks > 1 })
 expect("Stream Deck starting mid-way: page left alone", late.first { $0.page == "P1" }?.skipped == "Stream Deck started" && read("P1") == litPage)
 
 // The log text.
 let dp = DeckProfile(uuid: "aaaaaaaa-1111-4111-8111-111111111111", name: "Test", device: "@(1)[4057/143/X]", model: "", pages: 3, keys: [], pluginVersions: [])
 let logText = deckClearText(profile: dp, results: res, backupFolder: backups + "/P")
 expect("the log names the profile, the count, the keys and the backup", logText.contains("\u{201C}Test\u{201D}") && logText.contains("1 key reset")
-       && logText.contains("Lavender (0,0, was 1)") && logText.contains(backups + "/P/<page>/manifest.json") && logText.contains("Page P3: left as it was"), logText)
+       && logText.contains("Lavender (0,0, was 1)") && logText.contains("last-good copy: " + backups + "/P") && logText.contains("Page P3: left as it was"), logText)
 
 // --- deckProfilesToClear --------------------------------------------------------------------------------
 func prof(_ u: String, _ n: String) -> DeckProfile { DeckProfile(uuid: u, name: n, device: "d", model: "", pages: 1, keys: [], pluginVersions: []) }
