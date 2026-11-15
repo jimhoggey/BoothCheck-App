@@ -74,6 +74,11 @@ its window once so whoever sits down sees what to fix.
     it went missing (Lightkey's settings reset, say) though it's wanted here: Booth Check switched it
     on, or a start-up was ready with it on. Untick it in This Mac and it stays off. Only while
     Lightkey isn't running; read back afterwards.
+  - Before Stream Deck opens (the deck lights helper's step): the **deck lights helper**, when it's
+    ticked in This Mac, installed, and not the copy Booth Check carries, is updated with
+    **Update…**'s own script, off the main thread (`self_repair` `deck_helper_update`). Never
+    installed fresh: not installed stays a red row. If the update fails, the start-up carries on and
+    the row shows it.
   - After the apps are open, off the main thread: **Booth Check opens at login** (only a copy in
     Applications adds itself), **No show opens on its own at login**, **Stream Deck waits for Lightkey**
     and **Old apps don't reopen at start-up**, when the row is shown (switched on in This Mac, not
@@ -166,7 +171,7 @@ runs, each with a switch. Switching an app on switches on every check that belon
 | On this Mac | What Booth Check does |
 |---|---|
 | **Lightkey** | checks it's open with the right show (chosen on the main window), and opens it when the show starts. **A DMX interface is plugged in here** sits inside this row and adds the interface-connected and Lightkey-is-using-it checks; switching Lightkey off switches those off too |
-| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check, start-up wait and restarts. Until someone unticks it, it counts as on, so a Mac without the helper shows the row red with **Install…**. **Install / update…** under it installs the helper Booth Check carries. **Profile for the service** picks the Stream Deck profile that goes with the show (default **Don't check**; see [The Stream Deck profile](#the-stream-deck-profile)) |
+| **Stream Deck** | checks the deck is plugged in, its app is open, App Nap is off, and Lightkey is listening for it; opens it once Lightkey is ready. **Deck lights helper** (with Lightkey on) sits inside this row and adds its check, start-up wait and restarts. Until someone unticks it, it counts as on, so a Mac without the helper shows the row red with **Install…**. Under it, **Install…** / **Update…** / **Reinstall…** puts in the helper Booth Check carries, next to "Not installed.", "Out of date: click Update." or "Up to date." (both hidden when unticked: Booth Check then leaves the helper alone, without removing it). **Profile for the service** picks the Stream Deck profile that goes with the show (default **Don't check**; see [The Stream Deck profile](#the-stream-deck-profile)) |
 | **ProPresenter**, or any app added with **Add an app…** | checks it's open, and opens it when the show starts |
 | **Stays on for services** | checks the charger, sleep, Low Power Mode, starting from the charger, macOS updates, and what opens at login |
 | **Start the show when the Mac starts** | opens the apps above at login, in order, instead of macOS login items doing it all at once; the switch's description says exactly what it will open |
@@ -300,7 +305,7 @@ Input"). It sends nothing to Lightkey. It's built in the Lightkey-Skill repo
 the app by `build.sh`; the tests check it's the Summit show's build and that Booth Check starts it with
 the show's rules from `install_helper.sh`).
 
-**Install it from Booth Check**: This Mac → Stream Deck → **Install / update…**, or **Install…** on the
+**Install it from Booth Check**: This Mac → Stream Deck → **Install…** (**Update…** when out of date, **Reinstall…** when up to date), or **Install…** on the
 red row. The sheet shows the whole script before Run, no password: it stops any older copy (and one
 started by hand, which would hold the helper's lock), copies the helper to `~/Library/Application
 Support/DeckStateHelper/`, removes the quarantine flag, writes the LaunchAgent
@@ -309,7 +314,8 @@ log to `~/Library/Logs/DeckStateHelper.log`) and starts it. Then it watches the 
 seconds: the install only counts when launchd says `running` and the log shows the helper started with
 all its `--alias` rules (an older helper ignores them without a word); otherwise the sheet says what
 went wrong. Booth Check then restarts Stream Deck, if it's open, so the keys connect to the new port.
-This Mac shows which version is installed and which one Booth Check carries.
+This Mac says whether the installed copy is up to date (the short hashes are in the Log's check pass),
+and a login start-up updates an out-of-date copy by itself before Stream Deck opens.
 
 **launchd runs it, not Booth Check**, so it keeps running while Booth Check is quit or updated.
 **Deck lights helper running** is green when `launchctl print gui/<uid>/com.c3b.deckstatehelper` says
@@ -509,7 +515,7 @@ in This Mac. Both keep every step in the Log.
 | `person` | someone acted, or had to | `action`, `during` (startup, service, shutdown), and for a row `check`, `title`, `row_status`. Actions: `fix` (a row's button, `button`), `run` / `cancel` (the change sheet, `key`: e.g. `dmxReconnect` is Reconnect the lights…, `dmxRestart` Restart Lightkey…), `check_again`, `start_show`, `mute`, `unmute`, `not_yet` (`trigger`, `left_s`), `update`, `replug` (the replug card: `result` found, skipped or timeout, `wait_s`), `authenticate` (Lightkey asked for the password: `wait_s`, `result`) |
 | `settings_changed` | This Mac settings changed | `keys`, `this_mac_open` (0 = Booth Check changed it itself) |
 | `setting` | a logged setting (mute, show, profile…) | `key`, `value` |
-| `self_repair`, `dmx_recovery`, `dmx_snapshot`, `deck_profile`, `power_change` | Booth Check fixing or recording something | `what`/`rung`, `result` (`what` `deck_profile_restore`: `broke_again`, `no_copy`, `asks_restore` = Stream Deck's own restore question is up) |
+| `self_repair`, `dmx_recovery`, `dmx_snapshot`, `deck_profile`, `power_change` | Booth Check fixing or recording something | `what`/`rung`, `result` (`what` `deck_helper_update`: a login start-up updated an out-of-date deck lights helper, `result` ok or failed; `deck_profile_restore`: `broke_again`, `no_copy`, `asks_restore` = Stream Deck's own restore question is up) |
 | `deck_keys_cleared` | the saved key lights reset, Stream Deck closed | `why`, `keys`, `pages`, `profiles`, `skipped`, `result` |
 | `deck_profile_copy` | a new last-good copy of a profile | `why`, `pages`, `keys`, `kb`, `first` |
 | `deck_profile_restored` | a broken or missing profile put back from the copy | `why` (what was wrong), `during`, `how` (automatic, button), `result`, `identical`, `pages`, `keys`, `copy_age_h` |

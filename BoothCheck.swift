@@ -1501,6 +1501,22 @@ func deckLightsAutoOn(setting: Bool?, installed: Bool, lightkey: Bool, streamDec
     setting == nil && installed && lightkey && streamDeck
 }
 
+/// Whether a login start-up updates the helper by itself before Stream Deck opens (owner-approved, like
+/// the other login repairs): ticked in This Mac, installed, and not the copy Booth Check carries. Never
+/// installs it fresh (not installed stays a red row) and never mid-service.
+func shouldUpdateDeckHelperAtLogin(atLogin: Bool, setting: Bool?, installed: Bool, installedSHA: String?, bundledSHA: String?) -> Bool {
+    guard atLogin, setting == true, installed, let installedSHA, let bundledSHA else { return false }
+    return installedSHA != bundledSHA
+}
+
+/// This Mac's line under the Deck lights helper tick, and its button (nil: this copy carries no helper).
+/// The version hashes stay in the Log.
+func deckHelperVersionWords(installedSHA: String?, bundledSHA: String?) -> (text: String, button: String?) {
+    guard bundledSHA != nil else { return ("This copy of Booth Check doesn\u{2019}t carry the helper.", nil) }
+    guard let installedSHA else { return ("Not installed.", "Install\u{2026}") }
+    return installedSHA == bundledSHA ? ("Up to date.", "Reinstall\u{2026}") : ("Out of date: click Update.", "Update\u{2026}")
+}
+
 /// "Deck lights helper running": launchd runs it and its "Lightkey Feedback" port is there. `current`:
 /// the installed copy is the one Booth Check carries (nil: unknown). `lastLog`: the log's last line,
 /// shown when it fails. `gaveUp`: Booth Check's own restarts didn't fix it (see `deckHelperAutoFix`).
@@ -1512,7 +1528,7 @@ func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort
     if loaded && state == "running" && feedbackPort && argsCurrent == false {
         return Check(id: "deckLights", group: "Stream Deck", title: title, status: .warn,
                      detail: "It\u{2019}s running, but installed with old settings: its rules aren\u{2019}t the ones Booth Check would install for this show, so some key lights may not follow Lightkey. Presses still work.",
-                     fix: "Install / update puts the right ones in (no password).", action: .installDeckHelper)
+                     fix: "Install\u{2026} puts the right ones in (no password).", action: .installDeckHelper)
     }
     let effect = "so the deck\u{2019}s key lights may not follow Lightkey. Presses still work."
     let log = lastLog.map { " Its log: \u{201C}\($0)\u{201D}" } ?? ""
@@ -1522,7 +1538,7 @@ func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort
     if loaded && state == "running" && feedbackPort {
         return Check(id: "deckLights", group: "Stream Deck", title: title, status: .ok,
                      detail: "Its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port is there, so the deck\u{2019}s key lights follow Lightkey."
-                        + (current == false ? " (Booth Check carries a different version: This Mac \u{2192} Stream Deck \u{2192} Install / update.)" : ""))
+                        + (current == false ? " (It\u{2019}s out of date: This Mac \u{2192} Stream Deck \u{2192} Update\u{2026}, or the next login start-up updates it.)" : ""))
     }
     if loaded {
         return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
@@ -4332,20 +4348,11 @@ final class Booth: ObservableObject {
                 run: { shell("/bin/launchctl", args) })
             return
         case .installDeckHelper:
-            guard let source = deckHelperBundled, let sha = deckHelperBundledSHA else {
+            guard let change = deckHelperInstallChange() else {
                 message = "This copy of Booth Check doesn\u{2019}t carry the deck lights helper."
                 return
             }
-            let args = helperArgsInUse
-            let script = deckHelperInstallScript(from: source, args: args)
-            pending = PendingChange(
-                key: "deckInstall", title: "Install the deck lights helper",
-                explanation: "Copies the helper Booth Check carries (version \(sha.prefix(8))) to this Mac and hands it to macOS\u{2019}s launchd for this account, which starts it now and at every login, and restarts it within 2 seconds whenever it stops. Any older copy is stopped and replaced. It publishes the \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port the deck\u{2019}s key lights follow, and sends nothing to Lightkey. Then Booth Check watches it start (a few seconds), and restarts Stream Deck if it\u{2019}s open, so the keys pick the new port up. No password needed. Its rules for this show: "
-                    + (args.isEmpty ? "none (the helper\u{2019}s defaults)" : args.joined(separator: " "))
-                    + (deckShow?.helperFromFile == true ? ", from the show\u{2019}s .deck.json." : ", the built-in ones."),
-                language: "Terminal", code: script,
-                undo: commandLine("/bin/launchctl", deckHelperStopArgs()) + "; rm " + commandLine(deckHelperPlist, []),
-                run: { runDeckHelperInstall(script, args: args) })
+            pending = change
             return
         case .startDeckHelper:
             let args = deckHelperStartArgs()
@@ -4457,6 +4464,51 @@ final class Booth: ObservableObject {
             NSWorkspace.shared.open(url)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.refresh() }
+    }
+
+    /// Install… / Update…'s change sheet (nil: this copy carries no helper). A login start-up runs the
+    /// very same change to update an out-of-date helper (`updateDeckHelperAtLogin`).
+    func deckHelperInstallChange() -> PendingChange? {
+        guard let source = deckHelperBundled, let sha = deckHelperBundledSHA else { return nil }
+        let args = helperArgsInUse
+        let script = deckHelperInstallScript(from: source, args: args)
+        return PendingChange(
+            key: "deckInstall", title: "Install the deck lights helper",
+            explanation: "Copies the helper Booth Check carries (version \(sha.prefix(8))) to this Mac and hands it to macOS\u{2019}s launchd for this account, which starts it now and at every login, and restarts it within 2 seconds whenever it stops. Any older copy is stopped and replaced. It publishes the \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port the deck\u{2019}s key lights follow, and sends nothing to Lightkey. Then Booth Check watches it start (a few seconds), and restarts Stream Deck if it\u{2019}s open, so the keys pick the new port up. No password needed. Its rules for this show: "
+                + (args.isEmpty ? "none (the helper\u{2019}s defaults)" : args.joined(separator: " "))
+                + (deckShow?.helperFromFile == true ? ", from the show\u{2019}s .deck.json." : ", the built-in ones."),
+            language: "Terminal", code: script,
+            undo: commandLine("/bin/launchctl", deckHelperStopArgs()) + "; rm " + commandLine(deckHelperPlist, []),
+            run: { runDeckHelperInstall(script, args: args) })
+    }
+
+    /// A login start-up, before Stream Deck opens (owner-approved, see `shouldUpdateDeckHelperAtLogin`):
+    /// an installed helper that isn't the copy Booth Check carries is updated with Install…'s own change,
+    /// off the main thread (it waits up to 6 s for the new copy to start). Logged with the script, its
+    /// output and the undo, plus a `self_repair` event; the next pass's row confirms it. If it fails, the
+    /// start-up carries on and the row shows it.
+    func updateDeckHelperAtLogin(then done: @escaping () -> Void) {
+        let installedSHA = fileSHA256(deckHelperBinary)
+        guard shouldUpdateDeckHelperAtLogin(atLogin: bootAtLogin, setting: setup.deckLights,
+                                            installed: FileManager.default.fileExists(atPath: deckHelperPlist),
+                                            installedSHA: installedSHA, bundledSHA: deckHelperBundledSHA),
+              let change = deckHelperInstallChange() else { return done() }
+        let versions = "The installed helper (version \((installedSHA ?? "").prefix(8))) isn\u{2019}t the one Booth Check carries (\((deckHelperBundledSHA ?? "").prefix(8))), so Booth Check updated it before Stream Deck opens."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = change.run()
+            DispatchQueue.main.async {
+                self.changes.insert(LogEntry(title: "Start-up: updated the deck lights helper by itself", language: change.language,
+                                             code: change.code,
+                                             output: versions + "\n" + (r.out.isEmpty ? "(no output)" : r.out)
+                                                + "\nBooth Check checks it at the next pass."
+                                                + (change.undo.map { "\nUndo:\n" + $0 } ?? ""),
+                                             status: r.code), at: 0)
+                self.diagEvent("self_repair", ["what": .string("deck_helper_update"), "why": .string("out of date at login"),
+                                               "result": .string(r.code == 0 ? "ok" : "failed")])
+                self.refresh()
+                done()
+            }
+        }
     }
 
     /// The change sheets of the login rows (Booth Check at login, shows and Stream Deck opening by
@@ -5254,10 +5306,13 @@ extension Booth {
                                 : "Not there after 20 seconds, so the deck\u{2019}s key lights may not follow Lightkey (presses still work). Opening Stream Deck anyway.")
                 next()
             }
-            poll(every: 0.5, for: 3, found) { ok in
-                if ok { return finish(true) }
-                self.kickDeckHelper("Start-up") { _ in
-                    self.poll(every: 0.5, for: 17, found) { finish($0) }
+            // At login, an out-of-date helper is updated first (`updateDeckHelperAtLogin`).
+            updateDeckHelperAtLogin {
+                self.poll(every: 0.5, for: 3, found) { ok in
+                    if ok { return finish(true) }
+                    self.kickDeckHelper("Start-up") { _ in
+                        self.poll(every: 0.5, for: 17, found) { finish($0) }
+                    }
                 }
             }
 
@@ -7679,7 +7734,7 @@ func selfRepairRows(_ what: String) -> [String] {
     switch what {
     case "deck_profile", "deck_profile_restore": return ["deckProfile"]
     case "streamdeck_restart", "streamdeck_open": return ["deckapp", "deck"]
-    case "helper_restart": return ["deckLights"]
+    case "helper_restart", "deck_helper_update": return ["deckLights"]
     case "lightkey_no_password": return ["lkpass"]
     case _ where what.hasPrefix("login_"): return [String(what.dropFirst(6))]     // a login row fixed at the start-up
     default: return []
@@ -8845,24 +8900,26 @@ struct SetupSheet: View {
                 }
             }
             .toggleStyle(.checkbox)
-            HStack(spacing: 8) {
-                Button(booth.deckHelperSHA == nil ? "Install\u{2026}" : "Install / update\u{2026}") {
-                    // The install's own sheet can't open over this one: it opens once this one has closed.
-                    booth.afterSetup = { booth.perform(.installDeckHelper) }
-                    booth.showSetup = false
+            Group {
+                if booth.setup.deckLights == false {
+                    Text("Unticked: Booth Check leaves the helper alone (it isn\u{2019}t removed).")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                } else {
+                    let words = deckHelperVersionWords(installedSHA: booth.deckHelperSHA, bundledSHA: deckHelperBundledSHA)
+                    HStack(spacing: 8) {
+                        if let button = words.button {
+                            Button(button) {
+                                // The install's own sheet can't open over this one: it opens once this one has closed.
+                                booth.afterSetup = { booth.perform(.installDeckHelper) }
+                                booth.showSetup = false
+                            }
+                        }
+                        Text(words.text).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
-                .disabled(deckHelperBundled == nil)
-                Text(deckHelperVersions).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             .padding(.leading, 20)
         }
-    }
-
-    private var deckHelperVersions: String {
-        let carried = deckHelperBundledSHA.map { String($0.prefix(8)) } ?? "none"
-        guard let installed = booth.deckHelperSHA else { return "Not installed. Booth Check carries version \(carried)." }
-        return installed == deckHelperBundledSHA ? "Installed: version \(carried), the one Booth Check carries."
-                                                 : "Installed: version \(installed.prefix(8)). Booth Check carries \(carried)."
     }
 
     private var shutdownDetail: String {

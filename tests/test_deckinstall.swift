@@ -63,7 +63,7 @@ expect("old ones don't count", deckHelperAutoFix(failingFor: 60, fixes: [100, 20
 
 // 5. The row: says when Booth Check carries another version, quotes the log when red, says when it gave up.
 let other = deckHelperCheck(installed: true, loaded: true, state: "running", feedbackPort: true, current: false)
-expect("green with another version: still green, says so", other.status == .ok && other.detail.contains("different version"), other.detail)
+expect("green with another version: still green, says Update…", other.status == .ok && other.detail.contains("out of date") && other.detail.contains("Update\u{2026}"), other.detail)
 expect("green, same version: quiet", !deckHelperCheck(installed: true, loaded: true, state: "running", feedbackPort: true, current: true).detail.contains("version"))
 let red = deckHelperCheck(installed: true, loaded: true, state: "not running", feedbackPort: false, lastLog: "WATCHDOG: main loop silent")
 expect("red quotes the log", red.detail.contains("WATCHDOG"), red.detail)
@@ -73,6 +73,31 @@ expect("gave up: says what to press, with that button (Install…)", (gave.fix ?
        && gave.action?.label == "Install\u{2026}", gave.fix ?? "nil")
 let gaveInstalled = deckHelperCheck(installed: true, loaded: false, state: nil, feedbackPort: false, gaveUp: true)
 expect("gave up, not loaded: Install… too", gaveInstalled.action?.label == "Install\u{2026}", gaveInstalled.fix ?? "nil")
+
+// 5b. 1.33: This Mac's words say up to date / not installed / out of date, never the hash.
+let carried = String(repeating: "a", count: 64), oldCopy = String(repeating: "b", count: 64)
+let notIn = deckHelperVersionWords(installedSHA: nil, bundledSHA: carried)
+expect("not installed: Install…", notIn.text == "Not installed." && notIn.button == "Install\u{2026}", "\(notIn)")
+let same = deckHelperVersionWords(installedSHA: carried, bundledSHA: carried)
+expect("up to date: Reinstall…", same.text == "Up to date." && same.button == "Reinstall\u{2026}", "\(same)")
+let old = deckHelperVersionWords(installedSHA: oldCopy, bundledSHA: carried)
+expect("out of date: Update…", old.text.hasPrefix("Out of date") && old.button == "Update\u{2026}", "\(old)")
+expect("no hash on screen", ![notIn.text, same.text, old.text].contains { $0.contains("aaaa") || $0.contains("bbbb") })
+expect("carries none: no button", deckHelperVersionWords(installedSHA: oldCopy, bundledSHA: nil).button == nil)
+
+// 5c. 1.33: a login start-up updates an installed, out-of-date helper by itself; nothing else.
+func update(atLogin: Bool = true, setting: Bool? = true, installed: Bool = true, sha: String? = oldCopy, bundled: String? = carried) -> Bool {
+    shouldUpdateDeckHelperAtLogin(atLogin: atLogin, setting: setting, installed: installed, installedSHA: sha, bundledSHA: bundled)
+}
+expect("login, ticked, installed, out of date: update", update())
+expect("up to date: leave it", !update(sha: carried))
+expect("not at login (mid-service, by hand): leave it", !update(atLogin: false))
+expect("unticked: leave it", !update(setting: false))
+expect("never decided: leave it", !update(setting: nil))
+expect("not installed: never installs it fresh", !update(installed: false, sha: nil))
+expect("plist there but no binary: leave it", !update(sha: nil))
+expect("carries no helper: leave it", !update(bundled: nil))
+expect("its self_repair counts for the row", selfRepairRows("deck_helper_update") == ["deckLights"])
 
 // 6. The copy it carries and the rules it passes are the Summit show's (when that repo is here).
 let summit = NSHomeDirectory() + "/Claude/repos/Lightkey-Skill/LightKeyoutputs/summit2026/helper/"
