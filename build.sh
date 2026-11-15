@@ -35,7 +35,7 @@ for arch in arm64 x86_64; do
 done
 lipo -create build/BoothCheck-arm64 build/BoothCheck-x86_64 -output "$APP/Contents/MacOS/BoothCheck"
 cp Info.plist "$APP/Contents/Info.plist"
-# Diagnostics (1.31): the Aptabase app key lives in the git-ignored aptabase.key, never in git. It goes
+# Diagnostics: the Aptabase app key lives in the git-ignored aptabase.key, never in git. It goes
 # into the built copy's Info.plist before signing. Without the file the app builds and sends nothing.
 if [ -s aptabase.key ]; then
     KEY=$(tr -d '[:space:]' < aptabase.key)
