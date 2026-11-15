@@ -25,7 +25,10 @@ its window once so whoever sits down sees what to fix.
      seconds so someone can get to the cable, and **Carry on without it** skips it
   2. Open any other apps, such as ProPresenter
   3. With a Stream Deck: open **Lightkey without the show**, wait for its MIDI input (the Stream
-     Deck plugin looks for it when it starts), with the [deck lights helper](#the-deck-lights-helper)
+     Deck plugin looks for it when it starts; not there after 45 seconds, and the start-up opened
+     Lightkey itself, Booth Check quits Lightkey the shutdown's no-questions way, clears any olad left
+     behind, opens it again and waits once more, so the deck isn't dead all service; once only, never
+     a Lightkey that was already open), with the [deck lights helper](#the-deck-lights-helper)
      also wait for its "Lightkey Feedback" port (launchd starts the helper at login; not there
      within 3 seconds, Booth Check starts or restarts it through launchd at once, logged, and waits
      up to 20 seconds in all, then carries on with a warning), switch App Nap off if it's on, put the
@@ -55,7 +58,26 @@ its window once so whoever sits down sees what to fix.
      the box is on neither USB plane (that's the replug sign's job). If it all fails, the step warns
      with what was tried
   6. Without Lightkey on this Mac, Stream Deck opens here instead
-  7. Check everything
+  7. Check everything: it waits for a check pass that starts after the steps above (a pass already
+     running started too early to count), so the step and the panel's heading always give the same
+     count, and the step follows each pass while the panel is up
+
+  While the show opens, Booth Check also listens (read only) to "Lightkey Output" and notes in the Log
+  whether Lightkey reported the show's start states (how many cues, how many on). That's evidence
+  only: it never decides "Ready", since a show with nothing MIDI-mapped on at start reports nothing.
+
+  **A login start-up also puts a few settings back by itself**, each with the exact command its
+  row's change sheet runs, logged with the command, output and undo, and a `self_repair` event:
+  - Before Lightkey opens: **Lightkey connects without the password** (`DontUnloadFTDIDrivers`) when
+    it went missing (Lightkey's settings reset, say) though it's wanted here: Booth Check switched it
+    on, or a start-up was ready with it on. Untick it in This Mac and it stays off. Only while
+    Lightkey isn't running; read back afterwards.
+  - After the apps are open, off the main thread: **Booth Check opens at login** (only a copy in
+    Applications adds itself), **No show opens on its own at login**, **Stream Deck waits for Lightkey**
+    and **Old apps don't reopen at start-up**, when the row is shown (switched on in This Mac, not
+    muted) and orange or red. They take effect at the next login; the next pass confirms each. If
+    Booth Check can't read the login items (System Events not allowed), it changes nothing there.
+    AppleScript off the main thread goes through `osascript`, stopped after 20 seconds.
 
   After the start-up, **Stream Deck stays open**: when it's switched on in This Mac and its app
   isn't running (switched on just now, Booth Check reopened after an update, or someone quit it),
@@ -415,7 +437,10 @@ Lightkey before the start-up. Every step is kept in the Log.
 **Shut down by itself** (in This Mac) is the backstop for when nobody remembers. At the set time it
 gives a **5-minute** countdown, then does the same. **Not yet** asks again in half an hour. It only
 goes off within half an hour of the set time, so a Mac that was off or asleep then doesn't shut down
-the moment it comes back, and it waits for a running start-up to finish.
+the moment it comes back, and it waits for a running start-up to finish. **If the lights were used in
+the last 10 minutes** (Lightkey reported a cue changing on "Lightkey Output", which Booth Check hears
+read only, counting MIDI note and control messages, never clock), it doesn't count down at all: it
+treats that as Not yet, asks again in half an hour, and says why in the Log.
 
 **Shut down when the power goes off** (in This Mac, MacBooks only) does the same when the charger
 loses power while Booth Check is running: a **1-minute** countdown, which stops by itself if the power
@@ -427,7 +452,8 @@ macOS has no setting for this on a MacBook's own battery; its power-cut shutdown
 ## Nothing runs behind your back
 
 - **Checks only read.** Every command a check runs is listed in the **Log** (⌘L) with its output.
-  It's the same short list each time, repeated every 15 seconds.
+  It's the same short list each time, repeated every 15 seconds. The exception is a login start-up,
+  which puts a few settings back by itself (see the start-up above), each logged in full with its undo.
 - **Changes wait for you.** A button that changes something (turn App Nap off, add Booth Check to
   login, remove something from login) first shows the exact Terminal command or AppleScript, and runs
   it only when you press **Run**. The output appears straight away, and the change is kept in the
@@ -491,6 +517,29 @@ in This Mac. Both keep every step in the Log.
 | `session_summary` | with app_quit (or at the next launch) | `ended`, `session_s`, `launch_how`, `started`, `startup` (ready, not_ready, none), `startup_s`, `startups`, `rows`, `rows_ok` (never warn or fail), `rows_bad`, `bad_at_end`, `bad_rows`, `people`, `passes`, `version` |
 | `session_row` | one per row that was ever warn or fail | `check`, `title`, `worst`, `bad_s`, `share_pct` (of the session), `whole` (never OK all session), `bad_at_end`, `spells`, `first_bad_s`, `fix_clicks`, `muted`, `cleared_by` (`still_bad` if so), `ended` |
 | `log_chunk` | an incident's scrubbed log | `incident`, `part`, `parts`, `t00`… |
+
+  `startup_done` also has `start_state` (`reported`, `none`, `not_listened`: whether Lightkey reported
+  the show's start states while it opened), `start_state_msgs` and `start_state_on`. `self_repair`
+  `what` adds `lightkey_no_password` and `login_<row>` (`login_selfLogin`, `login_loginShows`,
+  `login_deckLogin`, `login_reopen`; `result` ok, not_confirmed or failed).
+
+  **Error reports** go to the dashboard's Errors page (`POST /api/v0/error`, one report per request,
+  202 = accepted; kept for later on no answer, 408, 429 or 5xx; dropped on 403, the month's error
+  quota, and any other 4xx). Each type goes once a session, at most 10 a session; message and trace
+  are scrubbed like everything else; they wait in `aptabase-errors.jsonl`, sent with the events.
+  Every report is also a line in the log on disk (`error report <type> …`), diagnostics on or off.
+
+| errorType | severity, kind | When | stackTrace |
+|---|---|---|---|
+| the exception type (`EXC_BAD_ACCESS`…) | fatal, crash | the launch after a crash: Booth Check's newest crash report (`~/Library/Logs/DiagnosticReports/Booth Check*.ips` or `.crash`) since the crashed run began, with the crashed run's session id | the crashed thread's frames |
+| `UncleanExit` | error, unhandled | the launch after an unclean end with no readable crash report (power cut, force quit) | the last 40 lines of that run's log |
+| `StartupNotReady` | error, handled | a start-up ends not ready | the Log's last 40 lines |
+| `DMXRecoveryFailed` | error, handled | the start-up's DMX recovery ran and Lightkey still didn't take the interface | the same |
+| `LightkeyForceQuit` | error, handled | Lightkey had to be made to quit (shutdown, restart) | the same |
+| `ShutdownStayedOn` | error, handled | a shutdown stopped and the Mac stayed on | the same |
+| `DeckProfileRestoreFailed` | error, handled | a damaged Stream Deck profile couldn't be put back, or broke again | the same |
+| `StreamDeckRestoreDialog` | error, handled | Stream Deck is asking whether to restore its backup | the same |
+| `CheckFailed:<row id>` | error, handled | a row red (not orange) over a minute outside a start-up: the same moment as its `log_chunk` incident | the same |
 
   Start-ups aren't counted in the session's rows (rows are red while apps open), nor the shutdown
   once it closes the apps. A shutdown that stops and leaves the Mac on can send a second summary for

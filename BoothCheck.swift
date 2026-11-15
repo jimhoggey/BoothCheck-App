@@ -72,6 +72,11 @@ struct MacSetup: Codable, Equatable {
     /// Black out the stage first (1.30, off by default; the owner asked for it optional): every shutdown
     /// sends the show's Blackout before Stream Deck and Lightkey close (see `blackoutBeforeClosing`).
     var blackoutAtShutdown = false
+    /// Whether Lightkey should connect without the password here (Nov 2026, see
+    /// `lightkeyNoPasswordRepairNeeded`): true once Booth Check switched DontUnloadFTDIDrivers on, or a
+    /// start-up ended ready with it on; false once a tech switched it off in This Mac. Nil: not known yet.
+    /// A login start-up puts the setting back when it's true and the setting went missing.
+    var noPasswordWanted: Bool? = nil
 
     /// Apps worth offering on a production Mac when they're installed.
     static let knownApps = [("com.renewedvision.propresenter", "ProPresenter")]
@@ -94,6 +99,7 @@ struct MacSetup: Codable, Equatable {
         diagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnostics) ?? true
         deckProfile = try? c.decodeIfPresent(DeckProfileChoice.self, forKey: .deckProfile)
         blackoutAtShutdown = try c.decodeIfPresent(Bool.self, forKey: .blackoutAtShutdown) ?? false
+        noPasswordWanted = try c.decodeIfPresent(Bool.self, forKey: .noPasswordWanted)
     }
 
     static var saved: MacSetup? {
@@ -434,10 +440,16 @@ final class MIDIWatch {
                                        : "CoreMIDI didn\u{2019}t send it (\(s)).")
     }
 
-    /// Listens to a source by name (read only) and hands each MIDI 1.0 channel-voice word to `onWord`
-    /// on the main thread. Returns the way to stop listening, or nil when there's no such source.
-    func listen(to source: String, onWord: @escaping (UInt32) -> Void) -> (() -> Void)? {
-        guard let src = endpoint(named: source, count: MIDIGetNumberOfSources(), get: MIDIGetSource) else { return nil }
+    /// The source called `name` as CoreMIDI has it now: a new ref each time its app makes it again.
+    func sourceRef(named name: String) -> MIDIEndpointRef? {
+        endpoint(named: name, count: MIDIGetNumberOfSources(), get: MIDIGetSource)
+    }
+
+    /// Listens to a source by name (read only) and hands each MIDI 1.0 channel-voice word to `onWord`,
+    /// on the main thread, or (`onMain` false) straight on CoreMIDI's own thread, for a listener that
+    /// only counts. Returns the way to stop listening, or nil when there's no such source.
+    func listen(to source: String, onMain: Bool = true, onWord: @escaping (UInt32) -> Void) -> (() -> Void)? {
+        guard let src = sourceRef(named: source) else { return nil }
         var port = MIDIPortRef()
         let s = MIDIInputPortCreateWithProtocol(client, "Booth Check in" as CFString, ._1_0, &port) { list, _ in
             var words: [UInt32] = []
@@ -445,13 +457,77 @@ final class MIDIWatch {
                 let n = Int(packet.pointee.wordCount)
                 words += withUnsafeBytes(of: packet.pointee.words) { Array($0.bindMemory(to: UInt32.self).prefix(n)) }
             }
-            DispatchQueue.main.async { words.forEach(onWord) }
+            if onMain { DispatchQueue.main.async { words.forEach(onWord) } } else { words.forEach(onWord) }
         }
         guard s == noErr, MIDIPortConnectSource(port, src, nil) == noErr else {
             if port != 0 { MIDIPortDispose(port) }
             return nil
         }
         return { MIDIPortDisconnectSource(port, src); MIDIPortDispose(port) }
+    }
+}
+
+/// What Lightkey has reported on "Lightkey Output" so far (see `LightkeyOutputWatch`): its MIDI 1.0
+/// channel-voice messages (cue states), how many said a cue is on, and when the last came (uptime).
+struct MIDIActivity: Equatable {
+    var messages = 0
+    var cuesOn = 0
+    var lastAt: TimeInterval?
+}
+
+/// One word from "Lightkey Output" counted. Only MIDI 1.0 channel-voice messages count (Lightkey's
+/// cue reports); clock and other system messages don't, so they can never hold up a shutdown.
+func midiActivityAdding(_ a: MIDIActivity, word: UInt32, at: TimeInterval) -> MIDIActivity {
+    guard word >> 28 == 2 else { return a }
+    var n = a
+    n.messages += 1
+    n.lastAt = at
+    if (word >> 16) & 0xF0 == 0x90 && word & 0x7F > 0 { n.cuesOn += 1 }
+    return n
+}
+
+/// Lightkey was used in the last `window` seconds (the weekly shutdown's guard, Nov 2026): it reported a
+/// cue changing on "Lightkey Output", which happens when someone presses a cue on the deck or in Lightkey.
+func lightkeyRecentlyUsed(lastAt: TimeInterval?, now: TimeInterval, window: TimeInterval = 600) -> Bool {
+    lastAt.map { now - $0 < window } ?? false
+}
+
+/// Listens passively to Lightkey's "Lightkey Output" while Lightkey runs on a Lightkey Mac (Nov 2026):
+/// read only, counted on CoreMIDI's thread under a lock, nothing published and no UI per message. The
+/// start-up reads it for whether Lightkey reported the show's start states; the weekly shutdown for
+/// whether the lights were used in the last 10 minutes. `keepListening` (main thread, each 15-second
+/// tick and at the start-up's show step) connects to the current source, again after Lightkey restarts.
+final class LightkeyOutputWatch {
+    static let shared = LightkeyOutputWatch()
+    private let lock = NSLock()
+    private var activity = MIDIActivity()
+    private var stop: (() -> Void)?
+    private var source: MIDIEndpointRef = 0
+
+    var listening: Bool { stop != nil }
+
+    func keepListening(_ wanted: Bool) {
+        let ref = wanted ? MIDIWatch.shared.sourceRef(named: IDs.lightkeyMIDIOutput) : nil
+        if let ref, ref == source, stop != nil { return }
+        stop?()
+        stop = nil
+        source = 0
+        guard let ref else { return }
+        stop = MIDIWatch.shared.listen(to: IDs.lightkeyMIDIOutput, onMain: false) { [weak self] word in self?.heard(word) }
+        if stop != nil { source = ref }
+    }
+
+    private func heard(_ word: UInt32) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        activity = midiActivityAdding(activity, word: word, at: now)
+        lock.unlock()
+    }
+
+    func now() -> MIDIActivity {
+        lock.lock()
+        defer { lock.unlock() }
+        return activity
     }
 }
 
@@ -745,6 +821,75 @@ func startUpReady(steps: [StepState], problems: Int, unknown: Int, checks: Int) 
     steps.allSatisfy { $0 == .done } || (problems == 0 && unknown == 0 && checks > 0)
 }
 
+/// "3 things to fix": the one wording for a problem count, in the header, the start-up panel's heading
+/// and its "Check everything" step.
+func thingsToFix(_ n: Int) -> String { "\(n) thing\(n == 1 ? "" : "s") to fix" }
+
+/// The start-up's last step from the problem count now. The panel's heading counts the same rows, and
+/// the step is kept in step with each pass while the panel is up (`syncCheckStep`), so the two always
+/// say the same number (the owner saw "3 things to fix" over a step saying 2, Nov 2026).
+func checkStepWords(problems n: Int) -> (state: StepState, detail: String) {
+    n == 0 ? (.done, "Everything is green.") : (.warn, thingsToFix(n) + ". Open Booth Check to see what.")
+}
+
+/// The start-up panel's heading (see `BootView`).
+func bootHeadline(finished: Bool, ready: Bool, problems n: Int) -> String {
+    !finished ? "Starting the show" : ready ? "Ready for the service" : n > 0 ? thingsToFix(n) : "Started, with warnings"
+}
+
+/// Whether Lightkey reported the show's start states on "Lightkey Output" while the show opened (Nov
+/// 2026): `mark` is what had come before (nil: Booth Check wasn't listening), `now` what has come by
+/// the end of the start-up. Evidence for the Log and `startup_done`'s `start_state` (reported, none,
+/// not_listened), never for "Ready": a show with no MIDI-mapped cue on at start reports nothing.
+func startStateEvidence(mark: MIDIActivity?, now: MIDIActivity, late: Bool) -> (prop: String, messages: Int, on: Int, text: String) {
+    guard let mark else {
+        return ("not_listened", 0, 0, "Booth Check couldn\u{2019}t listen to \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D} while the show opened (Lightkey\u{2019}s MIDI output wasn\u{2019}t there).")
+    }
+    let n = now.messages - mark.messages, on = now.cuesOn - mark.cuesOn
+    let lateNote = late ? " Booth Check only began listening once Lightkey had opened with the show, so it may have missed some." : ""
+    if n > 0 {
+        return ("reported", n, on, "Lightkey reported \(n) cue state\(n == 1 ? "" : "s") on \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D} as the show opened, \(on) of them on." + lateNote)
+    }
+    return ("none", 0, 0, "Lightkey reported no cue states on \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D} while the show opened (a show already open sends none)." + lateNote)
+}
+
+/// Whether the start-up may quit and reopen Lightkey once because its MIDI input never appeared (Nov
+/// 2026): only a Lightkey this start-up opened itself, without the show (so nothing is on stage yet), once.
+func midiRelaunchAllowed(openedByStartUp: Bool, alreadyRelaunched: Bool, shuttingDown: Bool) -> Bool {
+    openedByStartUp && !alreadyRelaunched && !shuttingDown
+}
+
+/// Whether a login start-up puts Lightkey's no-password setting back before Lightkey opens (Nov 2026):
+/// it's wanted here (`MacSetup.noPasswordWanted`), it's off now, Lightkey isn't running (it reads its
+/// settings when it opens, and would write its own back), and this Mac has a DMX interface.
+func lightkeyNoPasswordRepairNeeded(wanted: Bool?, settingOn: Bool, lightkeyRunning: Bool, dmx: Bool) -> Bool {
+    wanted == true && !settingOn && !lightkeyRunning && dmx
+}
+
+/// What `noPasswordWanted` becomes at the end of a start-up: a choice made stays; not known yet, a ready
+/// start-up with the setting on makes it wanted.
+func noPasswordWantedAfterStartUp(_ current: Bool?, ready: Bool, settingOn: Bool) -> Bool? {
+    current ?? (ready && settingOn ? true : nil)
+}
+
+/// The login rows a login start-up fixes by itself (Nov 2026, the owner's call): Booth Check not at
+/// login, a show or Stream Deck opening by itself, macOS reopening old apps. Only rows shown (switched
+/// on in This Mac, not muted) that are warn or fail and carry their own fix's button; "couldn't read"
+/// never counts. Booth Check adds itself only from Applications (a copy run from a build folder or a
+/// download must not become the login item). Returns their ids, in the order the rows come.
+func startUpLoginRepairs(_ checks: [Check], selfInApplications: Bool) -> [String] {
+    checks.compactMap { c in
+        guard c.status == .warn || c.status == .fail else { return nil }
+        switch (c.id, c.action) {
+        case ("selfLogin", .addSelfToLogin?):
+            return selfInApplications ? c.id : nil
+        case ("loginShows", .removeShowLoginItems?), ("deckLogin", .removeLoginItem?), ("reopen", .stopReopeningApps?):
+            return c.id
+        default: return nil
+        }
+    }
+}
+
 /// The start-up's steps, by id, in order. The DMX interface first (Lightkey attaches when it opens),
 /// then other apps. With a Stream Deck on a Lightkey Mac: Lightkey without the show, its MIDI input
 /// (the Stream Deck plugin looks for it when it starts), Stream Deck, and only then the show. Lightkey
@@ -967,6 +1112,9 @@ func dmxRowFix(oladPID: pid_t?, sinceReconnect: TimeInterval?) -> DMXRowFix {
     return oladPID.map { .reconnect($0) } ?? .restart
 }
 
+/// What to do when Booth Check can't confirm Lightkey holds the DMX interface: try the lights.
+let dmxUnconfirmedWords = "Press a key on the Stream Deck: if the lights don\u{2019}t respond, open Booth Check and click the button on the \u{201C}Lightkey is sending DMX\u{201D} row."
+
 /// What Booth Check is fixing by itself, for the big sign (see `selfRepairWords`).
 enum SelfRepair: Equatable {
     case dmxNotConnected, dmxAskingOlad, dmxResetOutput, dmxRestarting(Int), dmxConnected, dmxFailed, dmxReconnectFailed, dmxUnconfirmed
@@ -985,18 +1133,18 @@ func selfRepairWords(_ r: SelfRepair) -> (title: String, detail: String) {
     case .dmxRestarting(let n):
         return ("Restarting Lightkey", "The lights go dark for about 20 seconds." + (n > 1 ? " (Second try.)" : ""))
     case .dmxConnected: return ("The lights are connected", "You can use the Mac now.")
-    case .dmxFailed: return ("Couldn\u{2019}t reconnect the lights", "Unplug the blue DMX box\u{2019}s USB cable and plug it back in.")
+    case .dmxFailed: return ("Couldn\u{2019}t reconnect the lights", replugDMXWords)
     case .dmxReconnectFailed:
         return ("The lights still aren\u{2019}t connected", "Open Booth Check and click Restart Lightkey\u{2026} (the lights go dark for about 20 seconds).")
-    case .dmxUnconfirmed: return ("Couldn\u{2019}t confirm the lights are connected", "If the lights respond, all is well.")
+    case .dmxUnconfirmed: return ("Couldn\u{2019}t confirm the lights are connected", dmxUnconfirmedWords)
     case .deckReopening: return ("Stream Deck closed", "Opening it again\u{2026}")
     case .deckReopened: return ("Stream Deck is open again", "Its keys work again.")
     case .deckRestarting: return ("Restarting Stream Deck", "So its keys start clean.")
     case .deckRestarted: return ("Stream Deck restarted", "Its keys start clean.")
-    case .deckFailed: return ("Couldn\u{2019}t open Stream Deck", "Quit and reopen Stream Deck.")
+    case .deckFailed: return ("Couldn\u{2019}t open Stream Deck", "Open Booth Check and click Open Stream Deck on its row.")
     case .helperRestarting: return ("The deck\u{2019}s key lights stopped", "Restarting the deck lights helper\u{2026}")
     case .helperRestarted: return ("The deck\u{2019}s key lights are back", "The deck lights helper is running again.")
-    case .helperFailed: return ("Couldn\u{2019}t restart the deck lights helper", "The keys still work. Open Booth Check to see what\u{2019}s wrong.")
+    case .helperFailed: return ("Couldn\u{2019}t restart the deck lights helper", "The keys still work, and Booth Check tries again by itself shortly.")
     case .deckProfileSwitching(let name): return ("Putting Stream Deck on the \u{201C}\(name)\u{201D} profile", "Its keys go dark for a few seconds.")
     case .deckProfileSwitched(let name): return ("Stream Deck is on \u{201C}\(name)\u{201D}", "Its keys work again.")
     case .deckProfileFailed(let name): return ("Couldn\u{2019}t switch Stream Deck\u{2019}s profile", "In Stream Deck, choose \u{201C}\(name)\u{201D} at the top of its window.")
@@ -1308,9 +1456,9 @@ func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort
     }
     let effect = "so the deck\u{2019}s key lights may not follow Lightkey. Presses still work."
     let log = lastLog.map { " Its log: \u{201C}\($0)\u{201D}" } ?? ""
-    let selfFix = gaveUp
-        ? "Booth Check restarted it 3 times in 30 minutes and it still isn\u{2019}t working. Install it again from This Mac, then quit and reopen Stream Deck. Still red: a tech reads ~/Library/Logs/DeckStateHelper.log."
-        : "Booth Check fixes this by itself within half a minute."
+    let selfFix = "Booth Check fixes this by itself within half a minute."
+    // Its own restarts didn't help: putting it in again (which also restarts Stream Deck) is the one press left.
+    let gaveUpFix = "Booth Check restarted it 3 times in 30 minutes without luck: click Install\u{2026} to put it in again (no password)."
     if loaded && state == "running" && feedbackPort {
         return Check(id: "deckLights", group: "Stream Deck", title: title, status: .ok,
                      detail: "Its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port is there, so the deck\u{2019}s key lights follow Lightkey."
@@ -1321,12 +1469,14 @@ func deckHelperCheck(installed: Bool, loaded: Bool, state: String?, feedbackPort
                      detail: (state == "running"
                         ? "It\u{2019}s running, but its \u{201C}\(IDs.deckFeedback)\u{201D} MIDI port isn\u{2019}t there, \(effect)"
                         : "It\u{2019}s set up but not running (launchd says \u{201C}\(state ?? "no state")\u{201D}), \(effect)") + log,
-                     fix: selfFix + " Or restart it now: Stream Deck picks it up again by itself.", action: .restartDeckHelper)
+                     fix: gaveUp ? gaveUpFix : selfFix + " Or restart it now: Stream Deck picks it up again by itself.",
+                     action: gaveUp ? .installDeckHelper : .restartDeckHelper)
     }
     if installed {
         return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
                      detail: "It\u{2019}s installed but not started, \(effect)" + log,
-                     fix: selfFix + " Or start it now. From then on it starts by itself at every login.", action: .startDeckHelper)
+                     fix: gaveUp ? gaveUpFix : selfFix + " Or start it now. From then on it starts by itself at every login.",
+                     action: gaveUp ? .installDeckHelper : .startDeckHelper)
     }
     return Check(id: "deckLights", group: "Stream Deck", title: title, status: .fail,
                  detail: "It isn\u{2019}t installed on this Mac, \(effect)",
@@ -1782,7 +1932,7 @@ func deckProfileCheck(choice: DeckProfileChoice, read: DeckProfilesRead, preferr
                    action: .openSetup)
     }
     if let problem = read.problem {
-        return row(.unknown, "Can\u{2019}t tell which profile it\u{2019}s on: \(problem)", fix: "Check Stream Deck shows \(want) at the top of its window.")
+        return row(.unknown, "Can\u{2019}t tell which profile it\u{2019}s on: \(problem)", fix: "In Stream Deck, choose \(want) at the top of its window.")
     }
     let target: DeckProfile
     switch matchDeckProfile(choice, in: read.profiles) {
@@ -1802,7 +1952,7 @@ func deckProfileCheck(choice: DeckProfileChoice, read: DeckProfilesRead, preferr
     let extraText = extras.isEmpty ? "" : " " + extras.joined(separator: " ")
     guard prefsProblem == nil, let current = preferred[target.device] else {
         return row(.unknown, "Can\u{2019}t tell which profile Stream Deck is on: " + (prefsProblem ?? "its settings don\u{2019}t list the deck this profile is for.") + extraText,
-                   fix: "Check Stream Deck shows \(want) at the top of its window.")
+                   fix: "In Stream Deck, choose \(want) at the top of its window.")
     }
     let onIt = current == target.uuid
     let copy = onIt ? nil : read.profiles.first(where: { $0.uuid == current && $0.sigHash == target.sigHash })
@@ -2618,8 +2768,7 @@ func screenCheck(held: Bool, onAC: Bool) -> Check {
     }
     return Check(id: "screen", group: "Power & sleep", title: title, status: .fail,
                  detail: "macOS isn\u{2019}t keeping the screen awake for Booth Check, so the screen saver can start after a while untouched, and Stream Deck with it.",
-                 fix: "Quit and reopen Booth Check. Still red: in Lock Screen, set \u{201C}Start Screen Saver when inactive\u{201D} to Never.",
-                 action: .open(Settings.lockScreen, "Open Lock Screen settings"))
+                 fix: "Ask a tech: quit Booth Check (hold Option, click its menu bar icon, then Quit) and open it again.")
 }
 
 /// The shutdown warning's countdown: "4:59".
@@ -2858,7 +3007,13 @@ func appleScriptQuote(_ s: String) -> String {
 }
 
 /// Runs AppleScript and returns what it produced, or its error, in the same shape as a command.
+/// NSAppleScript belongs on the main thread; anywhere else (the start-up's login fixes) the script goes
+/// through `osascript`, with the shell's 20-second limit, so it can never wait for good.
 func runAppleScript(_ source: String) -> (out: String, code: Int32) {
+    guard Thread.isMainThread else {
+        let r = shell("/usr/bin/osascript", ["-e", source])
+        return (r.out.trimmingCharacters(in: .whitespacesAndNewlines), r.code)
+    }
     var err: NSDictionary?
     let result = NSAppleScript(source: source)?.executeAndReturnError(&err)
     if let err {
@@ -3107,18 +3262,25 @@ func undoBootArgs(_ value: String?) -> [String] {
     value.map { ["\(bootVariable)=\($0)"] } ?? ["-d", bootVariable]
 }
 
+/// How a volunteer restarts Stream Deck by hand: quitting it is enough, since Booth Check opens it again
+/// (`keepStreamDeckOpen`, at most once a minute).
+let quitStreamDeckWords = "Quit Stream Deck (its menu bar icon \u{2192} Quit Stream Deck); Booth Check opens it again by itself within a minute."
+
+/// What a volunteer does when the DMX box isn't seen: replug it; the DMX row then offers the reconnect.
+let replugDMXWords = "Unplug the blue DMX box\u{2019}s USB cable and plug it back in; if the lights stay off, click the button on the \u{201C}Lightkey is sending DMX\u{201D} row."
+
 /// Apps read the App Nap setting when they open, so only a Stream Deck that was already running
 /// when Booth Check switched it off can still be put to sleep; one opened afterwards is fine.
 func appNapCheck(appNapOff: Bool, switchedOffAt: Date?, deckLaunched: Date?) -> Check {
     if !appNapOff {
         return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .fail,
                      detail: "macOS can put the Stream Deck app to sleep — that's what freezes the keys.",
-                     fix: "Turn it off, then restart the Mac.", action: .fixAppNap)
+                     fix: "Click Turn App Nap off\u{2026} (no password).", action: .fixAppNap)
     }
     if let switchedOffAt, let deckLaunched, deckLaunched < switchedOffAt {
         return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .warn,
                      detail: "Switched off after the Stream Deck app opened, so that copy can still be put to sleep.",
-                     fix: "Quit and reopen Stream Deck once.")
+                     fix: quitStreamDeckWords)
     }
     return Check(id: "nap", group: "Power & sleep", title: "App Nap off", status: .ok,
                  detail: "macOS won't put the Stream Deck app to sleep.")
@@ -3262,6 +3424,14 @@ final class Booth: ObservableObject {
     /// Whether Lightkey may ask for the Mac's password this start-up: it has a DMX interface to take,
     /// and its DontUnloadFTDIDrivers setting is off. Read when the start-up begins.
     private var lightkeyMayAsk = true
+    /// This start-up opened Lightkey itself, without the show (the `lightkeyApp` step), and whether it
+    /// has quit and reopened it once because its MIDI input didn't appear (`midiRelaunchAllowed`).
+    private var lightkeyOpenedByStartUp = false
+    private var midiRelaunched = false
+    /// What "Lightkey Output" had reported as the show began to open (nil: Booth Check wasn't listening
+    /// then), for whether Lightkey reported the show's start states (`startStateEvidence`).
+    private var startStateMark: MIDIActivity?
+    private var startStateLate = false
     /// Lightkey was running when Booth Check started at login: macOS reopened it (see `logAppsOpenAtLogin`).
     var lightkeyReopenedByMacOS = false
     /// DMX self-recovery (1.30, see `dmxLadderNext`): when this start-up began and what each step did
@@ -3367,8 +3537,30 @@ final class Booth: ObservableObject {
                                 language: "Terminal", code: commandLine("/usr/bin/defaults", args),
                                 output: r.out.isEmpty ? "(no output)" : r.out, status: r.code), at: 0)
         lightkeyNoPassword = defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
+        if r.code == 0 { setup.noPasswordWanted = on }      // a tech's choice: the start-up keeps to it
         noteSettings(["lightkeyNoPassword"])
         refresh()
+    }
+
+    /// A login start-up, before Lightkey opens (Nov 2026, owner-approved, see `lightkeyNoPasswordRepairNeeded`):
+    /// the no-password setting went missing (Lightkey's settings reset, say) though it's wanted here, so
+    /// it's written back with the same `defaults` command as This Mac's switch, then read back. Logged
+    /// with the command, its output and the undo, and a `self_repair` event.
+    func putBackNoPasswordSetting() {
+        let read = ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]
+        guard lightkeyNoPasswordRepairNeeded(wanted: setup.noPasswordWanted, settingOn: defaultsSaysOn(shell("/usr/bin/defaults", read).out),
+                                             lightkeyRunning: isRunning(IDs.lightkey), dmx: setup.lightkey && setup.dmx) else { return }
+        let args = lightkeyPasswordCommand(on: true)
+        let r = shell("/usr/bin/defaults", args)
+        let on = defaultsSaysOn(shell("/usr/bin/defaults", read).out)
+        lightkeyNoPassword = on
+        changes.insert(LogEntry(title: "Start-up: put back \u{201C}Lightkey connects without the password\u{201D}", language: "Terminal",
+                                code: commandLine("/usr/bin/defaults", args) + "\n" + commandLine("/usr/bin/defaults", read) + "   # read back",
+                                output: (r.out.isEmpty ? "" : r.out + "\n")
+                                    + "DontUnloadFTDIDrivers was off, though Lightkey connected without the password here before, so Booth Check switched it back on before Lightkey opens. Read back: \(on ? "on" : "still off").\n"
+                                    + "Undo (with Lightkey quit), or untick it in This Mac: " + commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: false)),
+                                status: on ? 0 : 1), at: 0)
+        diagEvent("self_repair", ["what": .string("lightkey_no_password"), "why": .string("setting missing at login"), "result": .string(on ? "ok" : "failed")])
     }
 
     /// Shut the booth down when the charger's power goes off, after a 1-minute warning (see
@@ -3393,6 +3585,14 @@ final class Booth: ObservableObject {
     private var powerWatch: CFRunLoopSource?
 
     private var busy = false
+    /// Check passes started and the last one finished, numbered from 1, and a request that came while
+    /// one ran (see `refresh`). Plain values, never published.
+    private var refreshAsked = false
+    private(set) var passesStarted = 0
+    private(set) var passesFinished = 0
+    /// The login rows a login start-up just fixed by itself (`repairLoginAtStartUp`), confirmed by the
+    /// first pass numbered above `after` (`confirmLoginRepairs`).
+    var loginRepairsToConfirm: (ids: [String], after: Int, ran: [String: Int32])?
     /// When Booth Check switched App Nap off, this session. Apps read the setting when they open.
     private var appNapSwitchedOffAt: Date?
     /// Booth Check's keep-the-screen-on request while it's held (see `keepScreenOn`), and whether
@@ -3402,9 +3602,13 @@ final class Booth: ObservableObject {
 
     var showName: String? { showPath.map { URL(fileURLWithPath: $0).lastPathComponent } }
 
+    /// Asks for a check pass. One already running started too early to see what the caller just did,
+    /// so the request is kept and a fresh pass follows it (one at most, however many asked meanwhile).
     func refresh() {
-        guard !busy else { return }
+        guard !busy else { refreshAsked = true; return }
         busy = true
+        passesStarted += 1
+        let passNumber = passesStarted
         let lightkeyPID = NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.processIdentifier
         let deckHelperSwitchedOn = setup.lightkey && setup.streamDeck && setup.deckLights != false
         let deckOn = setup.streamDeck
@@ -3550,14 +3754,19 @@ final class Booth: ObservableObject {
                     status: ls.code))
             }
             DispatchQueue.main.async {
-                self.finish(s, pass)
+                self.finish(s, pass, number: passNumber)
+                self.passesFinished = passNumber
                 self.busy = false
+                if self.refreshAsked {
+                    self.refreshAsked = false
+                    self.refresh()
+                }
             }
         }
     }
 
     // Accessibility, NSWorkspace, CoreMIDI and AppleScript all run here on the main thread.
-    private func finish(_ s: Snapshot, _ pass: Pass) {
+    private func finish(_ s: Snapshot, _ pass: Pass, number: Int) {
         var out: [Check] = []
         // The show's .deck.json: noted in the Log whenever what it says changes (and at the first pass).
         let showText = deckShowFileText(s.deckShow)
@@ -3585,13 +3794,15 @@ final class Booth: ObservableObject {
         } else {
             out.append(Check(id: "dmx", group: "Lighting", title: "DMX interface plugged in", status: .fail,
                              detail: "No USB DMX interface found.",
-                             fix: "Unplug the DMX USB cable and plug it back in, then quit and reopen Lightkey."))
+                             fix: replugDMXWords))
         }
 
         out.append(lightkey != nil
             ? Check(id: "lk", group: "Lighting", title: "Lightkey is running", status: .ok, detail: "Lightkey is open.")
             : Check(id: "lk", group: "Lighting", title: "Lightkey is running", status: .fail,
-                    detail: "Lightkey isn't open.", action: showPath != nil ? .openShow : nil))
+                    detail: "Lightkey isn't open.",
+                    fix: showPath != nil ? "Click Open the show." : "Click Open Lightkey.",
+                    action: showPath != nil ? .openShow : .openApp(IDs.lightkey, "Lightkey")))
 
         out.append(showCheck(lightkey, pass))
 
@@ -3651,8 +3862,9 @@ final class Booth: ObservableObject {
                              status: .ok, detail: "Lightkey's MIDI input is ready."))
         } else {
             out.append(Check(id: "midi", group: "Lighting", title: "Lightkey is listening for the Stream Deck",
-                             status: .fail, detail: "Lightkey is open but its MIDI input isn't there.",
-                             fix: "Quit and reopen Lightkey."))
+                             status: .fail, detail: "Lightkey is open but its MIDI input isn't there, so the Stream Deck's keys do nothing.",
+                             fix: "Click Restart Lightkey\u{2026} (the lights go dark for about 20 seconds).",
+                             action: .restartLightkeyForDMX))
         }
 
         // Stream Deck --------------------------------------------------------------------------
@@ -3661,7 +3873,8 @@ final class Booth: ObservableObject {
             ? Check(id: "deck", group: "Stream Deck", title: "Stream Deck plugged in", status: .ok,
                     detail: "\(deck!.name.isEmpty ? "Stream Deck" : deck!.name).")
             : Check(id: "deck", group: "Stream Deck", title: "Stream Deck plugged in", status: .fail,
-                    detail: "No Stream Deck found on USB.", fix: "Check the Stream Deck's USB cable."))
+                    detail: "No Stream Deck found on USB.",
+                    fix: "Unplug the Stream Deck\u{2019}s USB cable and plug it back in."))
 
         let deckInstalled = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) != nil
         if deckApp != nil && s.deckAsksToRestore {
@@ -3900,7 +4113,23 @@ final class Booth: ObservableObject {
         diagPass(pass.entries, checks)
         lastPass = pass.entries
         lastChecked = Date()
-        settleStartUp()
+        if deckApp != nil && s.deckAsksToRestore {
+            reportError("StreamDeckRestoreDialog", "Stream Deck is asking whether to restore its backup from today (its log: \u{201C}Detected data loss - propose restore backup to user\u{201D}); its keys don\u{2019}t work until someone answers.")
+        }
+        confirmLoginRepairs(pass: number)
+        settleStartUp()         // first, so turning green is still logged as a step
+        syncCheckStep()
+    }
+
+    /// While the finished start-up's panel is up, its "Check everything" step follows each pass, so it
+    /// says the same number as the panel's heading (`checkStepWords`). Written only when it changes.
+    private func syncCheckStep() {
+        guard bootFinished, !starting, BootPanel.shared.isShowing, let last = bootSteps.indices.last,
+              bootSteps[last].id == "check", bootSteps[last].state != .waiting, bootSteps[last].state != .running else { return }
+        let words = checkStepWords(problems: problemCount)
+        guard bootSteps[last].state != words.state || bootSteps[last].detail != words.detail else { return }
+        bootSteps[last].state = words.state
+        bootSteps[last].detail = words.detail
     }
 
     /// A start-up can finish with warnings and be fine a minute later, say once Lightkey has the DMX
@@ -3911,7 +4140,7 @@ final class Booth: ObservableObject {
         guard startUpSettles(finished: bootFinished, running: starting, alreadySettled: bootSettled, problems: problemCount),
               BootPanel.shared.isShowing, let last = bootSteps.indices.last, bootSteps[last].id == "check" else { return }
         bootSettled = true
-        if bootSteps[last].state != .done { setStep(last, .done, "Everything is green now.") }
+        if bootSteps[last].state != .done { setStep(last, .done, checkStepWords(problems: 0).detail) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
             if self.bootFinished && !self.starting { BootPanel.shared.hide() }
         }
@@ -3943,7 +4172,7 @@ final class Booth: ObservableObject {
             // but didn't count (church Mac, 9 Oct 2026).
             return Check(id: "show", group: "Lighting", title: title, status: .unknown,
                          detail: "Booth Check needs permission to read Lightkey's window title.",
-                         fix: "Turn Booth Check on under Accessibility, then quit and reopen Booth Check. Already on? That's an older copy: select it, click \u{2212} to remove it, then click Allow access\u{2026} again.",
+                         fix: "Ask a tech: click Allow access\u{2026} and switch Booth Check on in the list (README, \u{201C}Putting it on the booth Mac\u{201D}, step 5).",
                          action: .allowAccessibility)
         }
         let (docs, titles) = windowsOf(pid: lightkey.processIdentifier)
@@ -3957,7 +4186,7 @@ final class Booth: ObservableObject {
             let folder = (copy.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
             return Check(id: "show", group: "Lighting", title: title, status: .fail,
                          detail: "Lightkey has a different copy of \(showName) open, from \(folder).",
-                         fix: "If that copy is the right one, choose it with Change\u{2026} above. Otherwise open the chosen show.",
+                         fix: "Click Open the show to open the chosen one (if that other copy is the right one, ask a tech to choose it with Change\u{2026}).",
                          action: .openShow)
         }
         let open = docs.map(\.lastPathComponent) + (docs.isEmpty ? titles : [])
@@ -4017,23 +4246,8 @@ final class Booth: ObservableObject {
                 undo: commandLine("/usr/bin/defaults", lightkeyPasswordCommand(on: false)),
                 run: { shell("/usr/bin/defaults", args) })
             return
-        case .stopReopeningApps:
-            let off = reopenAppsCommands(reopen: false), on = reopenAppsCommands(reopen: true)
-            pending = PendingChange(
-                key: "reopen", title: "Don\u{2019}t reopen old apps at start-up",
-                explanation: "Switches off macOS reopening the apps that were open at shutdown (the \u{201C}Reopen windows when logging back in\u{201D} tick when you shut down from the Apple menu). They\u{2019}d open before Booth Check\u{2019}s start-up and in no order, Lightkey included. Booth Check still opens what this Mac needs, in order. It applies from the next shutdown, for this account. No password needed.",
-                language: "Terminal",
-                code: off.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
-                undo: on.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
-                run: {
-                    var outs: [String] = [], code: Int32 = 0
-                    for args in off {
-                        let r = shell("/usr/bin/defaults", args)
-                        outs.append("$ " + commandLine("/usr/bin/defaults", args) + (r.out.isEmpty ? "" : "\n" + r.out))
-                        if r.code != 0 { code = r.code }
-                    }
-                    return (outs.joined(separator: "\n"), code)
-                })
+        case .stopReopeningApps, .removeLoginItem, .removeShowLoginItems, .addSelfToLogin:
+            pending = loginChange(for: action)
             return
         case .reconnectDMX(let pid):
             let args = ["-HUP", String(pid)]
@@ -4101,13 +4315,6 @@ final class Booth: ObservableObject {
                 explanation: "Adds the Stream Deck app to the login items so it starts by itself after a restart.",
                 language: "AppleScript", code: script, run: { runAppleScript(script) })
             return
-        case .removeLoginItem(let item):
-            let script = removeLoginItemScript(item.path)
-            pending = PendingChange(
-                key: "removeLogin", title: "Stop \(item.name) opening at login",
-                explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
-                language: "AppleScript", code: script, run: { runAppleScript(script) })
-            return
         case .switchDeckProfile(let device, let target, let from, let name):
             let fromName = deckProfiles.profiles.first { $0.uuid == from }.map { "\u{201C}\($0.name)\u{201D}" } ?? "the profile it\u{2019}s on now"
             pending = PendingChange(
@@ -4168,20 +4375,6 @@ final class Booth: ObservableObject {
                                           : (r.code == 0 ? "Done. The Mac now starts when the charger is plugged in." : r.out, r.code)
                 })
             return
-        case .removeShowLoginItems:
-            let script = removeShowLoginItemsScript
-            pending = PendingChange(
-                key: "removeShows", title: "Stop shows opening at login on their own",
-                explanation: "Removes every Lightkey show from the login items. Booth Check opens the chosen show itself at login, in the right order. The show files aren\u{2019}t touched.",
-                language: "AppleScript", code: script, run: { runAppleScript(script) })
-            return
-        case .addSelfToLogin:
-            let script = addLoginItemScript(Bundle.main.bundleURL.path)
-            pending = PendingChange(
-                key: "selfLogin", title: "Open Booth Check at login",
-                explanation: "Adds Booth Check to the login items, so it opens by itself after a restart and checks everything straight away.",
-                language: "AppleScript", code: script, run: { runAppleScript(script) })
-            return
         case .chooseShow:
             chooseShow()
         case .openShow:
@@ -4206,6 +4399,99 @@ final class Booth: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.refresh() }
     }
 
+    /// The change sheets of the login rows (Booth Check at login, shows and Stream Deck opening by
+    /// themselves, macOS reopening old apps). A login start-up runs the very same changes by itself
+    /// (`repairLoginAtStartUp`), so each is defined once.
+    func loginChange(for action: Action) -> PendingChange? {
+        switch action {
+        case .stopReopeningApps:
+            let off = reopenAppsCommands(reopen: false), on = reopenAppsCommands(reopen: true)
+            return PendingChange(
+                key: "reopen", title: "Don\u{2019}t reopen old apps at start-up",
+                explanation: "Switches off macOS reopening the apps that were open at shutdown (the \u{201C}Reopen windows when logging back in\u{201D} tick when you shut down from the Apple menu). They\u{2019}d open before Booth Check\u{2019}s start-up and in no order, Lightkey included. Booth Check still opens what this Mac needs, in order. It applies from the next shutdown, for this account. No password needed.",
+                language: "Terminal",
+                code: off.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
+                undo: on.map { commandLine("/usr/bin/defaults", $0) }.joined(separator: "\n"),
+                run: {
+                    var outs: [String] = [], code: Int32 = 0
+                    for args in off {
+                        let r = shell("/usr/bin/defaults", args)
+                        outs.append("$ " + commandLine("/usr/bin/defaults", args) + (r.out.isEmpty ? "" : "\n" + r.out))
+                        if r.code != 0 { code = r.code }
+                    }
+                    return (outs.joined(separator: "\n"), code)
+                })
+        case .removeLoginItem(let item):
+            let script = removeLoginItemScript(item.path)
+            return PendingChange(
+                key: "removeLogin", title: "Stop \(item.name) opening at login",
+                explanation: "Removes \(item.name) from the login items, so it no longer opens when the Mac starts. \(item.name) itself isn\u{2019}t deleted, and you can add it back in System Settings \u{2192} General \u{2192} Login Items.",
+                language: "AppleScript", code: script, undo: addLoginItemScript(item.path), run: { runAppleScript(script) })
+        case .removeShowLoginItems:
+            let script = removeShowLoginItemsScript
+            let shows = loginItems.filter(\.isShow)
+            return PendingChange(
+                key: "removeShows", title: "Stop shows opening at login on their own",
+                explanation: "Removes every Lightkey show from the login items. Booth Check opens the chosen show itself at login, in the right order. The show files aren\u{2019}t touched.",
+                language: "AppleScript", code: script,
+                undo: shows.isEmpty ? nil : shows.map { addLoginItemScript($0.path) }.joined(separator: "\n\n"),
+                run: { runAppleScript(script) })
+        case .addSelfToLogin:
+            let script = addLoginItemScript(Bundle.main.bundleURL.path)
+            return PendingChange(
+                key: "selfLogin", title: "Open Booth Check at login",
+                explanation: "Adds Booth Check to the login items, so it opens by itself after a restart and checks everything straight away.",
+                language: "AppleScript", code: script, undo: removeLoginItemScript(Bundle.main.bundleURL.path), run: { runAppleScript(script) })
+        default:
+            return nil
+        }
+    }
+
+    /// A login start-up, once its apps are open (Nov 2026, owner-approved exception to "changes wait for
+    /// you"): the login rows `startUpLoginRepairs` picks are fixed with their own change sheet's command,
+    /// off the main thread (AppleScript then goes through osascript, see `runAppleScript`), so a slow or
+    /// asking System Events never holds anything up. Only when the last pass could read the login items
+    /// (System Events allowed); otherwise the rows stay as they are. Each run is logged with its command,
+    /// output and undo; the next pass confirms it (`confirmLoginRepairs`). Takes effect at the next login.
+    func repairLoginAtStartUp() {
+        guard case .items = loginRead else { return }
+        let ids = startUpLoginRepairs(checks, selfInApplications: Bundle.main.bundlePath.hasPrefix("/Applications/"))
+        let fixes = ids.compactMap { id in checks.first { $0.id == id }?.action.flatMap(loginChange).map { (id, $0) } }
+        guard !fixes.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let results = fixes.map { (id: $0.0, change: $0.1, result: $0.1.run()) }
+            DispatchQueue.main.async {
+                for r in results {
+                    self.changes.insert(LogEntry(title: "Start-up: fixed by itself: \(r.change.title)", language: r.change.language,
+                                                 code: r.change.code,
+                                                 output: (r.result.out.isEmpty ? "(no output)" : r.result.out)
+                                                    + "\nIt takes effect from the next login. Booth Check checks it at the next pass."
+                                                    + (r.change.undo.map { "\nUndo:\n" + $0 } ?? ""),
+                                                 status: r.result.code), at: 0)
+                }
+                self.loginRepairsToConfirm = (results.map(\.id), self.passesStarted, Dictionary(results.map { ($0.id, $0.result.code) }) { a, _ in a })
+                self.refresh()
+            }
+        }
+    }
+
+    /// The first pass after the start-up's login fixes ran: did each row turn OK? Logged, and one
+    /// `self_repair` event each (result ok, not_confirmed, or failed when its command did).
+    func confirmLoginRepairs(pass number: Int) {
+        guard let r = loginRepairsToConfirm, number > r.after else { return }
+        loginRepairsToConfirm = nil
+        var lines: [String] = []
+        for id in r.ids {
+            let row = checks.first { $0.id == id }
+            let ok = row?.status == .ok
+            let result = r.ran[id] != 0 ? "failed" : ok ? "ok" : "not_confirmed"
+            lines.append("\(row?.title ?? id): " + (ok ? "OK now." : "still \(row.map { statusWord($0.status) } ?? "not shown")" + (r.ran[id] != 0 ? " (its command failed)." : ".")))
+            diagEvent("self_repair", ["what": .string("login_\(id)"), "why": .string("login start-up"), "result": .string(result)])
+        }
+        changes.insert(LogEntry(title: "Start-up: checked the login fixes", language: "Booth Check", code: "The next check pass",
+                                output: lines.joined(separator: "\n"), status: lines.allSatisfy { $0.hasSuffix("OK now.") } ? 0 : 1), at: 0)
+    }
+
     /// Runs an approved change, logs it, and returns the log entry for the sheet to show.
     func run(_ change: PendingChange) -> LogEntry {
         let r = change.run()
@@ -4215,6 +4501,7 @@ final class Booth: ObservableObject {
         person("run", row: pendingRow, ["key": .string(change.key), "code": .int(Int(r.code))])
         if let row = pendingRow?.id { tallyAction(&tally, row: row, what: "run:\(change.key)", at: sessionNow) }
         if change.key == "appnap", r.code == 0 { appNapSwitchedOffAt = Date() }
+        if change.key == "lkpass", r.code == 0 { setup.noPasswordWanted = true }
         if change.key == "dmxReconnect", r.code == 0 { watchDMXReconnect() }
         if change.key == "dmxRestart" { DispatchQueue.main.async { self.restartLightkeyForDMX() } }
         if change.key == "deckInstall", r.code == 0 {
@@ -4310,7 +4597,7 @@ extension Booth {
                     "\(unknownCount) check\(unknownCount == 1 ? "" : "s") couldn\u{2019}t run")
         }
         return (anyFailing ? "xmark.octagon.fill" : "exclamationmark.triangle.fill", anyFailing ? .red : .orange,
-                "\(problemCount) thing\(problemCount == 1 ? "" : "s") to fix")
+                thingsToFix(problemCount))
     }
 
     /// The menu bar shows shape rather than colour, since macOS draws menu bar icons in one colour.
@@ -4579,6 +4866,7 @@ extension Booth {
     func tick() {
         watchMenuIcon()
         keepScreenOn()
+        LightkeyOutputWatch.shared.keepListening(setup.lightkey)
         if pending == nil { refresh() }
         checkShutdownTime()
         checkPower()
@@ -4661,6 +4949,11 @@ extension Booth {
         frontAttempts = 0
         lastFront = nil
         SignOverlay.shared.setAsking(false)
+        lightkeyOpenedByStartUp = false
+        midiRelaunched = false
+        startStateMark = nil
+        startStateLate = false
+        if atLogin { putBackNoPasswordSetting() }
         lightkeyMayAsk = setup.lightkey && setup.dmx
             && !defaultsSaysOn(shell("/usr/bin/defaults", ["read", IDs.lightkey, "DontUnloadFTDIDrivers"]).out)
         ReplugOverlay.shared.onHide = { [weak self] in self?.updateSign() }
@@ -4789,7 +5082,7 @@ extension Booth {
                 self.setStep(i, ok ? .done : .warn,
                              ok ? "Found on USB." + (seen.disagree ? " (\(seen.text))" : "")
                                 : skipped ? "Skipped, so Lightkey opens without it."
-                                : "Not found in 90 seconds, so Lightkey opens anyway. No lights? Replug the DMX USB cable, then reopen Lightkey.")
+                                : "Not found in 90 seconds, so Lightkey opens anyway: unplug the blue DMX box\u{2019}s USB cable and plug it back in now, and Booth Check connects it in a later step.")
                 if !ok { self.dmxSnapshot(skipped ? "dmxWait-skipped" : "dmxWait-timeout") }
                 next()
             })
@@ -4811,6 +5104,9 @@ extension Booth {
 
         case "lightkey":
             let wasRunning = isRunning(IDs.lightkey)
+            // Nov 2026: listen (read only) to what Lightkey reports as the show opens: every cue's start
+            // state, once. Evidence for the Log and diagnostics (`startStateEvidence`), nothing more.
+            markStartState(late: false)
             // A show that was moved or renamed can't be opened, so open Lightkey on its own and say why.
             let showMissing = showPath.map { !FileManager.default.fileExists(atPath: $0) } ?? false
             if !wasRunning && NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.lightkey) == nil {
@@ -4835,6 +5131,7 @@ extension Booth {
                 NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.isFinishedLaunching == true
             }) { ok in
                 if ok { self.frontLightkeyIfBehind() }
+                if ok && self.startStateMark == nil { self.markStartState(late: true) }     // Lightkey opened with the show: listen now
                 if !ok {
                     self.setStep(i, .failed, "Lightkey didn\u{2019}t open within 45 seconds.")
                 } else if showMissing {
@@ -4855,9 +5152,34 @@ extension Booth {
             poll(every: 0.5, for: 45, {
                 MIDIWatch.shared.destinationNames().contains { $0.localizedCaseInsensitiveContains(IDs.lightkeyMIDIInput) }
             }) { ok in
-                self.setStep(i, ok ? .done : .warn,
-                             ok ? "Lightkey\u{2019}s MIDI input is ready." : "Not ready after 45 seconds. Opening Stream Deck anyway.")
-                next()
+                if ok {
+                    self.setStep(i, .done, "Lightkey\u{2019}s MIDI input is ready.")
+                    return next()
+                }
+                // Nov 2026: Stream Deck's plugin looks for the input only when it starts, so opening it
+                // now would leave the keys dead all service. A Lightkey this start-up opened (no show,
+                // nothing on stage yet) is quit the no-questions way and opened once more.
+                guard midiRelaunchAllowed(openedByStartUp: self.lightkeyOpenedByStartUp, alreadyRelaunched: self.midiRelaunched,
+                                          shuttingDown: self.shuttingDown),
+                      let app = self.bootSteps.firstIndex(where: { $0.id == "lightkeyApp" }), app < i else {
+                    self.setStep(i, .warn, "Lightkey\u{2019}s MIDI input isn\u{2019}t there after 45 seconds, so the Stream Deck\u{2019}s keys may not work: click Restart Lightkey\u{2026} in Booth Check.")
+                    return next()
+                }
+                self.midiRelaunched = true
+                self.setStep(i, .running, "Lightkey\u{2019}s MIDI input isn\u{2019}t there after 45 seconds: restarting Lightkey once\u{2026}")
+                self.changes.insert(LogEntry(title: "Start-up: Lightkey\u{2019}s MIDI input didn\u{2019}t appear, so Booth Check restarts Lightkey once",
+                                             language: "macOS API", code: "CoreMIDI: list the MIDI destinations, every 0.5 s, for 45 s",
+                                             output: "No \u{201C}\(IDs.lightkeyMIDIInput)\u{201D}. Destinations: "
+                                                + { let d = MIDIWatch.shared.destinationNames(); return d.isEmpty ? "(none)" : d.joined(separator: ", ") }()
+                                                + ". Lightkey was opened by this start-up without the show, so nothing is on stage: quitting it (Quit pressed if it asks, made to quit after 15 s), clearing any olad left behind, then opening it again and waiting once more.",
+                                             status: 1), at: 0)
+                self.quitLightkey("Start-up") { closed in
+                    guard closed else {
+                        self.setStep(i, .warn, "Lightkey\u{2019}s MIDI input isn\u{2019}t there, and Lightkey didn\u{2019}t close for a restart: click Restart Lightkey\u{2026} in Booth Check.")
+                        return next()
+                    }
+                    self.runSteps([app, i], then: next)
+                }
             }
 
         case "deckLights":
@@ -4906,6 +5228,7 @@ extension Booth {
                 self.poll(for: 45, {
                     NSRunningApplication.runningApplications(withBundleIdentifier: IDs.lightkey).first?.isFinishedLaunching == true
                 }) { ok in
+                    if ok { self.lightkeyOpenedByStartUp = true }
                     self.setStep(i, ok ? .done : .failed, ok ? "Opened, without the show for now." : "Lightkey didn\u{2019}t open within 45 seconds.")
                     next()
                 }
@@ -4976,14 +5299,27 @@ extension Booth {
             }
 
         default:        // "check"
+            // A pass already running started before the steps above finished, so wait for the next one
+            // (`refresh` keeps the request); at most 90 s, then go by the last pass and say so.
+            let fresh = passesStarted + 1
             refresh()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                let n = self.problemCount
-                self.setStep(i, n == 0 ? .done : .warn,
-                             n == 0 ? "Everything is green." : "\(n) thing\(n == 1 ? "" : "s") to fix. Open Booth Check to see what.")
+            poll(every: 0.25, for: 90, { self.passesFinished >= fresh }) { ok in
+                let words = checkStepWords(problems: self.problemCount)
+                self.setStep(i, words.state, words.detail + (ok ? "" : " (The last check took over 90 seconds, so this is from the one before.)"))
+                // The login rows a login start-up fixes by itself, off the main thread, after the apps are open.
+                if self.bootAtLogin { self.repairLoginAtStartUp() }
                 next()
             }
         }
+    }
+
+    /// Notes what "Lightkey Output" has reported so far, as the show starts to open (see `startStateEvidence`).
+    /// `late`: Lightkey wasn't there to listen to before it opened with the show.
+    private func markStartState(late: Bool) {
+        LightkeyOutputWatch.shared.keepListening(setup.lightkey)
+        guard startStateMark == nil, LightkeyOutputWatch.shared.listening else { return }
+        startStateMark = LightkeyOutputWatch.shared.now()
+        startStateLate = late
     }
 
     /// Lightkey doesn't load the show until someone clicks Authenticate and types the Mac's password
@@ -5047,7 +5383,7 @@ extension Booth {
         }
         if isRunning(IDs.streamDeck) {
             return napSwitched
-                ? (.warn, "Already open, but it started before App Nap was switched off. Quit and reopen Stream Deck once so it stays awake in the background.", false)
+                ? (.warn, "Already open, but it started before App Nap was switched off. " + quitStreamDeckWords, false)
                 : (.done, "Already open.", false)
         }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: IDs.streamDeck) else {
@@ -5098,7 +5434,7 @@ extension Booth {
                 return done((result.state, "Restarted it so every key starts clean. " + result.detail, result.opened))
             }
             if waited > 5 { apps.forEach { _ = $0.forceTerminate() } }
-            if waited > 15 { return done((.warn, "Couldn\u{2019}t restart it, so keys may still be lit from before. Quit and reopen Stream Deck.", false)) }
+            if waited > 15 { return done((.warn, "Couldn\u{2019}t restart it, so keys may still be lit from before. " + quitStreamDeckWords, false)) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { look() }
         }
         look()
@@ -5191,6 +5527,7 @@ extension Booth {
                 deckAutoRestores += 1
                 lines.append("\u{201C}\(t.name)\u{201D}: \(d.health.why). " + r.text)
                 if r.ok { restored.append(t.uuid) } else { failed = true }
+                if !r.ok { reportError("DeckProfileRestoreFailed", "\(what): couldn\u{2019}t put back the Stream Deck profile \u{201C}\(t.name)\u{201D} (\(d.health.why)): \(r.text)") }
                 diagEvent("deck_profile_restored", ["why": .string(d.health.why), "during": .string(what), "how": .string("automatic"),
                                                     "result": .string(r.ok ? "ok" : "failed"), "identical": .int(r.identical ? 1 : 0),
                                                     "pages": .int(d.copy?.pages ?? 0), "keys": .int(d.copy?.keys ?? 0),
@@ -5265,6 +5602,8 @@ extension Booth {
             self.deckRepairFailed = true
             self.diagEvent("self_repair", ["what": .string("deck_profile_restore"), "why": .string(b.health.why),
                                            "result": .string(b.hasCopy ? "broke_again" : "no_copy"), "attempt": .int(attempt)])
+            self.reportError("DeckProfileRestoreFailed", "\(what): the Stream Deck profile \u{201C}\(b.name)\u{201D} is still damaged after Stream Deck opened (\(b.health.why)); "
+                             + (b.hasCopy ? "it broke again after being put back." : "Booth Check has no copy of it."))
             self.refresh()
             done(false)
         }
@@ -5305,6 +5644,7 @@ extension Booth {
         let opened = { (r: (state: StepState, detail: String, opened: Bool)) in
             self.deckRestoring = false
             guard result.ok else {
+                self.reportError("DeckProfileRestoreFailed", "Restore the Stream Deck\u{2019}s keys (\u{201C}\(name)\u{201D}): \(result.text)")
                 self.endWorkingSign(.deckKeysRestoreFailed, ok: false)
                 return self.refresh()
             }
@@ -5607,7 +5947,27 @@ extension Booth {
             "people": .int(bootPeople),
             "started": .string(aptabaseTimestamp(bootStartedAt ?? Date()))]
         props.merge(startupStepCounts(bootSteps.map(\.state))) { a, _ in a }
+        if bootSteps.contains(where: { $0.id == "lightkey" }) {
+            let e = startStateEvidence(mark: startStateMark, now: LightkeyOutputWatch.shared.now(), late: startStateLate)
+            props["start_state"] = .string(e.prop)
+            props["start_state_msgs"] = .int(e.messages)
+            props["start_state_on"] = .int(e.on)
+            changes.insert(LogEntry(title: "Start-up: what Lightkey reported as the show opened", language: "macOS API",
+                                    code: "CoreMIDI: listen (read only) to \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D}; count its note and control messages from the show step to the end of the start-up",
+                                    output: e.text, status: e.prop == "reported" ? 0 : nil), at: 0)
+        }
         diagEvent("startup_done", props)
+        if !bootReady {
+            let bad = checks.filter { statusIsBad($0.status) }.map(\.title)
+            let steps = bootSteps.enumerated().filter { $0.element.state == .warn || $0.element.state == .failed }.map { "\($0.offset + 1). \($0.element.title)" }
+            reportError("StartupNotReady", "The start-up (\(props["how"]?.text ?? "?")) ended not ready: " + thingsToFix(problemCount)
+                        + (bad.isEmpty ? "" : " (" + bad.joined(separator: ", ") + ")") + (steps.isEmpty ? "." : ". Steps that warned: " + steps.joined(separator: ", ") + "."))
+        }
+        let wanted = noPasswordWantedAfterStartUp(setup.noPasswordWanted, ready: bootReady, settingOn: lightkeyNoPassword)
+        if wanted != setup.noPasswordWanted && setup.lightkey && setup.dmx {
+            setup.noPasswordWanted = wanted
+            logSetting("This Mac: Lightkey connects without the password here", "The start-up was ready with Lightkey\u{2019}s DontUnloadFTDIDrivers on, so a login start-up puts it back if it ever goes missing. Untick \u{201C}Connect without asking for the password\u{201D} in This Mac to stop that.")
+        }
         tally.startups += 1
         tally.startupReady = bootReady
         tally.startupSeconds = total
@@ -5621,7 +5981,6 @@ extension Booth {
         if dmxRestartingByHand {
             // Restart Lightkey… from the row: the sign said "Restarting Lightkey"; now say how it went.
             dmxRestartingByHand = false
-            let linked = bootSteps.first { $0.id == "dmxLink" }?.state == .done
             endWorkingSign(linked ? .dmxConnected : .dmxFailed, ok: linked)
         }
         if signOn && !workingSignUp { SignOverlay.shared.finish(ready: bootReady) }
@@ -5753,6 +6112,7 @@ extension Booth {
     private func failDMXLink(_ i: Int, _ text: String, next: @escaping () -> Void) {
         endAuthWait("still_asking", during: "dmx")
         setStep(i, .warn, text)
+        if dmxLadder.started { reportError("DMXRecoveryFailed", "The start-up\u{2019}s DMX recovery didn\u{2019}t get Lightkey to take the interface: \(text)") }
         dmxSnapshot("dmxLink-failed")
         endWorkingSign(.dmxFailed, ok: false)
         next()
@@ -5800,7 +6160,7 @@ extension Booth {
                         self.setStep(i, .running, "The DMX interface isn\u{2019}t on USB.")
                         again()
                     } else {
-                        self.failDMXLink(i, "The DMX interface isn\u{2019}t on USB, so there was nothing to reconnect. Replug the DMX USB cable, then quit and reopen Lightkey.", next: next)
+                        self.failDMXLink(i, "The DMX interface isn\u{2019}t on USB, so there was nothing to reconnect. " + replugDMXWords, next: next)
                     }
                 case .waitForPassword:
                     if elapsed < 180 {
@@ -5851,7 +6211,7 @@ extension Booth {
                     self.relaunchForDMX(i, next: next)
                 case .giveUp:
                     self.diagDMXRecovery("giveup", "failed")
-                    self.failDMXLink(i, "Lightkey didn\u{2019}t take the DMX interface. \(tried) Replug the DMX USB cable, then quit and reopen Lightkey. (This check is experimental: if the lights respond, all is well.)", next: next)
+                    self.failDMXLink(i, "Lightkey didn\u{2019}t take the DMX interface. \(tried) " + dmxUnconfirmedWords, next: next)
                 case .unconfirmed:
                     // Task 0 (14 Nov 2026): the "held" check may just be wrong, and olad's log doesn't say
                     // it missed the box, so Lightkey isn't restarted (the lights would go dark for nothing).
@@ -5861,7 +6221,7 @@ extension Booth {
                                 code: "Restart Lightkey (not done: no evidence olad missed the interface)", status: 1)
                     self.dmxLadder.unconfirmed = true
                     self.diagDMXRecovery("relaunch", "skipped_unconfirmed")
-                    self.setStep(i, .warn, "Couldn\u{2019}t confirm Lightkey has the DMX interface. \(tried) Nothing was restarted, because Lightkey\u{2019}s DMX server says it found the interface. If the lights respond, all is well.")
+                    self.setStep(i, .warn, "Couldn\u{2019}t confirm Lightkey has the DMX interface. \(tried) Nothing was restarted, because Lightkey\u{2019}s DMX server says it found the interface. " + dmxUnconfirmedWords)
                     self.dmxSnapshot("dmxLink-unconfirmed")
                     self.endWorkingSign(.dmxUnconfirmed, ok: false)
                     next()
@@ -5884,7 +6244,7 @@ extension Booth {
         showWorkingSign(.dmxRestarting(n))
         setStep(i, .running, "Restarting Lightkey (try \(n) of 2): it hadn\u{2019}t picked the interface up.")
         dmxSnapshot("before-relaunch-\(n)")     // reads olad's log first: the new Lightkey overwrites it
-        quitLightkeyForDMX { closed in
+        quitLightkey("DMX recovery") { closed in
             guard closed else {
                 return self.failDMXLink(i, "Lightkey didn\u{2019}t close for the restart. " + dmxLadderTriedText(self.dmxLadder), next: next)
             }
@@ -5922,7 +6282,7 @@ extension Booth {
         dmxRestartingByHand = true
         showWorkingSign(.dmxRestarting(1))
         dmxSnapshot("restart-by-hand")
-        quitLightkeyForDMX { closed in
+        quitLightkey("Restart Lightkey") { closed in
             guard closed else {
                 self.dmxRestartingByHand = false
                 self.endWorkingSign(.dmxFailed, ok: false)
@@ -6059,6 +6419,16 @@ extension Booth {
         case .notYet: break
         case .missed: armShutdown()
         case .now:
+            // Nov 2026: someone pressed a cue in the last 10 minutes, so the service may still be on.
+            // That counts as Not yet: ask again in half an hour, as the button does.
+            let used = LightkeyOutputWatch.shared.now()
+            if lightkeyRecentlyUsed(lastAt: used.lastAt, now: ProcessInfo.processInfo.systemUptime) {
+                shutdownAt = Date().addingTimeInterval(30 * 60)
+                shutdownReason = .timed         // for the shutdown event's reason
+                let ago = Int(ProcessInfo.processInfo.systemUptime - (used.lastAt ?? 0))
+                logShutdown("not yet by itself", "It\u{2019}s the set time, but Lightkey reported a cue changing \(ago / 60) min \(ago % 60) s ago (on \u{201C}\(IDs.lightkeyMIDIOutput)\u{201D}), so the lights are probably in use. Asking again in 30 minutes.", status: nil)
+                return
+            }
             armShutdown()
             shutDownBooth(.timed)
         }
@@ -6396,6 +6766,9 @@ extension Booth {
                             ? "It didn\u{2019}t close within \(Int(forceAfter)) seconds (it may have been asking to save the show), so it was made to quit, as Force Quit does. Changes to the show since it opened weren\u{2019}t saved, as with Don\u{2019}t Save."
                             : "It didn\u{2019}t close within \(Int(forceAfter)) seconds, so it was made to quit, as Force Quit does.",
                             status: 0)
+                if forced && bundleID == IDs.lightkey {
+                    reportError("LightkeyForceQuit", "\(logAs): Lightkey didn\u{2019}t close within \(Int(forceAfter)) s" + (pressed ? " after Booth Check pressed Quit on its question" : "") + ", so it was made to quit.")
+                }
                 note(true)
                 done(true)
             case .wait:
@@ -6424,6 +6797,7 @@ extension Booth {
         diagShutdownDone("stayed_on")
         diag.writeMarker(version: currentVersion)       // still running after all: the marker goes back
         reopenSession()
+        reportError("ShutdownStayedOn", "Shut down (\(shutdownTrigger(shutdownReason))): " + note)
         diag.incident("shutdown_stayed_on", logText(since: shutdownStartedAt ?? Date().addingTimeInterval(-600)))
         diag.flush()
     }
@@ -6435,9 +6809,11 @@ extension Booth {
         }
     }
 
-    /// Quits Lightkey the shutdown's way, with no one needed (see `close`), for the DMX recovery.
-    func quitLightkeyForDMX(then done: @escaping (Bool) -> Void) {
-        close(IDs.lightkey, name: "Lightkey", forceAfter: 15, logAs: "DMX recovery", then: done)
+    /// Quits Lightkey the shutdown's way, with no one needed (see `close`), for a restart: the DMX
+    /// recovery, Restart Lightkey…, and the start-up when Lightkey's MIDI input didn't appear. `why`
+    /// heads its Log entries.
+    func quitLightkey(_ why: String, then done: @escaping (Bool) -> Void) {
+        close(IDs.lightkey, name: "Lightkey", forceAfter: 15, logAs: why, then: done)
     }
 }
 
@@ -6642,6 +7018,8 @@ struct DiagFiles {
     var supportDir: String
     var log: String { logDir + "/BoothCheck.log" }
     var queue: String { supportDir + "/aptabase-queue.jsonl" }
+    /// Error reports waiting to go, one JSON line each (`DiagError`), next to the events' queue.
+    var errors: String { supportDir + "/aptabase-errors.jsonl" }
     var marker: String { supportDir + "/running.json" }
     var lastVersion: String { supportDir + "/last-version.txt" }
     /// The session's running tallies (`SessionTally`), so a session the Mac never finished still gets its summary.
@@ -6933,6 +7311,104 @@ func aptabaseOutcome(status: Int?, body: String) -> FlushOutcome {
     return status == 400 ? .drop : .retry
 }
 
+// Aptabase error reports (Nov 2026): the dashboard's Errors page, one report per request ------------
+
+let aptabaseErrorURL = URL(string: "https://us.aptabase.com/api/v0/error")!
+
+/// One error report as queued in `aptabase-errors.jsonl` (`time`: when it happened; `session`: the
+/// session it belongs to, the crashed one for a crash).
+struct DiagError: Codable, Equatable {
+    var id: String
+    var time: Double
+    var session: String
+    var errorType: String
+    var errorMessage: String
+    var stackTrace: String?
+    var severity: String            // fatal, error
+    var kind: String                // crash, unhandled, handled
+}
+
+/// The POST body for one report, in Aptabase's error API shape (docs/error-api-openapi.yaml): the
+/// required errorMessage (≤ 5000) and errorType (≤ 100), the rest optional, each cut to its limit, with
+/// the app's own system props (the same sdkVersion and isDebug rule as the events).
+func aptabaseErrorBody(_ e: DiagError, system: [String: DiagValue]) -> Data {
+    func sys(_ key: String, _ max: Int) -> DiagValue? {
+        if case .string(let s)? = system[key], !s.isEmpty { return .string(truncateUTF16(s, max)) }
+        return nil
+    }
+    var body: [String: DiagValue] = [
+        "errorMessage": .string(truncateUTF16(e.errorMessage.isEmpty ? e.errorType : e.errorMessage, 5000)),
+        "errorType": .string(truncateUTF16(e.errorType, 100)),
+        "timestamp": .string(aptabaseTimestamp(Date(timeIntervalSince1970: e.time))),
+        "platform": .string("macOS"),
+        "sessionId": .string(truncateUTF16(e.session, 100)),
+        "severity": .string(e.severity), "kind": .string(e.kind)]
+    if let s = e.stackTrace, !s.isEmpty { body["stackTrace"] = .string(truncateUTF16(s, 10000)) }
+    for (key, max) in [("osName", 30), ("osVersion", 100), ("appVersion", 50), ("sdkVersion", 40)] { body[key] = sys(key, max) }
+    if case .bool(let debug)? = system["isDebug"] { body["isDebug"] = .bool(debug) }
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return (try? enc.encode(body)) ?? Data("{}".utf8)
+}
+
+/// What the error API's answer means: 202 (any 2xx) sent; no answer, 408, 429 or 5xx kept for later;
+/// 403 (the month's error quota is used up, it resets on the 1st) and any other 4xx dropped.
+func aptabaseErrorOutcome(status: Int?) -> FlushOutcome {
+    guard let status else { return .retry }
+    if (200..<300).contains(status) { return .sent }
+    return status == 408 || status == 429 || status >= 500 ? .retry : .drop
+}
+
+/// Whether one more error report goes this session: each errorType once, at most `max` in all.
+func errorReportAllowed(_ type: String, sent: Set<String>, max: Int = 10) -> Bool {
+    !sent.contains(type) && sent.count < max
+}
+
+/// The last `lines` lines of Log entries (newest first, as `changes` holds them) as the log on disk
+/// writes them: an error report's stackTrace.
+func recentLogLines(_ entries: [LogEntry], lines: Int = 40) -> String {
+    entries.reversed().map(diskLogText).joined().split(separator: "\n", omittingEmptySubsequences: false).suffix(lines).joined(separator: "\n")
+}
+
+/// A crash report's gist for the Errors page: errorType (the exception type), a message (exception,
+/// signal, subtype, termination reason, the app's own last words such as a Swift fatal error) and the
+/// crashed thread's frames, one per line. Reads macOS's .ips (a JSON header line, then the JSON report)
+/// and the older .crash text. Nil when it's neither.
+func crashReportGist(_ text: String) -> (type: String, message: String, stack: String)? {
+    let parts = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+    if parts.count == 2, let body = (try? JSONSerialization.jsonObject(with: Data(parts[1].utf8))) as? [String: Any] {
+        let exc = body["exception"] as? [String: Any] ?? [:]
+        let type = exc["type"] as? String ?? "Crash"
+        let asi = (body["asi"] as? [String: Any] ?? [:]).sorted { $0.key < $1.key }
+            .flatMap { k, v in (v as? [String] ?? []).map { "\(k): \($0)" } }
+        let words = [[type, exc["signal"] as? String].compactMap { $0 }.joined(separator: " "),
+                     exc["subtype"] as? String, (body["termination"] as? [String: Any])?["indicator"] as? String].compactMap { $0 } + asi
+        let images = body["usedImages"] as? [[String: Any]] ?? []
+        let threads = body["threads"] as? [[String: Any]] ?? []
+        let faulting = body["faultingThread"] as? Int ?? threads.firstIndex { $0["triggered"] as? Bool == true } ?? 0
+        let frames = threads.indices.contains(faulting) ? threads[faulting]["frames"] as? [[String: Any]] ?? [] : []
+        let stack = frames.enumerated().map { n, f -> String in
+            let image = (f["imageIndex"] as? Int).flatMap { images.indices.contains($0) ? images[$0]["name"] as? String : nil } ?? "???"
+            let at = (f["symbol"] as? String).map { "\($0) + \(f["symbolLocation"] as? Int ?? 0)" }
+                ?? String(format: "0x%llx", (f["imageOffset"] as? Int) ?? 0)
+            return "\(n)  \(image)  \(at)"
+        }.joined(separator: "\n")
+        return (type, words.joined(separator: " \u{00B7} "), "Thread \(faulting) crashed:\n" + stack)
+    }
+    let lines = text.components(separatedBy: "\n")
+    func value(_ label: String) -> String? {
+        lines.first { $0.hasPrefix(label + ":") }.map { String($0.dropFirst(label.count + 1)).trimmingCharacters(in: .whitespaces) }
+    }
+    guard let exception = value("Exception Type") else { return nil }
+    let type = exception.split(separator: " ").first.map(String.init) ?? exception
+    let message = [exception, value("Exception Codes"), value("Termination Reason")].compactMap { $0 }.joined(separator: " \u{00B7} ")
+    var stack: [String] = []
+    if let start = lines.firstIndex(where: { $0.hasPrefix("Thread ") && $0.contains("Crashed") }) {
+        stack = Array(lines[start...].prefix { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+    }
+    return (type, message, stack.joined(separator: "\n"))
+}
+
 /// How the previous run ended: `running.json` left behind means it never got to quit; a crash report
 /// newer than its start says it crashed (otherwise power loss or a force quit).
 func previousExit(markerPresent: Bool, crashReportSinceStart: Bool, lastVersion: String?, currentVersion: String) -> String {
@@ -6942,7 +7418,13 @@ func previousExit(markerPresent: Bool, crashReportSinceStart: Bool, lastVersion:
 }
 
 func isBoothCheckCrashReport(_ name: String) -> Bool {
-    (name.hasPrefix("Booth Check") || name.hasPrefix("BoothCheck")) && name.hasSuffix(".ips")
+    (name.hasPrefix("Booth Check") || name.hasPrefix("BoothCheck")) && (name.hasSuffix(".ips") || name.hasSuffix(".crash"))
+}
+
+/// The newest of `reports` (name, modification date) written after `since`: the crash of the run that
+/// started then.
+func newestCrashReport(_ reports: [(name: String, modified: Date)], since: Date) -> String? {
+    reports.filter { isBoothCheckCrashReport($0.name) && $0.modified > since }.max { $0.modified < $1.modified }?.name
 }
 
 /// A check going bad or coming good, from the diff of two passes.
@@ -7140,6 +7622,8 @@ func selfRepairRows(_ what: String) -> [String] {
     case "deck_profile", "deck_profile_restore": return ["deckProfile"]
     case "streamdeck_restart", "streamdeck_open": return ["deckapp", "deck"]
     case "helper_restart": return ["deckLights"]
+    case "lightkey_no_password": return ["lkpass"]
+    case _ where what.hasPrefix("login_"): return [String(what.dropFirst(6))]     // a login row fixed at the start-up
     default: return []
     }
 }
@@ -7284,6 +7768,8 @@ final class Diagnostics {
     private var backoff: TimeInterval = 0
     private var backoffUntil: Date?
     private var lastRequest = Date.distantPast
+    /// Error report types queued this session (on `queue`; see `errorReportAllowed`).
+    private var errorTypesSent: Set<String> = []
     /// On the main thread: incidents sent this launch (at most 6), and where the Network Log entries go.
     var incidents = 0
     var onLog: ((LogEntry) -> Void)?
@@ -7356,17 +7842,18 @@ final class Diagnostics {
     }
 
     /// At launch, before anything else is written: how the previous run ended, and its log's tail.
-    func readPreviousRun(currentVersion: String) -> (exit: String, tail: String, detail: String) {
+    func readPreviousRun(currentVersion: String) -> (exit: String, tail: String, detail: String, crashPath: String?) {
         let fm = FileManager.default
         let marker = fm.contents(atPath: files.marker).map { String(decoding: $0, as: UTF8.self) }
         var crash: String?
+        let dir = NSHomeDirectory() + "/Library/Logs/DiagnosticReports"
         if let marker {
             let start = regexReplace(marker, "^.*\"start\":([0-9.]+).*$") { $0[1] }
             let since = Date(timeIntervalSince1970: Double(start.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0)
-            let dir = NSHomeDirectory() + "/Library/Logs/DiagnosticReports"
-            crash = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter(isBoothCheckCrashReport).first { name in
-                ((try? fm.attributesOfItem(atPath: dir + "/" + name))?[.modificationDate] as? Date).map { $0 > since } ?? false
+            let reports = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter(isBoothCheckCrashReport).compactMap { name in
+                ((try? fm.attributesOfItem(atPath: dir + "/" + name))?[.modificationDate] as? Date).map { (name: name, modified: $0) }
             }
+            crash = newestCrashReport(reports, since: since)
         }
         let last = fm.contents(atPath: files.lastVersion).map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
         let exit = previousExit(markerPresent: marker != nil, crashReportSinceStart: crash != nil, lastVersion: last, currentVersion: currentVersion)
@@ -7374,7 +7861,7 @@ final class Diagnostics {
             + (crash.map { ". Crash report: \($0)" } ?? "") + (last.map { ". Last version: \($0)" } ?? "")
         try? fm.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
         fm.createFile(atPath: files.lastVersion, contents: Data((currentVersion + "\n").utf8))
-        return (exit, marker != nil ? logTail(maxBytes: 30_000) : "", detail)
+        return (exit, marker != nil ? logTail(maxBytes: 30_000) : "", detail, crash.map { dir + "/" + $0 })
     }
 
     // Events and the queue ------------------------------------------------------------------------------
@@ -7416,16 +7903,50 @@ final class Diagnostics {
         if appendsSinceTrim >= 100 || size > 3_000_000 { trimQueue() }
     }
 
-    func loadQueue() -> [DiagEvent] {
-        guard let data = FileManager.default.contents(atPath: files.queue) else { return [] }
-        return data.split(separator: 0x0A).compactMap { try? JSONDecoder().decode(DiagEvent.self, from: Data($0)) }
+    /// A queue file: one JSON value per line (the events' queue, the error reports').
+    func loadLines<T: Decodable>(_ path: String) -> [T] {
+        guard let data = FileManager.default.contents(atPath: path) else { return [] }
+        return data.split(separator: 0x0A).compactMap { try? JSONDecoder().decode(T.self, from: Data($0)) }
     }
 
-    func saveQueue(_ events: [DiagEvent]) {
+    func saveLines<T: Encodable>(_ items: [T], to path: String) {
         let enc = JSONEncoder()
         var data = Data()
-        for e in events { if let l = try? enc.encode(e) { data.append(l); data.append(0x0A) } }
-        try? data.write(to: URL(fileURLWithPath: files.queue), options: .atomic)
+        for e in items { if let l = try? enc.encode(e) { data.append(l); data.append(0x0A) } }
+        try? FileManager.default.createDirectory(atPath: files.supportDir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    func loadQueue() -> [DiagEvent] { loadLines(files.queue) }
+    func saveQueue(_ events: [DiagEvent]) { saveLines(events, to: files.queue) }
+
+    // Error reports (the Errors page) -------------------------------------------------------------------
+
+    /// One error report, off the main thread (see `recordError`). `recent`: the Log's newest entries,
+    /// whose last 40 lines become the stackTrace when none is given.
+    func error(_ type: String, _ message: String, stack: String? = nil, recent: [LogEntry] = [],
+               severity: String = "error", kind: String = "handled", session sid: String? = nil, time: Date = Date()) {
+        queue.async {
+            self.recordError(type, message, stack: stack ?? recentLogLines(recent), severity: severity, kind: kind, session: sid, time: time)
+        }
+    }
+
+    /// `error` on the queue: a line in the log on disk always; queued for Aptabase (scrubbed) when
+    /// diagnostics are on with a key, each errorType once a session and at most 10 (`errorReportAllowed`).
+    func recordError(_ type: String, _ message: String, stack: String, severity: String, kind: String, session sid: String?, time: Date) {
+        guard errorReportAllowed(type, sent: errorTypesSent) else {
+            appendToLog("\(diskTime(Date()))  error report \(type): not sent again (each type once a session, at most 10)\n")
+            return
+        }
+        errorTypesSent.insert(type)
+        appendToLog("\(diskTime(time))  error report \(type) (\(severity), \(kind)): \(message)\n")
+        guard enabled, appKey != nil else { return }
+        let ctx = scrubContext
+        let e = DiagError(id: UUID().uuidString, time: time.timeIntervalSince1970, session: sid ?? session, errorType: type,
+                          errorMessage: truncateUTF16(scrub(message, ctx), 5000),
+                          stackTrace: stack.isEmpty ? nil : truncateUTF16(scrub(stack, ctx), 10000), severity: severity, kind: kind)
+        // A Mac offline for weeks keeps the newest 100.
+        saveLines(Array(((loadLines(files.errors) as [DiagError]) + [e]).suffix(100)), to: files.errors)
     }
 
     func trimQueue() {
@@ -7439,7 +7960,12 @@ final class Diagnostics {
         }
     }
 
-    func clearQueue() { queue.async { try? FileManager.default.removeItem(atPath: self.files.queue) } }
+    func clearQueue() {
+        queue.async {
+            try? FileManager.default.removeItem(atPath: self.files.queue)
+            try? FileManager.default.removeItem(atPath: self.files.errors)
+        }
+    }
 
     // Sending -----------------------------------------------------------------------------------------
 
@@ -7454,38 +7980,19 @@ final class Diagnostics {
         }
         if !ignoreBackoff, let until = backoffUntil, until > Date() { return [] }
         var logs: [LogEntry] = []
+        var retry = false
         while true {
             let all = loadQueue()
             guard !all.isEmpty else { break }
-            let wait = lastRequest.addingTimeInterval(1).timeIntervalSinceNow
-            if let deadline, Date().addingTimeInterval(max(wait, 0) + 0.5) > deadline { break }
-            if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
             let batch = Array(all.prefix(25))
             let body = aptabaseBatchBody(batch, now: Date())
-            var request = URLRequest(url: aptabaseURL, timeoutInterval: min(10, deadline.map { max($0.timeIntervalSinceNow, 1) } ?? 10))
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(key, forHTTPHeaderField: "App-Key")
-            request.httpBody = body
-            lastRequest = Date()
-            let sem = DispatchSemaphore(value: 0)
-            var status: Int?, reply = "", failure: String?
-            transport(request) { s, d, e in
-                status = s
-                reply = d.map { String(decoding: $0, as: UTF8.self) } ?? ""
-                failure = e?.localizedDescription
-                sem.signal()
-            }
-            if sem.wait(timeout: .now() + 11) == .timedOut { failure = "No answer in 11 seconds." }
+            guard let answer = post(aptabaseURL, body, key: key, deadline: deadline) else { break }
+            let (status, reply, failure) = answer
             let outcome = aptabaseOutcome(status: failure == nil ? status : nil, body: reply)
             let ids = Set(batch.map(\.id))
             let left = outcome == .retry ? all.count : all.count - batch.count
             if outcome != .retry { saveQueue(all.filter { !ids.contains($0.id) }) }
-            if outcome == .sent { backoff = 0; backoffUntil = nil }
-            if outcome == .retry {
-                backoff = backoff == 0 ? 60 : min(backoff * 2, 1800)
-                backoffUntil = Date().addingTimeInterval(backoff)
-            }
+            noteOutcome(outcome)
             var names: [String: Int] = [:]
             batch.forEach { names[$0.name, default: 0] += 1 }
             let what = names.sorted { $0.key < $1.key }.map { "\($0.key) \u{00D7}\($0.value)" }.joined(separator: ", ")
@@ -7499,9 +8006,58 @@ final class Diagnostics {
             // The answer on disk too (at quit, the Log's own entry never reaches the disk).
             appendToLog("\(diskTime(Date()))  Diagnostics answer: " + (failure.map { "network error: \($0)" } ?? "HTTP \(status ?? 0) \(capText(reply, maxBytes: 300))")
                         + " \u{2192} \(outcome == .sent ? "sent" : outcome == .drop ? "dropped" : "kept") \(batch.count) events (\(what))\n")
+            if outcome == .retry { retry = true; break }
+        }
+        // Then the error reports, one per request (the error API takes a single report).
+        while !retry {
+            let all: [DiagError] = loadLines(files.errors)
+            guard let e = all.first else { break }
+            guard let answer = post(aptabaseErrorURL, aptabaseErrorBody(e, system: systemProps), key: key, deadline: deadline) else { break }
+            let (status, reply, failure) = answer
+            let outcome = aptabaseErrorOutcome(status: failure == nil ? status : nil)
+            if outcome != .retry { saveLines(all.filter { $0.id != e.id }, to: files.errors) }
+            noteOutcome(outcome)
+            let said = failure.map { "Network error: \($0)" } ?? "HTTP \(status ?? 0): \(reply.isEmpty ? "(empty)" : capText(reply, maxBytes: 500))"
+            logs.append(LogEntry(title: "Diagnostics: " + (outcome == .sent ? "sent error report \(e.errorType)" : outcome == .drop ? "the server refused error report \(e.errorType) (dropped)" : "couldn\u{2019}t send error report \(e.errorType) (kept)"),
+                                 language: "Network", code: "POST \(aptabaseErrorURL.absoluteString)\nerrorType \(e.errorType), \(e.severity), \(e.kind)",
+                                 output: said + "\nError reports left: \(outcome == .retry ? all.count : all.count - 1)", status: outcome == .sent ? 0 : 1))
+            appendToLog("\(diskTime(Date()))  Diagnostics answer (error report \(e.errorType)): \(said) \u{2192} \(outcome == .sent ? "sent" : outcome == .drop ? "dropped" : "kept")\n")
             if outcome == .retry { break }
         }
         return logs
+    }
+
+    /// One POST with the App-Key, at most one a second, waiting for the answer (11 s at most). Nil when
+    /// `deadline` comes first. The events and the error reports both go through here.
+    private func post(_ url: URL, _ body: Data, key: String, deadline: Date?) -> (status: Int?, reply: String, failure: String?)? {
+        let wait = lastRequest.addingTimeInterval(1).timeIntervalSinceNow
+        if let deadline, Date().addingTimeInterval(max(wait, 0) + 0.5) > deadline { return nil }
+        if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
+        var request = URLRequest(url: url, timeoutInterval: min(10, deadline.map { max($0.timeIntervalSinceNow, 1) } ?? 10))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(key, forHTTPHeaderField: "App-Key")
+        request.httpBody = body
+        lastRequest = Date()
+        let sem = DispatchSemaphore(value: 0)
+        var status: Int?, reply = "", failure: String?
+        transport(request) { s, d, e in
+            status = s
+            reply = d.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            failure = e?.localizedDescription
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 11) == .timedOut { failure = "No answer in 11 seconds." }
+        return (status, reply, failure)
+    }
+
+    /// A send's outcome sets the back-off: sent clears it; kept for later starts it at 1 minute, doubling to 30.
+    private func noteOutcome(_ outcome: FlushOutcome) {
+        if outcome == .sent { backoff = 0; backoffUntil = nil }
+        if outcome == .retry {
+            backoff = backoff == 0 ? 60 : min(backoff * 2, 1800)
+            backoffUntil = Date().addingTimeInterval(backoff)
+        }
     }
 
     /// `flushSync` on the queue; the Log entries and `done` come back on the main thread.
@@ -7678,6 +8234,12 @@ extension Booth {
         persistTally()
     }
 
+    /// A handled failure for the Errors page (see `Diagnostics.recordError`): its stable type, what
+    /// happened, and the Log's last 40 lines as the trace. Nothing goes with diagnostics off or no key.
+    func reportError(_ type: String, _ message: String) {
+        diag.error(type, message, recent: Array(changes.prefix(40)))
+    }
+
     func diagDMXRecovery(_ rung: String, _ result: String) {
         diagEvent("dmx_recovery", ["rung": .string(rung), "result": .string(result)])
     }
@@ -7711,6 +8273,20 @@ extension Booth {
                 self.diag.appendToLog("\(diskTime(Date()))  The previous session (\(p.session)) never sent its summary; sending it now, ended \(ended), as of \(diskTime(when)):\n")
                 for e in sessionEvents(p, at: p.elapsed, ended: ended) {
                     self.diag.record(e.name, e.props.merging(["late": .int(1)]) { a, _ in a }, time: when, session: p.session)
+                }
+            }
+            // The Errors page: a crash with its report, else an unclean end with the log's last lines.
+            if prev.exit == "crash" || prev.exit == "unclean" {
+                let crashed = prevSession?.session
+                let when = prevSession.map { Date(timeIntervalSince1970: $0.savedWall) } ?? Date()
+                if let path = prev.crashPath, let text = try? String(contentsOfFile: path, encoding: .utf8), let gist = crashReportGist(text) {
+                    let at = ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date) ?? when
+                    self.diag.recordError(gist.type, "Booth Check crashed: " + gist.message + " (\((path as NSString).lastPathComponent))",
+                                          stack: gist.stack, severity: "fatal", kind: "crash", session: crashed, time: at)
+                } else {
+                    self.diag.recordError("UncleanExit", "Booth Check\u{2019}s last run ended without quitting (a power cut, a force quit, or a crash without a readable report). " + prev.detail,
+                                          stack: prev.tail.split(separator: "\n", omittingEmptySubsequences: false).suffix(40).joined(separator: "\n"),
+                                          severity: "error", kind: "unhandled", session: crashed, time: when)
                 }
             }
             try? FileManager.default.removeItem(atPath: self.diag.files.session)
@@ -7819,6 +8395,10 @@ extension Booth {
             guard let since = diagFailingSince[c.id], now.timeIntervalSince(since) > 60 else { continue }
             diagIncidentSent.insert(c.id)
             diag.incident("check_\(c.id)", checkIncidentText(c, since: since, entries: entries))
+            // The same incident, for the dashboard's Errors page: only a row that's red, not orange.
+            if c.status == .fail {
+                reportError("CheckFailed:\(c.id)", "\(c.title): \(c.detail)" + (c.fix.map { " Fix: \($0)" } ?? "") + " (failing since \(diskTime(since)))")
+            }
             diagFlushIfAllowed()
         }
     }
@@ -8792,12 +9372,11 @@ struct BootView: View {
     @ObservedObject var booth: Booth
 
     var body: some View {
-        let n = booth.problemCount
-        let (symbol, color, title): (String, Color, String) =
-            !booth.bootFinished ? ("play.circle.fill", .green, "Starting the show")
-            : booth.bootReady ? ("checkmark.seal.fill", .green, "Ready for the service")
-            : n > 0 ? ("exclamationmark.triangle.fill", .orange, "\(n) thing\(n == 1 ? "" : "s") to fix")
-            : ("exclamationmark.triangle.fill", .orange, "Started, with warnings")
+        let title = bootHeadline(finished: booth.bootFinished, ready: booth.bootReady, problems: booth.problemCount)
+        let (symbol, color): (String, Color) =
+            !booth.bootFinished ? ("play.circle.fill", .green)
+            : booth.bootReady ? ("checkmark.seal.fill", .green)
+            : ("exclamationmark.triangle.fill", .orange)
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: symbol).font(.system(size: 20)).foregroundStyle(color)
@@ -8862,6 +9441,9 @@ final class BootPanel {
 /// The replug sign's state: the start-up sets `found` when the DMX box is back.
 final class ReplugModel: ObservableObject {
     @Published var found = false
+    /// The plug moves only while the card is up: a hidden panel's TimelineView keeps redrawing (about
+    /// 6% CPU for the rest of the session after a timed-out or skipped replug, dev Mac, Nov 2026).
+    @Published var animating = false
     var skip: (() -> Void)?
 }
 
@@ -8884,7 +9466,7 @@ struct ReplugCard: View {
                     .font(.system(size: 34, weight: .bold))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                TimelineView(.animation) { context in
+                TimelineView(.animation(minimumInterval: nil, paused: !model.animating)) { context in
                     ReplugAnimation(phase: context.date.timeIntervalSinceReferenceDate / 3.2)
                 }
                 .frame(height: 190)
@@ -9008,6 +9590,7 @@ final class ReplugOverlay {
     func show(onSkip: @escaping () -> Void) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         model.found = false
+        model.animating = true
         model.skip = onSkip
         if backdrop == nil { backdrop = dimmingBackdrop(level: .floating) }
         if card == nil {
@@ -9033,6 +9616,7 @@ final class ReplugOverlay {
     func hide() {
         card?.orderOut(nil)
         backdrop?.orderOut(nil)
+        if model.animating { model.animating = false }
         onHide?()
     }
 }
@@ -9055,6 +9639,9 @@ final class SignModel: ObservableObject {
     @Published var seconds = 0
     @Published var note = ""
     @Published var title = ""          // a self-repair's title (see `selfRepairWords`); its line goes in `note`
+    /// The card is on screen: its busy ring only moves then (hidden on a busy face, say after Not yet,
+    /// a TimelineView would keep redrawing for good).
+    @Published var visible = false
     var notYet: (() -> Void)?
     var now: (() -> Void)?
 }
@@ -9157,7 +9744,7 @@ struct SignCard: View {
     private func badge(_ symbol: String, _ color: Color, size: CGFloat) -> some View {
         ZStack {
             if busy {
-                TimelineView(.animation) { context in
+                TimelineView(.animation(minimumInterval: nil, paused: !model.visible)) { context in
                     let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2.2) / 2.2
                     Circle().stroke(color.opacity(0.55 * (1 - t)), lineWidth: 5)
                         .frame(width: size, height: size)
@@ -9242,6 +9829,7 @@ final class SignOverlay {
                                         y: screen.frame.midY - Self.cardSize.height / 2))
         }
         card.orderFrontRegardless()
+        if !model.visible { model.visible = true }
     }
 
     /// The start-up is over: say how it went, where the sign already is, then go.
@@ -9290,6 +9878,7 @@ final class SignOverlay {
         ending?.cancel()
         card?.orderOut(nil)
         backdrop?.orderOut(nil)
+        if model.visible { model.visible = false }
     }
 }
 

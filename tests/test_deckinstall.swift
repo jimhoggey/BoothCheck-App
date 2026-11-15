@@ -69,7 +69,10 @@ let red = deckHelperCheck(installed: true, loaded: true, state: "not running", f
 expect("red quotes the log", red.detail.contains("WATCHDOG"), red.detail)
 expect("red says Booth Check fixes it", (red.fix ?? "").contains("by itself"), red.fix ?? "nil")
 let gave = deckHelperCheck(installed: true, loaded: true, state: "not running", feedbackPort: false, gaveUp: true)
-expect("gave up: says what to do", (gave.fix ?? "").contains("3 times") && gave.action?.label == "Restart\u{2026}", gave.fix ?? "nil")
+expect("gave up: says what to press, with that button (Install…)", (gave.fix ?? "").contains("3 times") && (gave.fix ?? "").contains("click Install")
+       && gave.action?.label == "Install\u{2026}", gave.fix ?? "nil")
+let gaveInstalled = deckHelperCheck(installed: true, loaded: false, state: nil, feedbackPort: false, gaveUp: true)
+expect("gave up, not loaded: Install… too", gaveInstalled.action?.label == "Install\u{2026}", gaveInstalled.fix ?? "nil")
 
 // 6. The copy it carries and the rules it passes are the Summit show's (when that repo is here).
 let summit = NSHomeDirectory() + "/Claude/repos/Lightkey-Skill/LightKeyoutputs/summit2026/helper/"
